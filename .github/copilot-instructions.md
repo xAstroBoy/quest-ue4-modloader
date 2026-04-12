@@ -188,8 +188,10 @@ Before writing or modifying any debug menu code, read and understand:
 ## Project Context
 
 ### What This Is
-- **RE4 VR** (Resident Evil 4 VR) modding framework for Meta Quest 3
-- **com.Armature.VR4** — Android arm64, Android 14, UE4.25
+- **Multi-game UE modding framework** for Meta Quest 3 (Android ARM64)
+- **Supported Games**:
+  - **RE4 VR** (com.Armature.VR4) — UE4.25
+  - **Pinball FX VR** (com.zenstudios.PFXVRQuest) — UE5.x
 - **Custom C++ modloader** (`libmodloader.so`) with sol2 Lua 5.4 + Dobby hooks
 - **UE4SS-compatible** Lua API — similar to PC UE4SS but ARM64 Android
 - Mods are pure Lua scripts in `mods/<ModName>/main.lua`
@@ -198,17 +200,79 @@ Before writing or modifying any debug menu code, read and understand:
 | Path | Description |
 |---|---|
 | `modloader/` | C++ modloader source (CMake, NDK r23c) |
-| `mods/` | Lua mods, each in own folder |
+| `mods/re4/` | RE4 VR Lua mods |
+| `mods/pfx/` | Pinball FX VR Lua mods |
 | `Current Modloader SDK/` | SDK dump from live game (Classes, Enums, Structs) |
 | `tools/` | Python deploy/test tools |
+| `tools/bindump/` | **Rust binary analysis tool** (BDMP database) |
 | `docs/` | Documentation (LUA_API.md, this file) |
 | `logs/` | Tombstones and game logs |
+| `Pinball FX VR Patches/` | PFX VR binary analysis dumps + BDMP database |
 
 ### Device & Connection
-- **Device**: Meta Quest 3 (192.168.1.15, wireless ADB)
-- **ADB Serial**: 2G0YC5ZG4W06ZK (or 192.168.1.15:5555)
+- **Device**: Meta Quest 3 (192.168.1.9, wireless ADB)
+- **ADB Serial**: 192.168.1.9:5555
 - **Bridge Port**: TCP 127.0.0.1:19420 (ADB forwarded)
 - **SSH Key**: `C:\Users\xAstroBoy\.ssh\quest_root`
+
+---
+
+## 🔍 Binary Analysis — Rust Bindump Tool
+
+### ALWAYS USE THIS TOOL FOR OFFSET LOOKUPS
+When you need to find function offsets, string references, cross-references, or analyze the game binary, **ALWAYS use the Rust bindump tool**. Never guess offsets.
+
+### Tool Location
+```
+tools\bindump\target\release\bindump.exe
+```
+
+### BDMP Database
+The tool uses a merged IDA+BINJA binary database for cross-view analysis:
+```
+"Pinball FX VR Patches\bindump.bdmp"    # 7.28 GB, 263K functions, 245K cross-matched
+```
+
+### Common Commands
+```bash
+# Search for strings in the binary
+bindump.exe strings "GEngine" --db "Pinball FX VR Patches\bindump.bdmp"
+
+# Find string cross-references (which functions reference a string)
+bindump.exe strxrefs "Create GEngine" --db "Pinball FX VR Patches\bindump.bdmp"
+
+# Get function details (decompilation, assembly, xrefs)
+bindump.exe func 0x3FFF768 --extract --db "Pinball FX VR Patches\bindump.bdmp"
+
+# Grep through decompiled C or assembly for patterns
+bindump.exe grep "GEngine" "c_binja" --db "Pinball FX VR Patches\bindump.bdmp"
+bindump.exe grep "qword_73CF" "asm_ida" --db "Pinball FX VR Patches\bindump.bdmp"
+
+# Search for function by name/pattern
+bindump.exe search "ProcessEvent" --db "Pinball FX VR Patches\bindump.bdmp"
+
+# List exports from the binary
+bindump.exe exports "." --db "Pinball FX VR Patches\bindump.bdmp"
+
+# Get database info
+bindump.exe info --db "Pinball FX VR Patches\bindump.bdmp"
+
+# View cross-references for a function
+bindump.exe xrefs 0x16774DC --db "Pinball FX VR Patches\bindump.bdmp"
+```
+
+### Key Binary Facts (Pinball FX VR)
+- **libUnreal.so** is STRIPPED — only `.dynsym` with ~1156 symbols (63 JNI exports)
+- **No `.symtab`** — no debug symbols, no function names
+- BINJA address offset: **0x400000** (subtract from BINJA addresses to get file offsets)
+- All UE5 engine functions must be found via **pattern scanning**, **string xrefs**, or **fallback offsets**
+
+### Offset Discovery Workflow
+1. **Find strings**: `strings "FunctionName"` — see if the function name appears in .rodata
+2. **Find xrefs**: `strxrefs "string"` — find which functions reference that string
+3. **Extract function**: `func 0xADDR --extract` — get full decompilation
+4. **Grep for patterns**: `grep "pattern" "c_binja"` or `grep "pattern" "asm_ida"`
+5. **Confirm with xref count**: A global like GEngine will have thousands of xrefs
 
 ---
 
@@ -222,18 +286,22 @@ cd c:\Users\xAstroBoy\Desktop\re4\modloader
 
 ### Deploy Commands (tools/deploy.py)
 ```bash
-python tools\deploy.py mods              # Push all Lua mods (most common)
-python tools\deploy.py mods ModName      # Push specific mod only
+# RE4 VR (default game):
+python tools\deploy.py mods              # Push all Lua mods
 python tools\deploy.py modloader         # Push libmodloader.so
 python tools\deploy.py all               # Push modloader + all mods
 python tools\deploy.py log               # Pull UEModLoader.log
 python tools\deploy.py tombstones        # Pull & purge crash tombstones
 python tools\deploy.py launch            # Kill + relaunch game
-python tools\deploy.py restart           # Force-stop game
-python tools\deploy.py forward           # Set up ADB port forwarding
 python tools\deploy.py console           # Interactive bridge console
-python tools\deploy.py status            # Show mod versions from log
-python tools\deploy.py sdk               # Pull SDK dump from device
+
+# Pinball FX VR (use --game pfxvr):
+python tools\deploy.py --game pfxvr mods
+python tools\deploy.py --game pfxvr all
+python tools\deploy.py --game pfxvr log
+python tools\deploy.py --game pfxvr launch
+python tools\deploy.py --game pfxvr console
+python tools\deploy.py --game pfxvr sdk    # Pull SDK dump from device
 ```
 
 ### Common Workflow

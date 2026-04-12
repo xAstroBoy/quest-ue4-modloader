@@ -14,40 +14,43 @@
 #include <sstream>
 #include <cstring>
 
-namespace lua_ue4ss_types {
+namespace lua_ue4ss_types
+{
 
-// ═══════════════════════════════════════════════════════════════════════
-// UObject Extensions — add missing UE4SS methods to existing UObject type
-// ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // UObject Extensions — add missing UE4SS methods to existing UObject type
+    // ═══════════════════════════════════════════════════════════════════════
 
-void extend_uobject(sol::state& lua) {
-    // We can't modify an existing usertype after creation in sol2,
-    // so we register these as global free functions that accept UObject as first arg.
-    // UE4SS does many of these as methods — we register both the method-style 
-    // (via extended_uobject_methods) and free-function style.
+    void extend_uobject(sol::state &lua)
+    {
+        // We can't modify an existing usertype after creation in sol2,
+        // so we register these as global free functions that accept UObject as first arg.
+        // UE4SS does many of these as methods — we register both the method-style
+        // (via extended_uobject_methods) and free-function style.
 
-    // GetFName(obj) → FName
-    lua.set_function("UObject_GetFName", [](sol::this_state ts, const lua_uobject::LuaUObject& self) -> sol::object {
+        // GetFName(obj) → FName
+        lua.set_function("UObject_GetFName", [](sol::this_state ts, const lua_uobject::LuaUObject &self) -> sol::object
+                         {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         int32_t idx = ue::uobj_get_name_index(self.ptr);
         lua_types::LuaFName fn(idx);
-        return sol::make_object(lua, fn);
-    });
+        return sol::make_object(lua, fn); });
 
-    // GetOuter(obj) → UObject
-    lua.set_function("UObject_GetOuter", [](sol::this_state ts, const lua_uobject::LuaUObject& self) -> sol::object {
+        // GetOuter(obj) → UObject
+        lua.set_function("UObject_GetOuter", [](sol::this_state ts, const lua_uobject::LuaUObject &self) -> sol::object
+                         {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         ue::UObject* outer = ue::uobj_get_outer(self.ptr);
         if (!outer) return sol::nil;
         lua_uobject::LuaUObject wrapped;
         wrapped.ptr = outer;
-        return sol::make_object(lua, wrapped);
-    });
+        return sol::make_object(lua, wrapped); });
 
-    // IsA(obj, className) → bool
-    lua.set_function("UObject_IsA", [](const lua_uobject::LuaUObject& self, sol::object class_arg) -> bool {
+        // IsA(obj, className) → bool
+        lua.set_function("UObject_IsA", [](const lua_uobject::LuaUObject &self, sol::object class_arg) -> bool
+                         {
         if (!self.ptr) return false;
 
         ue::UClass* target_cls = nullptr;
@@ -66,25 +69,25 @@ void extend_uobject(sol::state& lua) {
             if (cls == target_cls) return true;
             cls = reinterpret_cast<ue::UClass*>(ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(cls)));
         }
-        return false;
-    });
+        return false; });
 
-    // HasAllFlags(obj, flags) → bool
-    lua.set_function("UObject_HasAllFlags", [](const lua_uobject::LuaUObject& self, int32_t flags) -> bool {
+        // HasAllFlags(obj, flags) → bool
+        lua.set_function("UObject_HasAllFlags", [](const lua_uobject::LuaUObject &self, int32_t flags) -> bool
+                         {
         if (!self.ptr) return false;
         int32_t obj_flags = ue::uobj_get_flags(self.ptr);
-        return (obj_flags & flags) == flags;
-    });
+        return (obj_flags & flags) == flags; });
 
-    // HasAnyFlags(obj, flags) → bool
-    lua.set_function("UObject_HasAnyFlags", [](const lua_uobject::LuaUObject& self, int32_t flags) -> bool {
+        // HasAnyFlags(obj, flags) → bool
+        lua.set_function("UObject_HasAnyFlags", [](const lua_uobject::LuaUObject &self, int32_t flags) -> bool
+                         {
         if (!self.ptr) return false;
         int32_t obj_flags = ue::uobj_get_flags(self.ptr);
-        return (obj_flags & flags) != 0;
-    });
+        return (obj_flags & flags) != 0; });
 
-    // GetWorld(obj) → UObject (WorldContext)
-    lua.set_function("UObject_GetWorld", [](sol::this_state ts, const lua_uobject::LuaUObject& self) -> sol::object {
+        // GetWorld(obj) → UObject (WorldContext)
+        lua.set_function("UObject_GetWorld", [](sol::this_state ts, const lua_uobject::LuaUObject &self) -> sol::object
+                         {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         if (!symbols::GWorld) return sol::nil;
@@ -92,11 +95,11 @@ void extend_uobject(sol::state& lua) {
         if (!world) return sol::nil;
         lua_uobject::LuaUObject wrapped;
         wrapped.ptr = world;
-        return sol::make_object(lua, wrapped);
-    });
+        return sol::make_object(lua, wrapped); });
 
-    // type(obj) → string (the UE4SS "type" that returns "UObject", "AActor", "UClass" etc)
-    lua.set_function("UObject_type", [](const lua_uobject::LuaUObject& self) -> std::string {
+        // type(obj) → string (the UE4SS "type" that returns "UObject", "AActor", "UClass" etc)
+        lua.set_function("UObject_type", [](const lua_uobject::LuaUObject &self) -> std::string
+                         {
         if (!self.ptr) return "nil";
         ue::UClass* cls = ue::uobj_get_class(self.ptr);
         if (!cls) return "UObject";
@@ -107,13 +110,12 @@ void extend_uobject(sol::state& lua) {
             std::string meta_name = reflection::get_short_name(reinterpret_cast<const ue::UObject*>(meta));
             if (meta_name == "Class") return "UClass";
         }
-        return name;
-    });
+        return name; });
 
-    // GetPropertyValue(obj, propName) → RemoteUnrealParam-wrapped value
-    // UE4SS uses this to get typed property access
-    lua.set_function("UObject_GetPropertyValue", [](sol::this_state ts,
-            lua_uobject::LuaUObject& self, const std::string& prop_name) -> sol::object {
+        // GetPropertyValue(obj, propName) → RemoteUnrealParam-wrapped value
+        // UE4SS uses this to get typed property access
+        lua.set_function("UObject_GetPropertyValue", [](sol::this_state ts, lua_uobject::LuaUObject &self, const std::string &prop_name) -> sol::object
+                         {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
 
@@ -159,23 +161,24 @@ void extend_uobject(sol::state& lua) {
                 param.param_type = PT::RawPtr; break;
         }
 
-        return sol::make_object(lua, param);
-    });
+        return sol::make_object(lua, param); });
 
-    logger::log_info("LUA", "UObject extensions registered (GetFName, GetOuter, IsA, flags, etc.)");
-}
+        logger::log_info("LUA", "UObject extensions registered (GetFName, GetOuter, IsA, flags, etc.)");
+    }
 
-// ═══════════════════════════════════════════════════════════════════════
-// UClass usertype
-// ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // UClass usertype
+    // ═══════════════════════════════════════════════════════════════════════
 
-void register_uclass_type(sol::state& lua) {
-    // UClass inherits all UObject methods + adds its own
-    // Registered as a separate "UClass" type table with helper functions
-    sol::table t = lua.create_named_table("UClassMethods");
+    void register_uclass_type(sol::state &lua)
+    {
+        // UClass inherits all UObject methods + adds its own
+        // Registered as a separate "UClass" type table with helper functions
+        sol::table t = lua.create_named_table("UClassMethods");
 
-    // GetCDO(classObj) → UObject
-    t.set_function("GetCDO", [](sol::this_state ts, const lua_uobject::LuaUObject& self) -> sol::object {
+        // GetCDO(classObj) → UObject
+        t.set_function("GetCDO", [](sol::this_state ts, const lua_uobject::LuaUObject &self) -> sol::object
+                       {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         std::string name = reflection::get_short_name(self.ptr);
@@ -183,12 +186,11 @@ void register_uclass_type(sol::state& lua) {
         if (!cdo) return sol::nil;
         lua_uobject::LuaUObject wrapped;
         wrapped.ptr = cdo;
-        return sol::make_object(lua, wrapped);
-    });
+        return sol::make_object(lua, wrapped); });
 
-    // IsChildOf(classObj, parentClassObj) → bool
-    t.set_function("IsChildOf", [](const lua_uobject::LuaUObject& self,
-                                    const lua_uobject::LuaUObject& parent) -> bool {
+        // IsChildOf(classObj, parentClassObj) → bool
+        t.set_function("IsChildOf", [](const lua_uobject::LuaUObject &self, const lua_uobject::LuaUObject &parent) -> bool
+                       {
         if (!self.ptr || !parent.ptr) return false;
         ue::UClass* cls = reinterpret_cast<ue::UClass*>(self.ptr);
         ue::UClass* target = reinterpret_cast<ue::UClass*>(parent.ptr);
@@ -197,22 +199,22 @@ void register_uclass_type(sol::state& lua) {
             cls = reinterpret_cast<ue::UClass*>(
                 ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(cls)));
         }
-        return false;
-    });
+        return false; });
 
-    // GetSuperStruct(classObj) → UObject (parent class)
-    t.set_function("GetSuperStruct", [](sol::this_state ts, const lua_uobject::LuaUObject& self) -> sol::object {
+        // GetSuperStruct(classObj) → UObject (parent class)
+        t.set_function("GetSuperStruct", [](sol::this_state ts, const lua_uobject::LuaUObject &self) -> sol::object
+                       {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         ue::UStruct* super = ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(self.ptr));
         if (!super) return sol::nil;
         lua_uobject::LuaUObject wrapped;
         wrapped.ptr = reinterpret_cast<ue::UObject*>(super);
-        return sol::make_object(lua, wrapped);
-    });
+        return sol::make_object(lua, wrapped); });
 
-    // ForEachFunction(classObj, callback)
-    t.set_function("ForEachFunction", [](const lua_uobject::LuaUObject& self, sol::function callback) {
+        // ForEachFunction(classObj, callback)
+        t.set_function("ForEachFunction", [](const lua_uobject::LuaUObject &self, sol::function callback)
+                       {
         if (!self.ptr) return;
         auto funcs = reflection::walk_functions(
             reinterpret_cast<ue::UStruct*>(self.ptr), true);
@@ -223,11 +225,11 @@ void register_uclass_type(sol::state& lua) {
             if (result.valid() && result.get_type() == sol::type::boolean && result.get<bool>()) {
                 break; // return true from callback to stop
             }
-        }
-    });
+        } });
 
-    // ForEachProperty(classObj, callback)
-    t.set_function("ForEachProperty", [](sol::this_state ts, const lua_uobject::LuaUObject& self, sol::function callback) {
+        // ForEachProperty(classObj, callback)
+        t.set_function("ForEachProperty", [](sol::this_state ts, const lua_uobject::LuaUObject &self, sol::function callback)
+                       {
         sol::state_view lua(ts);
         if (!self.ptr) return;
         auto props = reflection::walk_properties(
@@ -243,62 +245,64 @@ void register_uclass_type(sol::state& lua) {
             if (result.valid() && result.get_type() == sol::type::boolean && result.get<bool>()) {
                 break;
             }
-        }
-    });
+        } });
 
-    logger::log_info("LUA", "UClassMethods table registered");
-}
+        logger::log_info("LUA", "UClassMethods table registered");
+    }
 
-// ═══════════════════════════════════════════════════════════════════════
-// UFunction usertype helpers
-// ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // UFunction usertype helpers
+    // ═══════════════════════════════════════════════════════════════════════
 
-void register_ufunction_type(sol::state& lua) {
-    sol::table t = lua.create_named_table("UFunctionMethods");
+    void register_ufunction_type(sol::state &lua)
+    {
+        sol::table t = lua.create_named_table("UFunctionMethods");
 
-    // GetFunctionFlags(funcObj) → int
-    t.set_function("GetFunctionFlags", [](const lua_uobject::LuaUObject& self) -> uint32_t {
+        // GetFunctionFlags(funcObj) → int
+        t.set_function("GetFunctionFlags", [](const lua_uobject::LuaUObject &self) -> uint32_t
+                       {
         if (!self.ptr) return 0;
-        return ue::ufunc_get_flags(reinterpret_cast<ue::UFunction*>(self.ptr));
-    });
+        return ue::ufunc_get_flags(reinterpret_cast<ue::UFunction*>(self.ptr)); });
 
-    // SetFunctionFlags(funcObj, flags)
-    t.set_function("SetFunctionFlags", [](const lua_uobject::LuaUObject& self, uint32_t flags) {
+        // SetFunctionFlags(funcObj, flags)
+        t.set_function("SetFunctionFlags", [](const lua_uobject::LuaUObject &self, uint32_t flags)
+                       {
         if (!self.ptr) return;
-        ue::write_field(self.ptr, ue::ufunc::FUNCTION_FLAGS, flags);
-    });
+        ue::write_field(self.ptr, ue::ufunc::FUNCTION_FLAGS_OFF(), flags); });
 
-    // GetNumParms(funcObj) → int
-    t.set_function("GetNumParms", [](const lua_uobject::LuaUObject& self) -> int {
+        // GetNumParms(funcObj) → int
+        t.set_function("GetNumParms", [](const lua_uobject::LuaUObject &self) -> int
+                       {
         if (!self.ptr) return 0;
-        return ue::ufunc_get_num_parms(reinterpret_cast<ue::UFunction*>(self.ptr));
-    });
+        return ue::ufunc_get_num_parms(reinterpret_cast<ue::UFunction*>(self.ptr)); });
 
-    // GetParmsSize(funcObj) → int
-    t.set_function("GetParmsSize", [](const lua_uobject::LuaUObject& self) -> int {
+        // GetParmsSize(funcObj) → int
+        t.set_function("GetParmsSize", [](const lua_uobject::LuaUObject &self) -> int
+                       {
         if (!self.ptr) return 0;
-        return ue::ufunc_get_parms_size(reinterpret_cast<ue::UFunction*>(self.ptr));
-    });
+        return ue::ufunc_get_parms_size(reinterpret_cast<ue::UFunction*>(self.ptr)); });
 
-    // GetNativeFunc(funcObj) → lightuserdata
-    t.set_function("GetNativeFunc", [](const lua_uobject::LuaUObject& self) -> sol::lightuserdata_value {
+        // GetNativeFunc(funcObj) → lightuserdata
+        t.set_function("GetNativeFunc", [](const lua_uobject::LuaUObject &self) -> sol::lightuserdata_value
+                       {
         if (!self.ptr) return sol::lightuserdata_value(nullptr);
         return sol::lightuserdata_value(
-            ue::ufunc_get_func_ptr(reinterpret_cast<ue::UFunction*>(self.ptr)));
-    });
+            ue::ufunc_get_func_ptr(reinterpret_cast<ue::UFunction*>(self.ptr))); });
 
-    logger::log_info("LUA", "UFunctionMethods table registered");
-}
+        logger::log_info("LUA", "UFunctionMethods table registered");
+    }
 
-// ═══════════════════════════════════════════════════════════════════════
-// UEnum helpers
-// ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // UEnum helpers
+    // ═══════════════════════════════════════════════════════════════════════
 
-void register_uenum_type(sol::state& lua) {
-    sol::table t = lua.create_named_table("UEnumMethods");
+    void register_uenum_type(sol::state &lua)
+    {
+        sol::table t = lua.create_named_table("UEnumMethods");
 
-    // GetNameByValue(enumObj, value) → string
-    t.set_function("GetNameByValue", [](const lua_uobject::LuaUObject& self, int64_t value) -> std::string {
+        // GetNameByValue(enumObj, value) → string
+        t.set_function("GetNameByValue", [](const lua_uobject::LuaUObject &self, int64_t value) -> std::string
+                       {
         if (!self.ptr) return "";
         // Read the enum names array
         void* names_data = ue::read_field<void*>(self.ptr, ue::uenum::NAMES_DATA);
@@ -313,12 +317,11 @@ void register_uenum_type(sol::state& lua) {
                 return reflection::fname_to_string(fname_idx);
             }
         }
-        return "";
-    });
+        return ""; });
 
-    // GetValueByName(enumObj, name) → int or nil
-    t.set_function("GetValueByName", [](sol::this_state ts, const lua_uobject::LuaUObject& self,
-                                         const std::string& name) -> sol::object {
+        // GetValueByName(enumObj, name) → int or nil
+        t.set_function("GetValueByName", [](sol::this_state ts, const lua_uobject::LuaUObject &self, const std::string &name) -> sol::object
+                       {
         sol::state_view lua(ts);
         if (!self.ptr) return sol::nil;
         void* names_data = ue::read_field<void*>(self.ptr, ue::uenum::NAMES_DATA);
@@ -334,11 +337,11 @@ void register_uenum_type(sol::state& lua) {
                 return sol::make_object(lua, static_cast<double>(enum_val));
             }
         }
-        return sol::nil;
-    });
+        return sol::nil; });
 
-    // ForEachName(enumObj, callback)
-    t.set_function("ForEachName", [](const lua_uobject::LuaUObject& self, sol::function callback) {
+        // ForEachName(enumObj, callback)
+        t.set_function("ForEachName", [](const lua_uobject::LuaUObject &self, sol::function callback)
+                       {
         if (!self.ptr) return;
         void* names_data = ue::read_field<void*>(self.ptr, ue::uenum::NAMES_DATA);
         int32_t names_num = ue::read_field<int32_t>(self.ptr, ue::uenum::NAMES_NUM);
@@ -354,29 +357,29 @@ void register_uenum_type(sol::state& lua) {
             if (result.valid() && result.get_type() == sol::type::boolean && result.get<bool>()) {
                 break;
             }
-        }
-    });
+        } });
 
-    // NumEnums(enumObj) → int
-    t.set_function("NumEnums", [](const lua_uobject::LuaUObject& self) -> int {
+        // NumEnums(enumObj) → int
+        t.set_function("NumEnums", [](const lua_uobject::LuaUObject &self) -> int
+                       {
         if (!self.ptr) return 0;
-        return ue::read_field<int32_t>(self.ptr, ue::uenum::NAMES_NUM);
-    });
+        return ue::read_field<int32_t>(self.ptr, ue::uenum::NAMES_NUM); });
 
-    logger::log_info("LUA", "UEnumMethods table registered");
-}
+        logger::log_info("LUA", "UEnumMethods table registered");
+    }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Register ALL extended types
-// ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // Register ALL extended types
+    // ═══════════════════════════════════════════════════════════════════════
 
-void register_all(sol::state& lua) {
-    extend_uobject(lua);
-    register_uclass_type(lua);
-    register_ufunction_type(lua);
-    register_uenum_type(lua);
+    void register_all(sol::state &lua)
+    {
+        extend_uobject(lua);
+        register_uclass_type(lua);
+        register_ufunction_type(lua);
+        register_uenum_type(lua);
 
-    logger::log_info("LUA", "UE4SS-compatible extended types registered");
-}
+        logger::log_info("LUA", "UE4SS-compatible extended types registered");
+    }
 
 } // namespace lua_ue4ss_types

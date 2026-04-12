@@ -1,16 +1,16 @@
 @echo off
 setlocal
 
-set NDK=C:\Android\ndk\23.1.7779620
+set "NDK=C:\Program Files (x86)\Android\AndroidNDK\android-ndk-r23c"
 set ABI=arm64-v8a
 set API=24
-set TOOLCHAIN=%NDK%\build\cmake\android.toolchain.cmake
+set "TOOLCHAIN=%NDK%\build\cmake\android.toolchain.cmake"
 
 if not exist build mkdir build
 cd build
 
 cmake -G Ninja ^
-    -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% ^
+    "-DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN%" ^
     -DANDROID_ABI=%ABI% ^
     -DANDROID_PLATFORM=android-%API% ^
     -DANDROID_STL=c++_static ^

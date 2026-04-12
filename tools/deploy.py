@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 """
-RE4VR Modloader Deploy Tool — SFTP-first, ADB fallback.
+UE Modloader Deploy Tool — SFTP-first, ADB fallback.
 
 Usage:
-    python deploy.py modloader          Push libmodloader.so to device
-    python deploy.py mods               Push all mods to device
-    python deploy.py mods Patches       Push specific mod(s)
-    python deploy.py all                Push modloader + all mods
-    python deploy.py log                Pull UEModLoader.log
-    python deploy.py pe_trace           Pull pe_trace.log
-    python deploy.py sdk                Pull generated SDK from device
-    python deploy.py tombstones         Pull & purge tombstones
-    python deploy.py restart            Force-stop the game
-    python deploy.py launch             Kill + relaunch the game
-    python deploy.py ensure             Ensure game is running (restart if needed)
-    python deploy.py status             Show mod versions from log
-    python deploy.py forward            Set up adb port forwarding (tcp:19420)
-    python deploy.py console            Interactive ADB bridge console
+    python deploy.py modloader              Push libmodloader.so to device
+    python deploy.py mods                   Push all mods to device
+    python deploy.py mods Patches           Push specific mod(s)
+    python deploy.py all                    Push modloader + all mods
+    python deploy.py log                    Pull UEModLoader.log
+    python deploy.py pe_trace               Pull pe_trace.log
+    python deploy.py sdk                    Pull generated SDK from device
+    python deploy.py tombstones             Pull & purge tombstones
+    python deploy.py restart                Force-stop the game
+    python deploy.py launch                 Kill + relaunch the game
+    python deploy.py ensure                 Ensure game is running (restart if needed)
+    python deploy.py status                 Show mod versions from log
+    python deploy.py forward                Set up adb port forwarding (tcp:19420)
+    python deploy.py console                Interactive ADB bridge console
+
+Game selection (pick one):
+    --game re4                              Target RE4 VR (default)
+    --game pfxvr                            Target Pinball FX VR
+    GAME=pfxvr python deploy.py modloader   Via env var
 
 Env vars (optional):
-    QUEST_IP        Device IP (default: 192.168.1.15)
+    QUEST_IP        Device IP (default: 192.168.1.9)
     QUEST_SSH_KEY   SSH key path (default: ~/.ssh/quest_root)
     ADB_SERIAL      ADB serial (default: auto-detect or $QUEST_IP:5555)
+    GAME            Target game: re4, pfxvr (default: auto-detect)
 """
 import argparse
 import os
@@ -34,18 +40,101 @@ from pathlib import Path
 # CONFIG — all derived from env vars or defaults
 # ═══════════════════════════════════════════════════════════════════════
 
-QUEST_IP = os.environ.get("QUEST_IP", "192.168.1.15")
+QUEST_IP = os.environ.get("QUEST_IP", "192.168.1.9")
 SSH_KEY = os.environ.get("QUEST_SSH_KEY",
     str(Path.home() / ".ssh" / "quest_root"))
 ADB_SERIAL = os.environ.get("ADB_SERIAL", "")  # will auto-detect if empty
 
-PKG = "com.Armature.VR4"
-APK_LIB_PATH = (
-    "/data/app/~~oJ6qrGbx0E_HVDUVWw-U2g==/"
-    "com.Armature.VR4-E18UVaMhj3ERp6JCKpdrSQ==/lib/arm64"
-)
-MODS_DEVICE = f"/storage/emulated/0/Android/data/{PKG}/files/mods"
-LOG_DEVICE = f"/storage/emulated/0/Android/data/{PKG}/files/UEModLoader.log"
+# ─── Multi-game profiles ──────────────────────────────────────────────
+# Each game has: pkg, activity, apk_lib_path (auto-detected at runtime)
+GAME_PROFILES = {
+    "re4": {
+        "pkg": "com.Armature.VR4",
+        "activity": "com.epicgames.ue4.GameActivity",
+        "mods_subdir": "re4",
+    },
+    "pfxvr": {
+        "pkg": "com.zenstudios.PFXVRQuest",
+        "activity": "com.epicgames.unreal.GameActivity",
+        "mods_subdir": "pfx",
+    },
+}
+
+# Select game from env var GAME (default: auto-detect running game, else re4)
+_game_key = os.environ.get("GAME", "").lower()
+
+def _detect_game() -> str:
+    """Auto-detect which game is installed/running on device."""
+    global _game_key
+    if _game_key and _game_key in GAME_PROFILES:
+        return _game_key
+    # Try to detect via ADB — check which package exists
+    for key, prof in GAME_PROFILES.items():
+        try:
+            r = subprocess.run(
+                ["adb", "shell", f"pm path {prof['pkg']}"],
+                capture_output=True, text=True, timeout=5, check=False
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                _game_key = key
+                return key
+        except Exception:
+            pass
+    return "re4"  # fallback
+
+
+def _find_apk_lib_path(pkg: str) -> str:
+    """Find the APK lib/arm64 path for a package via root SSH."""
+    try:
+        r = subprocess.run(
+            ["ssh", "-i", SSH_KEY, "-oConnectTimeout=3",
+             f"root@{QUEST_IP}",
+             f"find /data/app -path '*{pkg}*' -name 'lib' -type d 2>/dev/null"],
+            capture_output=True, text=True, timeout=10, check=False
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lib_dir = r.stdout.strip().splitlines()[0]
+            return f"{lib_dir}/arm64"
+    except Exception:
+        pass
+    # Hardcoded fallbacks
+    fallbacks = {
+        "com.Armature.VR4": (
+            "/data/app/~~oJ6qrGbx0E_HVDUVWw-U2g==/"
+            "com.Armature.VR4-E18UVaMhj3ERp6JCKpdrSQ==/lib/arm64"
+        ),
+        "com.zenstudios.PFXVRQuest": (
+            "/data/app/~~UsV39PPZPhjfO7ZUs03PuA==/"
+            "com.zenstudios.PFXVRQuest-FijRqQ-2zYyCGfeurQ0y4A==/lib/arm64"
+        ),
+    }
+    return fallbacks.get(pkg, f"/data/app/{pkg}/lib/arm64")
+
+
+def _init_game_config(game_key: str | None = None):
+    """Initialize global config vars for the selected game."""
+    global PKG, APK_LIB_PATH, MODS_DEVICE, LOG_DEVICE, GAME_ACTIVITY, MODS_DIR
+    key = game_key or _detect_game()
+    prof = GAME_PROFILES.get(key, GAME_PROFILES["re4"])
+    PKG = prof["pkg"]
+    GAME_ACTIVITY = prof["activity"]
+    APK_LIB_PATH = _find_apk_lib_path(PKG)
+    MODS_DEVICE = f"/storage/emulated/0/Android/data/{PKG}/files/mods"
+    LOG_DEVICE = f"/storage/emulated/0/Android/data/{PKG}/files/UEModLoader.log"
+    # Use game-specific mods subdirectory if configured
+    subdir = prof.get("mods_subdir")
+    if subdir:
+        MODS_DIR = PROJECT_ROOT / "mods" / subdir
+    else:
+        MODS_DIR = PROJECT_ROOT / "mods"
+
+
+# These will be set by _init_game_config() in main()
+PKG = ""
+APK_LIB_PATH = ""
+MODS_DEVICE = ""
+LOG_DEVICE = ""
+GAME_ACTIVITY = ""
 TOMBSTONE_DIR = "/data/tombstones"
 
 # Project paths — relative to this script's parent dir (project root)
@@ -149,31 +238,59 @@ def adb_forward() -> bool:
 
 
 def adb_push_fallback(local: Path, remote: str) -> bool:
-    """ADB push as fallback when SFTP fails. Uses /data/local/tmp staging."""
+    """ADB push as fallback when SFTP fails. Uses /data/local/tmp staging.
+    Tries cp, then dd, then scp as root for incremental-fs."""
     tmp = f"/data/local/tmp/{local.name}"
     try:
         r = adb("push", str(local), tmp, check=False)
         if r.returncode != 0:
             print(f"  [ADB FAIL] push: {r.stderr.strip()}")
             return False
+
+        # Try cp first (works on normal filesystems)
         r2 = adb_shell(f"cp {tmp} {remote}", check=False)
-        if r2.returncode != 0:
-            print(f"  [ADB FAIL] cp: {r2.stderr.strip()}")
-            return False
+        if r2.returncode == 0:
+            adb_shell(f"rm {tmp}", check=False)
+            return True
+        print(f"  [ADB] cp failed, trying dd...")
+
+        # Try dd (may bypass some permission checks)
+        r3 = adb_shell(f"dd if={tmp} of={remote} 2>/dev/null && chmod 755 {remote}", check=False)
+        if r3.returncode == 0:
+            adb_shell(f"rm {tmp}", check=False)
+            return True
+        print(f"  [ADB] dd failed, trying scp via root SSH...")
+
+        # Try scp from localhost as root (SFTP already failed, try raw scp)
+        try:
+            scp_r = subprocess.run(
+                ["ssh", "-i", SSH_KEY, "-oConnectTimeout=3",
+                 f"root@{QUEST_IP}",
+                 f"cp {tmp} '{remote}' 2>&1 || "
+                 f"dd if={tmp} of='{remote}' 2>/dev/null && chmod 755 '{remote}'"],
+                capture_output=True, text=True, timeout=15, check=False
+            )
+            if scp_r.returncode == 0:
+                adb_shell(f"rm {tmp}", check=False)
+                return True
+        except Exception:
+            pass
+
+        print(f"  [ADB FAIL] all copy methods failed for {remote}")
         adb_shell(f"rm {tmp}", check=False)
-        return True
+        return False
     except Exception as e:
         print(f"  [ADB FAIL] {e}")
         return False
 
 
 def push_file(local: Path, remote: str) -> bool:
-    """Push a file — SFTP first, ADB fallback."""
+    """Push a file — SFTP first, ADB fallback, root dd last resort."""
     local_posix = str(local).replace("\\", "/")
     print(f"  {local.name} → {remote}")
 
-    # Try SFTP first
-    if sftp_batch([f"put {local_posix} {remote}"]):
+    # Try SFTP first (quote paths for spaces)
+    if sftp_batch([f'put "{local_posix}" "{remote}"']):
         print(f"  ✓ SFTP OK")
         return True
 
@@ -349,6 +466,73 @@ def cmd_console():
     return True
 
 
+def _tmpfs_overlay_deploy(local_so: Path) -> bool:
+    """Deploy .so via tmpfs overlay when incremental-fs blocks direct writes.
+    Steps: SCP .so to /data/local/tmp, backup originals, mount tmpfs, restore + add."""
+    remote_tmp = f"/data/local/tmp/{local_so.name}"
+    backup_dir = "/data/local/tmp/pfxvr_backup"
+    script = f"""#!/system/bin/sh
+set -e
+LIB_DIR=$(find /data/app -path '*{PKG}*/lib/arm64' -type d 2>/dev/null | head -1)
+[ -z "$LIB_DIR" ] && echo "ERROR: lib dir not found" && exit 1
+echo "LIB_DIR=$LIB_DIR"
+
+# Check if tmpfs already mounted (re-deploy case)
+if mount | grep -q "$LIB_DIR.*tmpfs"; then
+    echo "tmpfs already mounted — copying directly"
+    cp {remote_tmp} "$LIB_DIR/{local_so.name}"
+    chmod 755 "$LIB_DIR/{local_so.name}"
+    ls -la "$LIB_DIR/{local_so.name}"
+    echo "DONE — updated {local_so.name} on existing tmpfs"
+    exit 0
+fi
+
+# Fresh mount: backup, mount tmpfs, restore + add
+mkdir -p {backup_dir}
+for f in "$LIB_DIR"/*.so; do
+    fname=$(basename "$f")
+    [ ! -f "{backup_dir}/$fname" ] && cp "$f" "{backup_dir}/$fname"
+done
+mount -t tmpfs tmpfs "$LIB_DIR"
+for f in {backup_dir}/*.so; do
+    cp "$f" "$LIB_DIR/$(basename $f)"
+done
+cp {remote_tmp} "$LIB_DIR/{local_so.name}"
+chmod 755 "$LIB_DIR"/*.so
+ls -la "$LIB_DIR/{local_so.name}"
+echo "DONE — {local_so.name} deployed via tmpfs overlay"
+"""
+    # SCP the .so to device
+    print("  [TMPFS] SCP .so to device staging...")
+    try:
+        r = subprocess.run(
+            ["scp", "-i", SSH_KEY, str(local_so), f"root@{QUEST_IP}:{remote_tmp}"],
+            capture_output=True, text=True, timeout=60, check=False
+        )
+        if r.returncode != 0:
+            print(f"  [TMPFS FAIL] SCP: {r.stderr.strip()}")
+            return False
+    except Exception as e:
+        print(f"  [TMPFS FAIL] SCP: {e}")
+        return False
+
+    # Run the overlay script via SSH
+    print("  [TMPFS] Running overlay deploy via SSH...")
+    try:
+        r = subprocess.run(
+            ["ssh", "-i", SSH_KEY, f"root@{QUEST_IP}", script],
+            capture_output=True, text=True, timeout=30, check=False
+        )
+        for line in (r.stdout + r.stderr).strip().splitlines():
+            print(f"  [TMPFS] {line}")
+        if r.returncode == 0 and "DONE" in r.stdout:
+            return True
+        return False
+    except Exception as e:
+        print(f"  [TMPFS FAIL] SSH: {e}")
+        return False
+
+
 def cmd_modloader():
     """Push libmodloader.so to device."""
     print("[DEPLOY] Pushing modloader...")
@@ -358,9 +542,17 @@ def cmd_modloader():
         return False
     size_mb = MODLOADER_SO.stat().st_size / (1024 * 1024)
     print(f"  Size: {size_mb:.1f} MB")
+
+    # Try SFTP direct first
     ok = push_file(MODLOADER_SO, f"{APK_LIB_PATH}/libmodloader.so")
+
+    # If direct push failed, try tmpfs overlay (for incremental-fs)
+    if not ok:
+        print("  ⚠ Direct push failed — trying tmpfs overlay deploy...")
+        ok = _tmpfs_overlay_deploy(MODLOADER_SO)
+
     if ok:
-        # ensure ADB bridge forwarding
+        print("  ✓ Modloader deployed")
         print("[INFO] setting up ADB forward for command bridge...")
         adb_forward()
     return ok
@@ -402,7 +594,7 @@ def cmd_mods(mod_names: list[str] | None = None):
         lua_file = mod / "main.lua"
         local_posix = str(lua_file).replace("\\", "/")
         remote = f"{MODS_DEVICE}/{mod.name}/main.lua"
-        sftp_cmds.append(f"put {local_posix} {remote}")
+        sftp_cmds.append(f'put "{local_posix}" "{remote}"')
         print(f"  {mod.name}/main.lua")
 
     if sftp_batch(sftp_cmds):
@@ -432,7 +624,7 @@ def cmd_all():
 
 def cmd_restart():
     """Force-stop the game."""
-    print("[RESTART] Stopping com.Armature.VR4...")
+    print(f"[RESTART] Stopping {PKG}...")
     try:
         adb("shell", f"am force-stop {PKG}", check=False)
         print("  ✓ Game stopped")
@@ -446,7 +638,7 @@ def cmd_ensure():
     """Ensure the game is running.  If not running, start it; if already
     running, kill and restart it to guarantee a fresh process."""
     # if pid exists we still restart to give a clean state
-    print("[ENSURE] ensuring RE4 VR process is running (will restart if needed)")
+    print(f"[ENSURE] ensuring {PKG} process is running (will restart if needed)")
     return cmd_launch()
 
 
@@ -454,7 +646,7 @@ def cmd_launch():
     """Kill the game, then launch it fresh."""
     import time
 
-    print("[LAUNCH] Killing RE4 VR...")
+    print(f"[LAUNCH] Killing {PKG}...")
     adb("shell", f"am force-stop {PKG}", check=False)
     adb("shell", f"su -c 'pkill -9 -f {PKG}'", check=False)
     adb("shell", f"su -c 'killall -9 {PKG}'", check=False)
@@ -468,8 +660,8 @@ def cmd_launch():
 
     time.sleep(1)
 
-    print("[LAUNCH] Starting RE4 VR...")
-    activity = f"{PKG}/com.epicgames.ue4.GameActivity"
+    print(f"[LAUNCH] Starting {PKG}...")
+    activity = f"{PKG}/{GAME_ACTIVITY}"
     r = adb("shell", f"am start -n {activity}", check=False)
     if r.stderr and "Error" in r.stderr:
         print(f"  ✗ Launch error: {r.stderr.strip()}")
@@ -499,7 +691,7 @@ def cmd_log():
     local_posix = str(local).replace("\\", "/")
     print(f"[LOG] Pulling UEModLoader.log...")
 
-    if sftp_batch([f"get {LOG_DEVICE} {local_posix}"]):
+    if sftp_batch([f'get "{LOG_DEVICE}" "{local_posix}"']):
         print(f"  ✓ Saved to {local}")
         return True
 
@@ -542,7 +734,7 @@ def cmd_tombstones():
         local.parent.mkdir(exist_ok=True)
         local_posix = str(local).replace("\\", "/")
 
-        pulled = sftp_batch([f"get {remote} {local_posix}"])
+        pulled = sftp_batch([f'get "{remote}" "{local_posix}"'])
         if not pulled:
             r = adb_shell(f"cat {remote}", check=False)
             if r.returncode == 0:
@@ -568,7 +760,7 @@ def cmd_pe_trace():
     pe_trace_device = f"/storage/emulated/0/Android/data/{PKG}/files/pe_trace.log"
     print("[PE_TRACE] Pulling pe_trace.log...")
 
-    if sftp_batch([f"get {pe_trace_device} {local_posix}"]):
+    if sftp_batch([f'get "{pe_trace_device}" "{local_posix}"']):
         print(f"  ✓ Saved to {local}")
         return True
 
@@ -629,7 +821,7 @@ def cmd_status():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="RE4VR Modloader Deploy Tool — SFTP-first, ADB fallback"
+        description="UE Modloader Deploy Tool — SFTP-first, ADB fallback"
     )
     parser.add_argument(
         "command",
@@ -646,12 +838,28 @@ def main():
         "--no-restart", action="store_true",
         help="Don't force-stop the game after deploy"
     )
+    parser.add_argument(
+        "--game", "-g",
+        choices=list(GAME_PROFILES.keys()),
+        default=os.environ.get("GAME", "").lower() or None,
+        help="Target game (default: auto-detect). Can also set GAME env var."
+    )
     args = parser.parse_args()
 
-    print(f"═══ RE4VR Deploy Tool ═══")
+    # Initialize game config BEFORE any commands
+    _init_game_config(args.game)
+
+    game_label = {
+        "com.Armature.VR4": "RE4 VR",
+        "com.zenstudios.PFXVRQuest": "Pinball FX VR",
+    }.get(PKG, PKG)
+
+    print(f"═══ UE Modloader Deploy Tool ═══")
+    print(f"  Game:    {game_label} ({PKG})")
     print(f"  Device:  {QUEST_IP}")
     print(f"  ADB:     {get_adb_serial()}")
     print(f"  SSH Key: {SSH_KEY}")
+    print(f"  Lib:     {APK_LIB_PATH}")
     print()
 
     ok = True

@@ -26,6 +26,7 @@ set(MOD_SOURCES
     src/core/paths.cpp
     src/core/pattern_scanner.cpp
     src/core/object_monitor.cpp
+    src/core/game_profile.cpp
     src/hook/process_event_hook.cpp
     src/hook/pe_trace.cpp
     src/hook/native_hooks.cpp

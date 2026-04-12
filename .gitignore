@@ -34,6 +34,35 @@ modloader/third_party/sol2_repo/
 # ── Junk / experimental ──────────────────────────────────────────────
 Junk/
 
+# ── Pinball FX VR Patches (huge BDMP database ~7GB) ─────────────────
+Pinball FX VR Patches/
+
+# ── Binary analysis extracted data ───────────────────────────────────
+extracted/
+
+# ── Installer build artifacts ────────────────────────────────────────
+installer_err.txt
+installer_out.txt
+installer_output.txt
+
+# ── Rust build output ────────────────────────────────────────────────
+tools/bindump/target/
+installer/target/
+
+# ── Root-level test/diagnostic scripts (personal) ────────────────────
+diagnose_mods.py
+quick_test.py
+test_*.py
+verify_mods.py
+
+# ── NDK / SDK local copies ──────────────────────────────────────────
+sdks/
+
+# ── Tools exploration scripts (personal) ─────────────────────────────
+tools/explore_*.py
+tools/ping.py
+tools/quick_test.py
+
 # ── Logs & crash dumps ───────────────────────────────────────────────
 logs/
 *.log
