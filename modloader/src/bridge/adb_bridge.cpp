@@ -433,6 +433,117 @@ namespace adb_bridge
             return ok_response("pong");
         }
 
+        // ═══ exec_console — execute a UE console command via bridge ═════════
+        // Usage: {"cmd": "exec_console", "command": "stat fps"}
+        // This runs the command via PlayerController::ConsoleCommand (ProcessEvent)
+        // which works even in shipping builds (no FExec::Exec guard).
+        if (command == "exec_console")
+        {
+            if (!cmd.contains("command"))
+                return error_response("exec_console: missing 'command' field");
+            std::string console_cmd = cmd["command"].get<std::string>();
+
+            // exec_console must run on the game thread (PlayerController access is game-thread only)
+            // Queue it and wait for result
+            std::string exec_result;
+            std::mutex mtx;
+            std::condition_variable cv;
+            bool done = false;
+
+            pe_hook::queue_game_thread([&]()
+                                       {
+                // Find PlayerController
+                ue::UObject* pc = nullptr;
+                static const char* pc_classes[] = {
+                    "BP_PlayerController_C", "VR4PlayerController_BP_C",
+                    "PFXPlayerController", "PlayerController", nullptr
+                };
+                for (int i = 0; pc_classes[i] && !pc; i++) {
+                    auto* rc = rebuilder::rebuild(pc_classes[i]);
+                    if (rc) pc = rc->get_first_instance();
+                }
+                if (!pc) pc = reflection::find_first_instance("PlayerController");
+
+                if (!pc) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    exec_result = "ERROR: no PlayerController";
+                    done = true;
+                    cv.notify_one();
+                    return;
+                }
+
+                auto* func = pe_hook::resolve_func_path("PlayerController:ConsoleCommand");
+                if (!func) {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    exec_result = "ERROR: ConsoleCommand not found";
+                    done = true;
+                    cv.notify_one();
+                    return;
+                }
+
+                uint16_t parms_size = ue::ufunc_get_parms_size(func);
+                std::vector<uint8_t> parms(parms_size > 0 ? parms_size : 128, 0);
+
+                std::u16string u16cmd(console_cmd.begin(), console_cmd.end());
+                u16cmd.push_back(u'\0');
+                struct FStr { const char16_t* data; int32_t num, max; };
+                FStr fs;
+                fs.data = u16cmd.c_str();
+                fs.num = static_cast<int32_t>(u16cmd.size());
+                fs.max = fs.num;
+                std::memcpy(parms.data(), &fs, sizeof(FStr));
+
+                auto pe = pe_hook::get_original();
+                if (!pe) pe = symbols::ProcessEvent;
+                if (pe) {
+                    pe(pc, func, parms.data());
+                    std::lock_guard<std::mutex> lk(mtx);
+                    exec_result = "OK: executed '" + console_cmd + "'";
+                } else {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    exec_result = "ERROR: ProcessEvent not available";
+                }
+                done = true;
+                cv.notify_one(); });
+
+            // Wait up to 8 seconds for game thread to execute
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                if (!cv.wait_for(lk, std::chrono::seconds(8), [&]
+                                 { return done; }))
+                {
+                    return error_response("exec_console timed out");
+                }
+            }
+
+            logger::log_info("ADB", "exec_console: %s -> %s", console_cmd.c_str(), exec_result.c_str());
+            return ok_response(exec_result);
+        }
+
+        // dump_console_commands — dump all known console commands/CVars
+        if (command == "dump_console_commands")
+        {
+            json result = json::array();
+            const auto &classes = reflection::get_classes();
+            for (const auto &ci : classes)
+            {
+                for (const auto &fi : ci.functions)
+                {
+                    if (fi.flags & 0x00000200)
+                    { // FUNC_Exec
+                        json entry;
+                        entry["class"] = ci.name;
+                        entry["name"] = fi.name;
+                        entry["full"] = ci.name + ":" + fi.name;
+                        entry["params"] = fi.num_parms;
+                        result.push_back(entry);
+                    }
+                }
+            }
+            logger::log_info("ADB", "dump_console_commands: %d commands", (int)result.size());
+            return ok_response(result);
+        }
+
         // dump_symbols — writes all ELF symbols from libUE4.so to a file
         if (command == "dump_symbols")
         {
@@ -461,6 +572,7 @@ namespace adb_bridge
                 "list_mods", "reload_mod", "load_mod", "exec_lua", "list_hooks",
                 "dump_sdk", "mount_pak", "list_paks", "log_tail", "get_stats",
                 "find_object", "find_class", "object_count", "dump_symbols",
+                "exec_console", "dump_console_commands",
                 "pe_trace_start", "pe_trace_stop", "pe_trace_clear", "pe_trace_status",
                 "pe_trace_top", "pe_trace_dump", "ping"};
             for (auto &b : built)

@@ -25,6 +25,8 @@
 #include "modloader/object_monitor.h"
 #include "modloader/config.h"
 #include "modloader/game_profile.h"
+#include "modloader/auto_offsets.h"
+#include "modloader/safe_call.h"
 
 #include <chrono>
 #include <unistd.h>
@@ -387,6 +389,10 @@ namespace init
         crash_handler::install();
         logger::log_info("BOOT", "Crash handler installed");
 
+        // ── Step 3.1: Initialize safe-call subsystem ────────────────────────
+        safe_call::init();
+        logger::log_info("BOOT", "Safe-call subsystem initialized (try/catch + signal recovery)");
+
         // ── Step 3.5: Load config.json ──────────────────────────────────────
         config::load(paths::data_dir());
 
@@ -408,6 +414,25 @@ namespace init
         // ── Step 6: Initialize pattern scanner ──────────────────────────────
         pattern::init();
         logger::log_info("BOOT", "Pattern scanner initialized");
+
+        // ── Step 6.5: Run dynamic offset discovery ──────────────────────────
+        // Auto-discovers GNames, GUObjectArray, ProcessEvent, FUObjectItem size,
+        // and other critical offsets for ANY UE version. Discovered values are
+        // merged into the game profile as fallbacks (game profile takes priority).
+        {
+            auto_offsets::init();
+            auto discovery = auto_offsets::discover_all();
+            logger::log_info("BOOT", "Auto-offset discovery: %d found, %d failed, version=%s",
+                             discovery.total_discoveries, discovery.failed_discoveries,
+                             discovery.version_string.c_str());
+
+            // Apply discoveries to the game profile (only fills gaps)
+            auto_offsets::apply_to_profile(discovery);
+
+            // Re-apply type offsets if auto-discovery changed them
+            ue::apply_type_offsets(game_profile::offsets());
+            logger::log_info("BOOT", "Type offsets updated after auto-discovery");
+        }
 
         // ── Step 7: Resolve core symbols ────────────────────────────────────
         symbols::resolve_core_symbols();

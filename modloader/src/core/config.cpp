@@ -15,11 +15,12 @@ namespace config
 {
 
     // ═══ Default values ═════════════════════════════════════════════════════
+    // These MUST match the header docs, build_defaults(), and safe_get() fallbacks.
     static bool s_auto_dump_on_boot = true;
-    static bool s_auto_dump_on_level_change = true;
-    static bool s_object_monitor_enabled = true;
+    static bool s_auto_dump_on_level_change = false;
+    static bool s_object_monitor_enabled = false;
     static int s_monitor_poll_interval_ms = 5000;
-    static int s_monitor_growth_threshold = 100;
+    static int s_monitor_growth_threshold = 500;
     static int s_monitor_cooldown_ms = 30000;
 
     static bool s_loaded = false;
@@ -35,10 +36,10 @@ namespace config
     {
         nlohmann::json j;
         j["auto_dump_on_boot"] = true;
-        j["auto_dump_on_level_change"] = true;
-        j["object_monitor_enabled"] = true;
+        j["auto_dump_on_level_change"] = false;
+        j["object_monitor_enabled"] = false;
         j["monitor_poll_interval_ms"] = 5000;
-        j["monitor_growth_threshold"] = 100;
+        j["monitor_growth_threshold"] = 500;
         j["monitor_cooldown_ms"] = 30000;
         return j;
     }

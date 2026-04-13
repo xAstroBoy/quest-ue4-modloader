@@ -295,8 +295,11 @@ namespace lua_uobject
             }
             // NOTE: The FString data was allocated by UE4's allocator (FMemory::Malloc).
             // Do NOT call free() on it — that would corrupt the heap.
-            // Accept a small leak per FText read. The data is typically small.
-            // TODO: Use FMemory::Free if/when we resolve that symbol.
+            // Intentional small leak per FText read (~100 bytes typical).
+            // FMemory::Free is not exported on stripped ARM64 binaries and cannot
+            // be reliably resolved. Calling libc free() on UE4-allocated memory
+            // causes immediate heap corruption. The leak is acceptable — FText
+            // reads are infrequent and the per-read cost is negligible.
         }
 
         return result;
@@ -1063,52 +1066,29 @@ namespace lua_uobject
 
         case reflection::PropType::StrProperty:
         {
-            // FString = { char16_t* Data; int32 Num; int32 Max; }
-            struct FStr
-            {
-                char16_t *data;
-                int32_t num;
-                int32_t max;
-            };
             uint8_t *ptr = base + prop.offset;
-            FStr *fstr = reinterpret_cast<FStr *>(ptr);
+            std::string s;
             if (value.is<std::string>())
             {
-                std::string s = value.as<std::string>();
-                size_t wlen = s.size() + 1;
-                char16_t *wbuf = new char16_t[wlen];
-                for (size_t i = 0; i < s.size(); i++)
-                {
-                    wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(s[i]));
-                }
-                wbuf[s.size()] = 0;
-                if (fstr->data && fstr->max > 0)
-                    delete[] fstr->data;
-                fstr->data = wbuf;
-                fstr->num = static_cast<int32_t>(wlen);
-                fstr->max = static_cast<int32_t>(wlen);
-                return true;
+                s = value.as<std::string>();
             }
             else if (value.is<lua_types::LuaFString>())
             {
-                auto &fs = value.as<lua_types::LuaFString &>();
-                std::string s = fs.to_string();
-                size_t wlen = s.size() + 1;
-                char16_t *wbuf = new char16_t[wlen];
-                for (size_t i = 0; i < s.size(); i++)
-                {
-                    wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(s[i]));
-                }
-                wbuf[s.size()] = 0;
-                if (fstr->data && fstr->max > 0)
-                    delete[] fstr->data;
-                fstr->data = wbuf;
-                fstr->num = static_cast<int32_t>(wlen);
-                fstr->max = static_cast<int32_t>(wlen);
-                return true;
+                s = value.as<lua_types::LuaFString &>().to_string();
             }
-            logger::log_warn("UOBJ", "Cannot write FString '%s' — expected string", prop.name.c_str());
-            return false;
+            else
+            {
+                logger::log_warn("UOBJ", "Cannot write FString '%s' — expected string", prop.name.c_str());
+                return false;
+            }
+            // Use shared utility — handles reuse of existing buffer or malloc()
+            // (never new[] to avoid allocator mismatch with UE4's FMemory::Free)
+            if (!lua_uobject::fstring_from_utf8(ptr, s))
+            {
+                logger::log_warn("UOBJ", "Failed to write FString '%s'", prop.name.c_str());
+                return false;
+            }
+            return true;
         }
 
         case reflection::PropType::TextProperty:
@@ -1685,6 +1665,52 @@ namespace lua_uobject
                 }
                 return sol::make_object(lua, sol::lightuserdata_value(const_cast<uint8_t *>(ret_ptr)));
             }
+            case reflection::PropType::NameProperty:
+            {
+                int32_t fname_idx = *reinterpret_cast<const int32_t *>(ret_ptr);
+                return sol::make_object(lua, reflection::fname_to_string(fname_idx));
+            }
+            case reflection::PropType::EnumProperty:
+            {
+                int32_t elem_sz = rf->return_prop->element_size;
+                if (elem_sz == 1)
+                    return sol::make_object(lua, static_cast<int>(ret_ptr[0]));
+                if (elem_sz == 2)
+                    return sol::make_object(lua, static_cast<int>(*reinterpret_cast<const int16_t *>(ret_ptr)));
+                return sol::make_object(lua, *reinterpret_cast<const int32_t *>(ret_ptr));
+            }
+            case reflection::PropType::ClassProperty:
+            case reflection::PropType::WeakObjectProperty:
+            case reflection::PropType::SoftObjectProperty:
+            case reflection::PropType::LazyObjectProperty:
+            case reflection::PropType::InterfaceProperty:
+            {
+                ue::UObject *ret_obj = *reinterpret_cast<ue::UObject *const *>(ret_ptr);
+                if (ret_obj && ue::is_valid_ptr(ret_obj))
+                {
+                    LuaUObject wrapped;
+                    wrapped.ptr = ret_obj;
+                    return sol::make_object(lua, wrapped);
+                }
+                return sol::nil;
+            }
+            case reflection::PropType::ArrayProperty:
+            {
+                // Return TArray from call result — copy the 16 bytes (Data, Num, Max)
+                // into an owning LuaTArray
+                ue::FProperty *inner_prop = nullptr;
+                if (rf->return_prop->raw && ue::is_valid_ptr(rf->return_prop->raw))
+                {
+                    inner_prop = ue::read_field<ue::FProperty *>(rf->return_prop->raw, ue::fprop::ARRAY_INNER_OFF());
+                    if (inner_prop && !ue::is_mapped_ptr(inner_prop))
+                        inner_prop = nullptr;
+                }
+                lua_tarray::LuaTArray arr;
+                arr.array_ptr = const_cast<uint8_t *>(ret_ptr);
+                arr.inner_prop = inner_prop;
+                arr.element_size = inner_prop ? ue::fprop_get_element_size(inner_prop) : 0;
+                return sol::make_object(lua, arr);
+            }
             default:
                 return sol::make_object(lua, sol::lightuserdata_value(const_cast<uint8_t *>(ret_ptr)));
             }
@@ -2115,6 +2141,30 @@ namespace lua_uobject
             }
             return false; },
 
+                                     // ── Cast: validate IsA then return same object ──
+                                     // Usage: local pc = obj:Cast("PlayerController")
+                                     "Cast", [](sol::this_state ts, const LuaUObject &self, const std::string &class_name) -> sol::object
+                                     {
+            sol::state_view lua(ts);
+            if (!self.ptr) return sol::nil;
+
+            ue::UClass* target_cls = reflection::find_class_ptr(class_name);
+            if (!target_cls) target_cls = reflection::find_class_ptr(class_name + "_C");
+            if (!target_cls) {
+                logger::log_warn("CAST", "Cast: class '%s' not found", class_name.c_str());
+                return sol::nil;
+            }
+            ue::UClass* cls = ue::uobj_get_class(self.ptr);
+            while (cls) {
+                if (cls == target_cls) {
+                    // IsA succeeded — return same wrapper
+                    return sol::make_object(lua, self);
+                }
+                cls = reinterpret_cast<ue::UClass*>(ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(cls)));
+            }
+            logger::log_warn("CAST", "Cast failed: object is not a '%s'", class_name.c_str());
+            return sol::nil; },
+
                                      "GetFName", [](const LuaUObject &self) -> std::string
                                      {
             if (!self.ptr) return "";
@@ -2364,6 +2414,107 @@ namespace lua_uobject
         LuaUObject wrapped;
         wrapped.ptr = obj;
         return sol::make_object(lua, wrapped);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Public shared utility functions — used by lua_tarray and lua_ustruct
+    // ═══════════════════════════════════════════════════════════════════════
+
+    std::string ftext_to_string(const void *ftext_ptr)
+    {
+        return ftext_to_string_via_kismet(ftext_ptr);
+    }
+
+    bool ftext_from_string(void *ftext_ptr, const std::string &str)
+    {
+        // Destroy old FText (decrement refcount) if destructor available
+        if (symbols::FText_Dtor)
+        {
+            symbols::FText_Dtor(ftext_ptr);
+        }
+        // Primary: use Kismet ProcessEvent to create properly-allocated FText
+        if (ftext_from_string_via_kismet(ftext_ptr, str))
+            return true;
+        // Fallback: direct FText::FromString via arm64 asm
+        if (symbols::FText_FromString)
+        {
+            size_t wlen = str.size() + 1;
+            char16_t *wbuf = static_cast<char16_t *>(malloc(wlen * sizeof(char16_t)));
+            for (size_t i = 0; i < str.size(); i++)
+                wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(str[i]));
+            wbuf[str.size()] = 0;
+            FStrRaw tmp_fstr = {wbuf, static_cast<int32_t>(wlen), static_cast<int32_t>(wlen)};
+            arm64_call_ftext_fromstring(ftext_ptr, &tmp_fstr);
+            // Don't free wbuf — ownership transferred to FText
+            return true;
+        }
+        return false;
+    }
+
+    std::string fstring_to_utf8(const void *fstring_ptr)
+    {
+        if (!fstring_ptr)
+            return "";
+        const FStrRaw *fstr = reinterpret_cast<const FStrRaw *>(fstring_ptr);
+        if (!fstr->data || fstr->num <= 0 || !ue::is_mapped_ptr(fstr->data))
+            return "";
+
+        std::string utf8;
+        int count = fstr->num - 1; // num includes null terminator
+        for (int i = 0; i < count; i++)
+        {
+            char16_t c = fstr->data[i];
+            if (c == 0)
+                break;
+            if (c < 0x80)
+                utf8 += static_cast<char>(c);
+            else if (c < 0x800)
+            {
+                utf8 += static_cast<char>(0xC0 | (c >> 6));
+                utf8 += static_cast<char>(0x80 | (c & 0x3F));
+            }
+            else
+            {
+                utf8 += static_cast<char>(0xE0 | (c >> 12));
+                utf8 += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
+                utf8 += static_cast<char>(0x80 | (c & 0x3F));
+            }
+        }
+        return utf8;
+    }
+
+    bool fstring_from_utf8(void *fstring_ptr, const std::string &str)
+    {
+        if (!fstring_ptr)
+            return false;
+        FStrRaw *fstr = reinterpret_cast<FStrRaw *>(fstring_ptr);
+
+        size_t wlen = str.size() + 1;
+        // Reuse existing buffer if capacity is sufficient
+        if (fstr->data && fstr->max >= static_cast<int32_t>(wlen) && ue::is_mapped_ptr(fstr->data))
+        {
+            for (size_t i = 0; i < str.size(); i++)
+                fstr->data[i] = static_cast<char16_t>(static_cast<unsigned char>(str[i]));
+            fstr->data[str.size()] = 0;
+            fstr->num = static_cast<int32_t>(wlen);
+            return true;
+        }
+
+        // Need new allocation — use malloc (safe across allocator boundaries).
+        // We deliberately do NOT free the old buffer because it was likely allocated
+        // by UE4's FMemory::Malloc and we cannot call FMemory::Free from here.
+        // This may leak the old buffer, but avoids heap corruption.
+        char16_t *wbuf = static_cast<char16_t *>(malloc(wlen * sizeof(char16_t)));
+        if (!wbuf)
+            return false;
+        for (size_t i = 0; i < str.size(); i++)
+            wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(str[i]));
+        wbuf[str.size()] = 0;
+
+        fstr->data = wbuf;
+        fstr->num = static_cast<int32_t>(wlen);
+        fstr->max = static_cast<int32_t>(wlen);
+        return true;
     }
 
 } // namespace lua_uobject

@@ -46,10 +46,15 @@ set(MOD_SOURCES
     src/lua/lua_enum_ext.cpp
     src/mods/mod_loader.cpp
     src/pak/pak_mounter.cpp
+    src/pak/aes_extractor.cpp
     src/bridge/adb_bridge.cpp
     src/util/logger.cpp
     src/util/crash_handler.cpp
     src/util/notification.cpp
+    src/util/safe_call.cpp
+    src/core/auto_offsets.cpp
+    src/lua/lua_console.cpp
+    src/lua/lua_cast.cpp
 )
 
 add_library(modloader SHARED ${MOD_SOURCES})
@@ -72,13 +77,41 @@ target_link_libraries(modloader PRIVATE
 
 target_compile_options(modloader PRIVATE
     -fno-rtti
-    -fno-exceptions
+    -fexceptions
     -Wall
     -Wno-unused-function
     -O2
+    -g                    # DWARF debug info — addr2line on crash logs
+    -ffunction-sections   # Per-function sections for better GC
+    -fdata-sections       # Per-data sections for better GC
 )
 
 target_link_options(modloader PRIVATE
     -Wl,--gc-sections
-    -Wl,--strip-debug
 )
+
+# ── Post-build: create stripped copy for deployment ─────────────────────
+# The unstripped libmodloader.so (with DWARF) stays in build/ for addr2line.
+# The stripped copy goes to build/deploy/ for pushing to the device.
+find_program(STRIP_TOOL
+    ${CMAKE_STRIP}
+    "${ANDROID_TOOLCHAIN_ROOT}/bin/llvm-strip"
+    "${ANDROID_TOOLCHAIN_ROOT}/bin/aarch64-linux-android-strip"
+)
+
+add_custom_command(TARGET modloader POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/deploy"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "$<TARGET_FILE:modloader>"
+        "${CMAKE_BINARY_DIR}/deploy/libmodloader.so"
+    COMMAND ${CMAKE_COMMAND} -E echo "[STRIP] Creating stripped copy for deployment..."
+    COMMENT "Creating stripped deployment copy"
+)
+
+if(STRIP_TOOL)
+    add_custom_command(TARGET modloader POST_BUILD
+        COMMAND ${STRIP_TOOL} --strip-debug --strip-unneeded
+            "${CMAKE_BINARY_DIR}/deploy/libmodloader.so"
+        COMMENT "Stripping debug info from deploy copy"
+    )
+endif()

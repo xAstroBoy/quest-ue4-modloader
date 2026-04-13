@@ -5,7 +5,7 @@
 // Pattern format: "48 8B 05 ?? ?? ?? ?? 48 85 C0" where ?? = wildcard
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE  // for memmem on Android/Bionic
+#define _GNU_SOURCE // for memmem on Android/Bionic
 #endif
 #include "modloader/pattern_scanner.h"
 #include "modloader/game_profile.h"
@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
-#include <string.h>  // for memmem
+#include <string.h> // for memmem
 #include <vector>
 #include <sstream>
 #include <string>

@@ -274,7 +274,16 @@ if sym_readEmList then
             -- at retPtr will be the new level's original value, not ours.
             if cached then
                 local ok, currentEmId = pcall(ReadU8, retPtr)
-                if ok and currentEmId == cached.replEmId then
+                if not ok then
+                    -- retPtr is invalid (freed memory during level transition).
+                    -- Do NOT write to it — would cause SIGSEGV on ARM64.
+                    -- Clear caches so next valid call re-randomizes.
+                    slotMap = {}
+                    levelSwaps = 0
+                    cached = nil
+                    return retPtr
+                end
+                if currentEmId == cached.replEmId then
                     -- Fast path: our data is still in memory, nothing to do.
                     -- (We already wrote it; the game hasn't touched it.)
                     return retPtr
@@ -320,7 +329,9 @@ if sym_readEmList then
 
             -- ── Apply randomization bytes to ESL entry ──
             if cached then
-                pcall(function()
+                local writeOk = pcall(function()
+                    -- Validate retPtr is still readable before writing
+                    ReadU8(retPtr)
                     for j = 0, 6 do
                         WriteU8(Offset(retPtr, j), cached.bytes[j + 1])
                     end
@@ -331,6 +342,11 @@ if sym_readEmList then
                         WriteU8(Offset(retPtr, 2), flags & ~0x40)
                     end
                 end)
+                if not writeOk then
+                    -- Write failed — retPtr went invalid between read and write.
+                    -- Evict this slot so we retry on next call.
+                    slotMap[idx] = nil
+                end
             end
 
             return retPtr

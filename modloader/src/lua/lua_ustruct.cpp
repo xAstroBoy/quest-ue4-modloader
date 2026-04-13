@@ -152,36 +152,15 @@ namespace lua_ustruct
 
         case reflection::PropType::StrProperty:
         {
-            struct FStr
-            {
-                char16_t *data;
-                int32_t num;
-                int32_t max;
-            };
-            const FStr *fstr = reinterpret_cast<const FStr *>(ptr);
-            if (fstr->data && fstr->num > 0 && ue::is_mapped_ptr(fstr->data))
-            {
-                std::string utf8;
-                for (int i = 0; i < fstr->num - 1; i++)
-                {
-                    char16_t c = fstr->data[i];
-                    if (c < 0x80)
-                        utf8 += static_cast<char>(c);
-                    else if (c < 0x800)
-                    {
-                        utf8 += static_cast<char>(0xC0 | (c >> 6));
-                        utf8 += static_cast<char>(0x80 | (c & 0x3F));
-                    }
-                    else
-                    {
-                        utf8 += static_cast<char>(0xE0 | (c >> 12));
-                        utf8 += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
-                        utf8 += static_cast<char>(0x80 | (c & 0x3F));
-                    }
-                }
-                return sol::make_object(lua, utf8);
-            }
-            return sol::make_object(lua, std::string(""));
+            // FString — use shared utility for consistency
+            return sol::make_object(lua, lua_uobject::fstring_to_utf8(ptr));
+        }
+
+        case reflection::PropType::TextProperty:
+        {
+            // FText (24 bytes) — read via KismetTextLibrary::Conv_TextToString
+            std::string utf8 = lua_uobject::ftext_to_string(ptr);
+            return sol::make_object(lua, utf8);
         }
 
         case reflection::PropType::ObjectProperty:
@@ -527,37 +506,31 @@ namespace lua_ustruct
 
         case reflection::PropType::StrProperty:
         {
-            // FString = { char16_t* Data; int32 Num; int32 Max; }
-            struct FStr
-            {
-                char16_t *data;
-                int32_t num;
-                int32_t max;
-            };
-            FStr *fstr = reinterpret_cast<FStr *>(ptr);
+            // FString write using shared utility (safe allocator)
             if (value.is<std::string>())
             {
-                std::string s = value.as<std::string>();
-                size_t wlen = s.size() + 1;
-                // Allocate via FMemory (UE4 allocator) if available, otherwise new[]
-                char16_t *wbuf = new char16_t[wlen];
-                for (size_t i = 0; i < s.size(); i++)
-                {
-                    wbuf[i] = static_cast<char16_t>(static_cast<unsigned char>(s[i]));
-                }
-                wbuf[s.size()] = 0;
-                // Free old data if any (best-effort)
-                if (fstr->data && fstr->max > 0)
-                    delete[] fstr->data;
-                fstr->data = wbuf;
-                fstr->num = static_cast<int32_t>(wlen);
-                fstr->max = static_cast<int32_t>(wlen);
+                return lua_uobject::fstring_from_utf8(ptr, value.as<std::string>());
             }
-            else
+            else if (value.is<lua_types::LuaFString>())
             {
-                return false;
+                return lua_uobject::fstring_from_utf8(ptr, value.as<lua_types::LuaFString &>().to_string());
             }
-            return true;
+            return false;
+        }
+
+        case reflection::PropType::TextProperty:
+        {
+            // FText write using shared utility (via Kismet ProcessEvent)
+            std::string str;
+            if (value.is<std::string>())
+                str = value.as<std::string>();
+            else if (value.is<lua_types::LuaFText>())
+                str = value.as<lua_types::LuaFText &>().to_string();
+            else if (value.is<lua_types::LuaFString>())
+                str = value.as<lua_types::LuaFString &>().to_string();
+            else
+                return false;
+            return lua_uobject::ftext_from_string(ptr, str);
         }
 
         default:

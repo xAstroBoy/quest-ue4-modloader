@@ -203,6 +203,8 @@ namespace game_profile
             {"StaticConstructObject_Internal", 0x06E20A8C},
             {"GetEtcModelClass", 0x066909C8},
             {"FPakPlatformFile::Mount", 0x08056024},
+            {"MountAllPakFiles_1", 0x08054B78},
+            {"MountAllPakFiles_2", 0x08054FE8},
             {"_ZN20FPlatformFileManager3GetEv", 0x0666D4B4},
             {"_ZN20FPlatformFileManager16FindPlatformFileEPKDs", 0x0666D034},
             {"_ZNK5FText8ToStringEv", 0x066C49BC},
@@ -330,25 +332,30 @@ namespace game_profile
         void *ue5_handle = dlopen("libUnreal.so", RTLD_NOLOAD);
         void *ue4_handle = dlopen("libUE4.so", RTLD_NOLOAD);
 
-        if (ue5_handle) {
+        if (ue5_handle)
+        {
             p.engine_lib_name = "libUnreal.so";
             p.engine_version = "UE5 (auto-detected)";
-            p.detected_engine_version = EngineVersion::UE5_4;  // default UE5 assumption
+            p.detected_engine_version = EngineVersion::UE5_4; // default UE5 assumption
             p.offsets = build_offsets_for_version(EngineVersion::UE5_4);
             dlclose(ue5_handle);
 
             __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                "[PROFILE] Auto-detected UE5 (libUnreal.so loaded)");
-        } else if (ue4_handle) {
+                                "[PROFILE] Auto-detected UE5 (libUnreal.so loaded)");
+        }
+        else if (ue4_handle)
+        {
             p.engine_lib_name = "libUE4.so";
             p.engine_version = "UE4 (auto-detected)";
-            p.detected_engine_version = EngineVersion::UE4_27;  // default UE4 assumption
+            p.detected_engine_version = EngineVersion::UE4_27; // default UE4 assumption
             p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
             dlclose(ue4_handle);
 
             __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                "[PROFILE] Auto-detected UE4 (libUE4.so loaded)");
-        } else {
+                                "[PROFILE] Auto-detected UE4 (libUE4.so loaded)");
+        }
+        else
+        {
             // Neither library found yet — default to UE4.27 (most common)
             p.engine_lib_name = "libUE4.so";
             p.engine_version = "Unknown";
@@ -356,7 +363,7 @@ namespace game_profile
             p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
 
             __android_log_print(ANDROID_LOG_WARN, LOG_TAG,
-                "[PROFILE] No engine library detected! Defaulting to UE4.27 offsets");
+                                "[PROFILE] No engine library detected! Defaulting to UE4.27 offsets");
         }
 
         return p;
@@ -374,18 +381,20 @@ namespace game_profile
         // For now, this is a stub that will be called from main.cpp after pattern::init().
 
         __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-            "[PROFILE] Engine version detection from binary: using library-based detection");
+                            "[PROFILE] Engine version detection from binary: using library-based detection");
 
         // Library name is the most reliable indicator
         void *ue5_handle = dlopen("libUnreal.so", RTLD_NOLOAD);
-        if (ue5_handle) {
+        if (ue5_handle)
+        {
             dlclose(ue5_handle);
             // Default UE5 → try to narrow down via string scanning later
             return EngineVersion::UE5_4;
         }
 
         void *ue4_handle = dlopen("libUE4.so", RTLD_NOLOAD);
-        if (ue4_handle) {
+        if (ue4_handle)
+        {
             dlclose(ue4_handle);
             return EngineVersion::UE4_27;
         }
@@ -453,6 +462,7 @@ namespace game_profile
     // ═══ Accessors ══════════════════════════════════════════════════════════
     GameID detected_game() { return s_profile.id; }
     const GameProfile &profile() { return s_profile; }
+    GameProfile &mutable_profile() { return s_profile; }
     const TypeOffsets &offsets() { return s_profile.offsets; }
     const std::string &engine_lib_name() { return s_profile.engine_lib_name; }
     const std::string &display_name() { return s_profile.display_name; }

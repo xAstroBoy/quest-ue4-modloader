@@ -61,7 +61,6 @@ namespace lua_tarray
         {
         case reflection::PropType::BoolProperty:
         {
-            uint8_t byte_mask = ue::read_field<uint8_t>(prop, ue::fprop::BOOL_BYTE_MASK_OFF());
             uint8_t field_mask = ue::read_field<uint8_t>(prop, ue::fprop::BOOL_FIELD_MASK_OFF());
             if (field_mask != 0xFF)
             {
@@ -103,63 +102,21 @@ namespace lua_tarray
         case reflection::PropType::NameProperty:
         {
             int32_t fname_idx = *reinterpret_cast<const int32_t *>(base);
-            return sol::make_object(lua, lua_types::LuaFName(fname_idx));
+            // Return plain string for consistency with UObject/UStruct access
+            return sol::make_object(lua, reflection::fname_to_string(fname_idx));
         }
 
         case reflection::PropType::StrProperty:
         {
-            struct FStr
-            {
-                void *data; // TCHAR* (char16_t or char depending on platform)
-                int32_t num;
-                int32_t max;
-            };
-            const FStr *fstr = reinterpret_cast<const FStr *>(base);
-            if (fstr->data && fstr->num > 0 && fstr->num < 65536 && ue::is_mapped_ptr(fstr->data))
-            {
-                // Try UTF-16 first (standard UE4), fall back to UTF-8
-                const char16_t *wdata = reinterpret_cast<const char16_t *>(fstr->data);
-                const char *cdata = reinterpret_cast<const char *>(fstr->data);
+            // Return plain UTF-8 string using shared utility
+            return sol::make_object(lua, lua_uobject::fstring_to_utf8(base));
+        }
 
-                // Heuristic: if second byte of first char is 0 and first isn't, it's UTF-16
-                bool is_utf16 = (fstr->num >= 2 && cdata[1] == 0 && cdata[0] != 0);
-
-                std::string utf8;
-                if (is_utf16)
-                {
-                    for (int i = 0; i < fstr->num - 1; i++)
-                    {
-                        char16_t c = wdata[i];
-                        if (c == 0)
-                            break;
-                        if (c < 0x80)
-                            utf8 += static_cast<char>(c);
-                        else if (c < 0x800)
-                        {
-                            utf8 += static_cast<char>(0xC0 | (c >> 6));
-                            utf8 += static_cast<char>(0x80 | (c & 0x3F));
-                        }
-                        else
-                        {
-                            utf8 += static_cast<char>(0xE0 | (c >> 12));
-                            utf8 += static_cast<char>(0x80 | ((c >> 6) & 0x3F));
-                            utf8 += static_cast<char>(0x80 | (c & 0x3F));
-                        }
-                    }
-                }
-                else
-                {
-                    // UTF-8 / ASCII data
-                    for (int i = 0; i < fstr->num - 1; i++)
-                    {
-                        if (cdata[i] == 0)
-                            break;
-                        utf8 += cdata[i];
-                    }
-                }
-                return sol::make_object(lua, lua_types::LuaFString(utf8));
-            }
-            return sol::make_object(lua, lua_types::LuaFString(""));
+        case reflection::PropType::TextProperty:
+        {
+            // FText is 24 bytes — read via KismetTextLibrary::Conv_TextToString
+            std::string utf8 = lua_uobject::ftext_to_string(base);
+            return sol::make_object(lua, utf8);
         }
 
         case reflection::PropType::ObjectProperty:
@@ -341,6 +298,34 @@ namespace lua_tarray
             {
                 *reinterpret_cast<int32_t *>(base + 4) = number;
             }
+            break;
+        }
+        case reflection::PropType::StrProperty:
+        {
+            // FString write using shared utility (safe allocator)
+            if (value.is<std::string>())
+            {
+                lua_uobject::fstring_from_utf8(base, value.as<std::string>());
+            }
+            else if (value.is<lua_types::LuaFString>())
+            {
+                lua_uobject::fstring_from_utf8(base, value.as<lua_types::LuaFString &>().to_string());
+            }
+            break;
+        }
+        case reflection::PropType::TextProperty:
+        {
+            // FText write using shared utility (via Kismet ProcessEvent)
+            std::string str;
+            if (value.is<std::string>())
+                str = value.as<std::string>();
+            else if (value.is<lua_types::LuaFText>())
+                str = value.as<lua_types::LuaFText &>().to_string();
+            else if (value.is<lua_types::LuaFString>())
+                str = value.as<lua_types::LuaFString &>().to_string();
+            else
+                break;
+            lua_uobject::ftext_from_string(base, str);
             break;
         }
         case reflection::PropType::StructProperty:
@@ -632,7 +617,168 @@ namespace lua_tarray
                 *reinterpret_cast<int32_t*>(elem + 4) = number;
             }
             raw->num++;
-            return raw->num; });
+            return raw->num; },
+
+                                    // RemoveAt — remove element at 1-based index, shifts remaining elements down.
+                                    // Returns true if removed successfully.
+                                    "RemoveAt", [](LuaTArray &self, int index) -> bool
+                                    {
+            if (!self.array_ptr || self.element_size <= 0) return false;
+            RawTArray* raw = reinterpret_cast<RawTArray*>(self.array_ptr);
+            int idx = index - 1;
+            if (idx < 0 || idx >= raw->num) {
+                logger::log_warn("TARRAY", "RemoveAt: index %d out of bounds (num=%d)", index, raw->num);
+                return false;
+            }
+            uint8_t* data = reinterpret_cast<uint8_t*>(raw->data);
+            // Shift elements after idx down by one position
+            int remaining = raw->num - idx - 1;
+            if (remaining > 0) {
+                std::memmove(data + idx * self.element_size,
+                           data + (idx + 1) * self.element_size,
+                           remaining * self.element_size);
+            }
+            // Zero out the last element slot (now unused)
+            std::memset(data + (raw->num - 1) * self.element_size, 0, self.element_size);
+            raw->num--;
+            return true; },
+
+                                    // Insert — insert value at 1-based index, shifts existing elements up.
+                                    // Requires Num < Max (pre-allocated capacity).
+                                    // Returns true if inserted.
+                                    "Insert", [](LuaTArray &self, int index, sol::object value) -> bool
+                                    {
+            if (!self.array_ptr || !self.inner_prop || self.element_size <= 0) return false;
+            RawTArray* raw = reinterpret_cast<RawTArray*>(self.array_ptr);
+            if (raw->num >= raw->max) {
+                logger::log_warn("TARRAY", "Insert: array full (Num=%d, Max=%d)", raw->num, raw->max);
+                return false;
+            }
+            int idx = index - 1;
+            if (idx < 0 || idx > raw->num) {
+                logger::log_warn("TARRAY", "Insert: index %d out of bounds (num=%d)", index, raw->num);
+                return false;
+            }
+            uint8_t* data = reinterpret_cast<uint8_t*>(raw->data);
+            // Shift elements from idx..end up by one position
+            int to_shift = raw->num - idx;
+            if (to_shift > 0) {
+                std::memmove(data + (idx + 1) * self.element_size,
+                           data + idx * self.element_size,
+                           to_shift * self.element_size);
+            }
+            // Zero and write the new element
+            uint8_t* elem = data + idx * self.element_size;
+            std::memset(elem, 0, self.element_size);
+            write_element(elem, self.inner_prop, value);
+            raw->num++;
+            return true; },
+
+                                    // Swap — swap elements at two 1-based indices.
+                                    "Swap", [](LuaTArray &self, int idx1, int idx2) -> bool
+                                    {
+            if (!self.array_ptr || self.element_size <= 0) return false;
+            RawTArray* raw = reinterpret_cast<RawTArray*>(self.array_ptr);
+            int i1 = idx1 - 1, i2 = idx2 - 1;
+            if (i1 < 0 || i1 >= raw->num || i2 < 0 || i2 >= raw->num) return false;
+            if (i1 == i2) return true;
+            uint8_t* data = reinterpret_cast<uint8_t*>(raw->data);
+            // Use stack-allocated temp buffer for small elements, heap for large
+            if (self.element_size <= 256) {
+                uint8_t tmp[256];
+                std::memcpy(tmp, data + i1 * self.element_size, self.element_size);
+                std::memcpy(data + i1 * self.element_size, data + i2 * self.element_size, self.element_size);
+                std::memcpy(data + i2 * self.element_size, tmp, self.element_size);
+            } else {
+                std::vector<uint8_t> tmp(self.element_size);
+                std::memcpy(tmp.data(), data + i1 * self.element_size, self.element_size);
+                std::memcpy(data + i1 * self.element_size, data + i2 * self.element_size, self.element_size);
+                std::memcpy(data + i2 * self.element_size, tmp.data(), self.element_size);
+            }
+            return true; },
+
+                                    // Contains — check if array contains a value (string comparison).
+                                    // Works for FName, FString, int, float, bool.
+                                    "Contains", [](sol::this_state ts, const LuaTArray &self, sol::object target) -> bool
+                                    {
+            sol::state_view lua(ts);
+            if (!self.array_ptr || !self.inner_prop || self.element_size <= 0) return false;
+            int32_t n = self.num();
+            if (n <= 0) return false;
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(self.data());
+            if (!data) return false;
+
+            // Convert target to string for universal comparison
+            std::string target_str;
+            if (target.is<std::string>()) target_str = target.as<std::string>();
+            else if (target.is<int>()) target_str = std::to_string(target.as<int>());
+            else if (target.is<double>()) target_str = std::to_string(target.as<double>());
+            else if (target.is<bool>()) target_str = target.as<bool>() ? "true" : "false";
+            else if (target.is<lua_types::LuaFName>()) target_str = target.as<lua_types::LuaFName&>().to_string();
+            else if (target.is<lua_types::LuaFString>()) target_str = target.as<lua_types::LuaFString&>().to_string();
+            else return false;
+
+            for (int32_t i = 0; i < n; i++) {
+                sol::object elem = read_element(lua, data + i * self.element_size, self.inner_prop);
+                std::string elem_str;
+                if (elem.is<std::string>()) elem_str = elem.as<std::string>();
+                else if (elem.is<int>()) elem_str = std::to_string(elem.as<int>());
+                else if (elem.is<double>()) elem_str = std::to_string(elem.as<double>());
+                else if (elem.is<bool>()) elem_str = elem.as<bool>() ? "true" : "false";
+                else if (elem.is<lua_types::LuaFName>()) elem_str = elem.as<lua_types::LuaFName&>().to_string();
+                else if (elem.is<lua_types::LuaFString>()) elem_str = elem.as<lua_types::LuaFString&>().to_string();
+                else continue;
+                if (elem_str == target_str) return true;
+            }
+            return false; },
+
+                                    // IndexOf — find 1-based index of first matching value, or 0 if not found.
+                                    "IndexOf", [](sol::this_state ts, const LuaTArray &self, sol::object target) -> int
+                                    {
+            sol::state_view lua(ts);
+            if (!self.array_ptr || !self.inner_prop || self.element_size <= 0) return 0;
+            int32_t n = self.num();
+            if (n <= 0) return 0;
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(self.data());
+            if (!data) return 0;
+
+            std::string target_str;
+            if (target.is<std::string>()) target_str = target.as<std::string>();
+            else if (target.is<int>()) target_str = std::to_string(target.as<int>());
+            else if (target.is<double>()) target_str = std::to_string(target.as<double>());
+            else if (target.is<bool>()) target_str = target.as<bool>() ? "true" : "false";
+            else if (target.is<lua_types::LuaFName>()) target_str = target.as<lua_types::LuaFName&>().to_string();
+            else if (target.is<lua_types::LuaFString>()) target_str = target.as<lua_types::LuaFString&>().to_string();
+            else return 0;
+
+            for (int32_t i = 0; i < n; i++) {
+                sol::object elem = read_element(lua, data + i * self.element_size, self.inner_prop);
+                std::string elem_str;
+                if (elem.is<std::string>()) elem_str = elem.as<std::string>();
+                else if (elem.is<int>()) elem_str = std::to_string(elem.as<int>());
+                else if (elem.is<double>()) elem_str = std::to_string(elem.as<double>());
+                else if (elem.is<bool>()) elem_str = elem.as<bool>() ? "true" : "false";
+                else if (elem.is<lua_types::LuaFName>()) elem_str = elem.as<lua_types::LuaFName&>().to_string();
+                else if (elem.is<lua_types::LuaFString>()) elem_str = elem.as<lua_types::LuaFString&>().to_string();
+                else continue;
+                if (elem_str == target_str) return i + 1; // 1-indexed
+            }
+            return 0; },
+
+                                    // ToTable — convert entire array to a Lua table
+                                    "ToTable", [](sol::this_state ts, const LuaTArray &self) -> sol::table
+                                    {
+            sol::state_view lua(ts);
+            sol::table result = lua.create_table();
+            if (!self.array_ptr || !self.inner_prop || self.element_size <= 0) return result;
+            int32_t n = self.num();
+            if (n <= 0) return result;
+            const uint8_t* data = reinterpret_cast<const uint8_t*>(self.data());
+            if (!data) return result;
+            for (int32_t i = 0; i < n; i++) {
+                result[i + 1] = read_element(lua, data + i * self.element_size, self.inner_prop);
+            }
+            return result; });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -898,7 +1044,298 @@ namespace lua_tarray
             }
 
             logger::log_warn("TMAP", "SetByKey: key '%s' not found (searched %d entries)", target_key.c_str(), visited);
-            return false; });
+            return false; },
+
+                                  // ── GetByKey — find value by key ──────────────────────────
+                                  // Usage: local value = myMap:GetByKey("SomeKey")
+                                  // Searches for a matching key by string comparison.
+                                  // Returns the value object, or nil if not found.
+                                  "GetByKey", [](sol::this_state ts, const LuaTMap &self, sol::object key_lua) -> sol::object
+                                  {
+            sol::state_view lua(ts);
+            if (!self.map_ptr || !self.key_prop || !self.value_prop) return sol::nil;
+            if (self.key_size <= 0 || self.value_size <= 0) return sol::nil;
+            if (self.entry_stride <= 0) return sol::nil;
+
+            const uint8_t* sparse_base = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void* const*>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return sol::nil;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return sol::nil;
+            if (num_free_idx < 0) num_free_idx = 0;
+
+            // Build free-index set
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            // Convert target key to string for comparison
+            std::string target_key;
+            if (key_lua.is<lua_types::LuaFName>()) {
+                target_key = key_lua.as<lua_types::LuaFName&>().to_string();
+            } else if (key_lua.is<std::string>()) {
+                target_key = key_lua.as<std::string>();
+            } else if (key_lua.is<int>()) {
+                target_key = std::to_string(key_lua.as<int>());
+            } else if (key_lua.is<double>()) {
+                target_key = std::to_string(static_cast<int64_t>(key_lua.as<double>()));
+            } else {
+                return sol::nil;
+            }
+
+            // Search for matching key
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+
+                const uint8_t* entry = reinterpret_cast<const uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* key_ptr = entry + self.key_offset;
+                const uint8_t* value_ptr = entry + self.value_offset;
+
+                if (!ue::is_mapped_ptr(key_ptr) || !ue::is_mapped_ptr(value_ptr)) {
+                    visited++;
+                    continue;
+                }
+
+                sol::object key_obj = read_element(lua, key_ptr, self.key_prop);
+                std::string key_str;
+                if (key_obj.is<lua_types::LuaFName>()) {
+                    key_str = key_obj.as<lua_types::LuaFName&>().to_string();
+                } else if (key_obj.is<std::string>()) {
+                    key_str = key_obj.as<std::string>();
+                } else if (key_obj.is<lua_types::LuaFString>()) {
+                    key_str = key_obj.as<lua_types::LuaFString&>().to_string();
+                } else if (key_obj.is<int>()) {
+                    key_str = std::to_string(key_obj.as<int>());
+                } else if (key_obj.is<double>()) {
+                    key_str = std::to_string(static_cast<int64_t>(key_obj.as<double>()));
+                }
+
+                if (key_str == target_key) {
+                    return read_element(lua, value_ptr, self.value_prop);
+                }
+                visited++;
+            }
+
+            return sol::nil; },
+
+                                  // ── Keys — return table of all keys ───────────────────────
+                                  "Keys", [](sol::this_state ts, const LuaTMap &self) -> sol::table
+                                  {
+            sol::state_view lua(ts);
+            sol::table result = lua.create_table();
+            if (!self.map_ptr || !self.key_prop) return result;
+            if (self.key_size <= 0 || self.entry_stride <= 0) return result;
+
+            const uint8_t* sparse_base = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void* const*>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return result;
+            if (num_free_idx < 0) num_free_idx = 0;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return result;
+
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            int lua_idx = 1;
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+                const uint8_t* entry = reinterpret_cast<const uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* key_ptr = entry + self.key_offset;
+                if (!ue::is_mapped_ptr(key_ptr)) { visited++; continue; }
+                result[lua_idx++] = read_element(lua, key_ptr, self.key_prop);
+                visited++;
+            }
+            return result; },
+
+                                  // ── Values — return table of all values ───────────────────
+                                  "Values", [](sol::this_state ts, const LuaTMap &self) -> sol::table
+                                  {
+            sol::state_view lua(ts);
+            sol::table result = lua.create_table();
+            if (!self.map_ptr || !self.value_prop) return result;
+            if (self.value_size <= 0 || self.entry_stride <= 0) return result;
+
+            const uint8_t* sparse_base = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void* const*>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return result;
+            if (num_free_idx < 0) num_free_idx = 0;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return result;
+
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            int lua_idx = 1;
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+                const uint8_t* entry = reinterpret_cast<const uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* value_ptr = entry + self.value_offset;
+                if (!ue::is_mapped_ptr(value_ptr)) { visited++; continue; }
+                result[lua_idx++] = read_element(lua, value_ptr, self.value_prop);
+                visited++;
+            }
+            return result; },
+
+                                  // ── ToTable — return all entries as {key, value} pairs ────
+                                  "ToTable", [](sol::this_state ts, const LuaTMap &self) -> sol::table
+                                  {
+            sol::state_view lua(ts);
+            sol::table result = lua.create_table();
+            if (!self.map_ptr || !self.key_prop || !self.value_prop) return result;
+            if (self.key_size <= 0 || self.value_size <= 0 || self.entry_stride <= 0) return result;
+
+            const uint8_t* sparse_base = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void* const*>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return result;
+            if (num_free_idx < 0) num_free_idx = 0;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return result;
+
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            int lua_idx = 1;
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+                const uint8_t* entry = reinterpret_cast<const uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* key_ptr = entry + self.key_offset;
+                const uint8_t* value_ptr = entry + self.value_offset;
+                if (!ue::is_mapped_ptr(key_ptr) || !ue::is_mapped_ptr(value_ptr)) { visited++; continue; }
+
+                sol::table pair = lua.create_table();
+                pair["key"] = read_element(lua, key_ptr, self.key_prop);
+                pair["value"] = read_element(lua, value_ptr, self.value_prop);
+                result[lua_idx++] = pair;
+                visited++;
+            }
+            return result; },
+
+                                  // ── ContainsKey — check if a key exists in the map ───────
+                                  "ContainsKey", [](sol::this_state ts, const LuaTMap &self, sol::object key_lua) -> bool
+                                  {
+            sol::state_view lua(ts);
+            if (!self.map_ptr || !self.key_prop) return false;
+            if (self.key_size <= 0 || self.entry_stride <= 0) return false;
+
+            const uint8_t* sparse_base = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void* const*>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return false;
+            if (num_free_idx < 0) num_free_idx = 0;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return false;
+
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            std::string target_key;
+            if (key_lua.is<lua_types::LuaFName>()) target_key = key_lua.as<lua_types::LuaFName&>().to_string();
+            else if (key_lua.is<std::string>()) target_key = key_lua.as<std::string>();
+            else if (key_lua.is<int>()) target_key = std::to_string(key_lua.as<int>());
+            else if (key_lua.is<double>()) target_key = std::to_string(static_cast<int64_t>(key_lua.as<double>()));
+            else return false;
+
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+                const uint8_t* entry = reinterpret_cast<const uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* key_ptr = entry + self.key_offset;
+                if (!ue::is_mapped_ptr(key_ptr)) { visited++; continue; }
+
+                sol::object key_obj = read_element(lua, key_ptr, self.key_prop);
+                std::string key_str;
+                if (key_obj.is<lua_types::LuaFName>()) key_str = key_obj.as<lua_types::LuaFName&>().to_string();
+                else if (key_obj.is<std::string>()) key_str = key_obj.as<std::string>();
+                else if (key_obj.is<lua_types::LuaFString>()) key_str = key_obj.as<lua_types::LuaFString&>().to_string();
+                else if (key_obj.is<int>()) key_str = std::to_string(key_obj.as<int>());
+                else if (key_obj.is<double>()) key_str = std::to_string(static_cast<int64_t>(key_obj.as<double>()));
+
+                if (key_str == target_key) return true;
+                visited++;
+            }
+            return false; },
+
+                                  // ── Num — return count of valid entries (alias for #map) ─
+                                  "Num", [](const LuaTMap &self) -> int
+                                  {
+            if (!self.map_ptr) return 0;
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            int32_t array_num = *reinterpret_cast<const int32_t*>(b + 8);
+            int32_t num_free  = *reinterpret_cast<const int32_t*>(b + 52);
+            if (num_free < 0 || num_free > array_num) num_free = 0;
+            return array_num - num_free; },
+
+                                  // ── IsEmpty — check if map has no valid entries ────────
+                                  "IsEmpty", [](const LuaTMap &self) -> bool
+                                  {
+            if (!self.map_ptr) return true;
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(self.map_ptr);
+            int32_t array_num = *reinterpret_cast<const int32_t*>(b + 8);
+            int32_t num_free  = *reinterpret_cast<const int32_t*>(b + 52);
+            if (num_free < 0 || num_free > array_num) num_free = 0;
+            return (array_num - num_free) <= 0; });
     }
 
     // ═══════════════════════════════════════════════════════════════════════

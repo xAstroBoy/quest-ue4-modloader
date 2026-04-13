@@ -12,6 +12,8 @@
 #include "modloader/lua_tarray.h"
 #include "modloader/lua_ustruct.h"
 #include "modloader/lua_enum_ext.h"
+#include "modloader/lua_console.h"
+#include "modloader/lua_cast.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 
@@ -169,6 +171,12 @@ namespace lua_engine
         // Register delayed action system (ExecuteWithDelay, LoopAsync, etc.)
         lua_delayed::init();
         lua_delayed::register_all(*s_lua);
+
+        // Register console command, CheatManager, ViewMode, diagnostics API
+        lua_console::register_all(*s_lua);
+
+        // Register Cast layer, CastParms, SpawnActor, NewObject, introspection API
+        lua_cast::register_all(*s_lua);
 
         // Initialize SharedAPI as a bare Lua global table.
         // The modloader is GENERIC — it only provides the empty SharedAPI namespace.

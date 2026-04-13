@@ -1005,7 +1005,7 @@ namespace reflection
         int enum_count = 0;
         int null_count = 0;
         int invalid_count = 0;
-        int unmapped_count = 0;
+        (void)0; // unmapped_count removed — was unused
 
         for (int32_t i = 0; i < s_object_count; i++)
         {

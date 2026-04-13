@@ -153,6 +153,9 @@ namespace game_profile
     // Get the full game profile
     const GameProfile &profile();
 
+    // Get a mutable reference to the game profile (for auto_offsets to update)
+    GameProfile &mutable_profile();
+
     // Get the type offsets for the current game
     const TypeOffsets &offsets();
 
