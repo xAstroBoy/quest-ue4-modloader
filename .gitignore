@@ -32,6 +32,9 @@ Current Modloader SDK/
 # ── Reference projects (vendored, not ours) ──────────────────────────
 RE-UE4SS/
 
+# ── Unreal Engine source (copyrighted — NEVER commit) ───────────────
+Unreal Engine For Quest/
+
 # ── sol2 full repo clone (only sol2/include/ is used) ────────────────
 modloader/third_party/sol2_repo/
 
