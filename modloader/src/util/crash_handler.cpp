@@ -59,6 +59,11 @@ namespace crash_handler
     static struct sigaction s_old_sigbus;
     static struct sigaction s_old_sigfpe;
 
+    // Boot grace period — skip SIGABRT logging during first 5 seconds.
+    // Frida's gadget (libfrda.so) calls abort() ~1.4s after boot which
+    // is expected/handled. After boot completes, we catch everything.
+    static volatile bool s_boot_complete = false;
+
     // Track our own library's address range so we can distinguish
     // modloader crashes from game crashes
     static uintptr_t s_modloader_base = 0;
@@ -181,6 +186,23 @@ namespace crash_handler
 
     static void crash_handler_fn(int sig, siginfo_t *info, void *ucontext_raw)
     {
+        // ── SIGABRT BOOT GRACE PERIOD ────────────────────────────────────────
+        // During the first ~5s, Frida's gadget calls abort() which is expected.
+        // Don't intercept it — let the old handler deal with it.
+        if (sig == SIGABRT && !s_boot_complete)
+        {
+            if (s_old_sigabrt.sa_sigaction)
+                s_old_sigabrt.sa_sigaction(sig, info, ucontext_raw);
+            else if (s_old_sigabrt.sa_handler != SIG_DFL && s_old_sigabrt.sa_handler != SIG_IGN)
+                s_old_sigabrt.sa_handler(sig);
+            else
+            {
+                signal(sig, SIG_DFL);
+                raise(sig);
+            }
+            return;
+        }
+
         // ── SAFE_CALL RECOVERY (highest priority) ────────────────────────────
         // If we're inside a safe_call::execute() region, recover via siglongjmp.
         // This is the modern, unified recovery path for all modloader code.
@@ -228,53 +250,18 @@ namespace crash_handler
             // Never reaches here
         }
 
-        // Check if crash PC is inside libmodloader.so — if not, this is a game crash,
-        // not ours. Pass directly to previous handler without writing crash log or
-        // posting notification. The game or ART may handle it gracefully.
+        // Determine if crash PC is inside libmodloader.so or game code.
+        // We write a crash report for ALL crashes — our hooks can trigger
+        // crashes in game code (libUE4.so), and we need to capture those too.
         ucontext_t *uc = static_cast<ucontext_t *>(ucontext_raw);
-        bool is_our_crash = false;
+        bool is_modloader_crash = false;
         if (uc)
         {
             uintptr_t pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
-            is_our_crash = pc_in_modloader(pc);
+            is_modloader_crash = pc_in_modloader(pc);
         }
 
-        if (!is_our_crash)
-        {
-            // Not our crash — forward to previous handler immediately
-            struct sigaction *old_action = nullptr;
-            switch (sig)
-            {
-            case SIGSEGV:
-                old_action = &s_old_sigsegv;
-                break;
-            case SIGABRT:
-                old_action = &s_old_sigabrt;
-                break;
-            case SIGBUS:
-                old_action = &s_old_sigbus;
-                break;
-            case SIGFPE:
-                old_action = &s_old_sigfpe;
-                break;
-            }
-            if (old_action && old_action->sa_sigaction)
-            {
-                old_action->sa_sigaction(sig, info, ucontext_raw);
-            }
-            else if (old_action && old_action->sa_handler != SIG_DFL && old_action->sa_handler != SIG_IGN)
-            {
-                old_action->sa_handler(sig);
-            }
-            else
-            {
-                signal(sig, SIG_DFL);
-                raise(sig);
-            }
-            return;
-        }
-
-        // Crash IS in libmodloader.so — write full crash report
+        // Write full crash report for ALL crashes (modloader + game)
         FILE *f = fopen(paths::crash_log().c_str(), "w");
         if (f)
         {
@@ -291,6 +278,19 @@ namespace crash_handler
             fprintf(f, "Signal: %s (%d)\n", signal_name(sig), sig);
             fprintf(f, "Code: %s (%d)\n", signal_code_name(sig, info->si_code), info->si_code);
             fprintf(f, "Fault address: %p\n", info->si_addr);
+            fprintf(f, "Crash origin: %s\n", is_modloader_crash ? "libmodloader.so (OUR CODE)" : "GAME / EXTERNAL (possibly triggered by our hooks)");
+            // Resolve crashing library via dladdr
+            if (uc)
+            {
+                uintptr_t crash_pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+                Dl_info crash_dl;
+                if (dladdr(reinterpret_cast<void *>(crash_pc), &crash_dl) && crash_dl.dli_fname)
+                {
+                    fprintf(f, "Crash library: %s\n", crash_dl.dli_fname);
+                    fprintf(f, "Crash offset:  0x%lX\n",
+                            (unsigned long)(crash_pc - reinterpret_cast<uintptr_t>(crash_dl.dli_fbase)));
+                }
+            }
             fprintf(f, "Crash log path: %s\n", paths::crash_log().c_str());
             fprintf(f, "\n");
             fprintf(f, "=== LIBRARY BASE ADDRESSES ===\n");
@@ -316,6 +316,22 @@ namespace crash_handler
                     fprintf(f, "  llvm-addr2line -e build/libmodloader.so -f 0x%lX\n",
                             (unsigned long)pc_offset);
                     fprintf(f, "  ndk-stack -sym build/ -dump <this_file>\n");
+                }
+                else
+                {
+                    // Game crash — show which library and offset
+                    Dl_info pc_dl;
+                    if (dladdr(reinterpret_cast<void *>(pc), &pc_dl) && pc_dl.dli_fname)
+                    {
+                        uintptr_t lib_offset = pc - reinterpret_cast<uintptr_t>(pc_dl.dli_fbase);
+                        fprintf(f, "PC in %s + 0x%lX\n", pc_dl.dli_fname, (unsigned long)lib_offset);
+                        if (pc_dl.dli_sname)
+                            fprintf(f, "Near symbol: %s\n", pc_dl.dli_sname);
+                    }
+                    else
+                    {
+                        fprintf(f, "PC not in any known library (unmapped?)\n");
+                    }
                 }
 
                 fprintf(f, "\n=== REGISTERS ===\n");
@@ -465,14 +481,19 @@ namespace crash_handler
         sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
 
-        // Handle hardware faults only — NOT SIGABRT.
-        // SIGABRT is excluded because Frida's gadget (libfrda.so) calls abort()
-        // ~1.4s after boot. If we intercept SIGABRT and forward to the saved
-        // handler (which may be SIG_DFL), the process dies immediately instead
-        // of Frida handling it gracefully. Leave SIGABRT alone.
+        // Handle ALL crash signals including SIGABRT.
+        // SIGABRT during boot grace period (first ~5s) is forwarded to old handler
+        // to let Frida's gadget abort() work. After boot completes, we catch everything.
         sigaction(SIGSEGV, &sa, &s_old_sigsegv);
+        sigaction(SIGABRT, &sa, &s_old_sigabrt);
         sigaction(SIGBUS, &sa, &s_old_sigbus);
         sigaction(SIGFPE, &sa, &s_old_sigfpe);
+    }
+
+    void mark_boot_complete()
+    {
+        s_boot_complete = true;
+        logger::log_info("CRASH", "Boot complete — SIGABRT handler now active (all signals caught)");
     }
 
     void reinstall()
@@ -493,6 +514,7 @@ namespace crash_handler
 
         // Save whatever is currently installed (Oculus/Frida handler) as our chain target
         sigaction(SIGSEGV, &sa, &s_old_sigsegv);
+        sigaction(SIGABRT, &sa, &s_old_sigabrt);
         sigaction(SIGBUS, &sa, &s_old_sigbus);
         sigaction(SIGFPE, &sa, &s_old_sigfpe);
 

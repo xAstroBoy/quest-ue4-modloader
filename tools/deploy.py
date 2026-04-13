@@ -685,21 +685,29 @@ def cmd_launch():
 
 
 def cmd_log():
-    """Pull UEModLoader.log from device."""
+    """Pull UEModLoader.log from device, then clear it."""
     LOGS_DIR.mkdir(exist_ok=True)
     local = LOGS_DIR / "UEModLoader.log"
     local_posix = str(local).replace("\\", "/")
     print(f"[LOG] Pulling UEModLoader.log...")
 
+    pulled = False
     if sftp_batch([f'get "{LOG_DEVICE}" "{local_posix}"']):
         print(f"  ✓ Saved to {local}")
+        pulled = True
+    else:
+        # ADB fallback
+        r = adb("pull", LOG_DEVICE, str(local), check=False)
+        if r.returncode == 0:
+            print(f"  ✓ Saved to {local} (via ADB)")
+            pulled = True
+
+    if pulled:
+        # Clear log on device after successful pull
+        adb_shell(f'echo -n > "{LOG_DEVICE}" 2>/dev/null', check=False)
+        print(f"  ✓ Cleared log on device")
         return True
 
-    # ADB fallback
-    r = adb("pull", LOG_DEVICE, str(local), check=False)
-    if r.returncode == 0:
-        print(f"  ✓ Saved to {local} (via ADB)")
-        return True
     print(f"  ✗ Failed to pull log")
     return False
 
@@ -753,23 +761,59 @@ def cmd_tombstones():
 
 
 def cmd_pe_trace():
-    """Pull pe_trace.log from device."""
+    """Pull pe_trace.log from device, then clear it."""
     LOGS_DIR.mkdir(exist_ok=True)
     local = LOGS_DIR / "pe_trace.log"
     local_posix = str(local).replace("\\", "/")
     pe_trace_device = f"/storage/emulated/0/Android/data/{PKG}/files/pe_trace.log"
     print("[PE_TRACE] Pulling pe_trace.log...")
 
+    pulled = False
     if sftp_batch([f'get "{pe_trace_device}" "{local_posix}"']):
         print(f"  ✓ Saved to {local}")
+        pulled = True
+    else:
+        r = adb("pull", pe_trace_device, str(local), check=False)
+        if r.returncode == 0:
+            print(f"  ✓ Saved to {local} (via ADB)")
+            pulled = True
+
+    if pulled:
+        # Clear log on device after successful pull
+        adb_shell(f'echo -n > "{pe_trace_device}" 2>/dev/null', check=False)
+        print(f"  ✓ Cleared pe_trace.log on device")
         return True
 
-    r = adb("pull", pe_trace_device, str(local), check=False)
-    if r.returncode == 0:
-        print(f"  ✓ Saved to {local} (via ADB)")
-        return True
     print(f"  ✗ Failed to pull pe_trace.log")
     return False
+
+
+def cmd_crashlog():
+    """Pull modloader_crash.log from device, then clear it."""
+    LOGS_DIR.mkdir(exist_ok=True)
+    local = LOGS_DIR / "modloader_crash.log"
+    local_posix = str(local).replace("\\", "/")
+    crashlog_device = f"/storage/emulated/0/Android/data/{PKG}/files/modloader_crash.log"
+    print("[CRASHLOG] Pulling modloader_crash.log...")
+
+    pulled = False
+    if sftp_batch([f'get "{crashlog_device}" "{local_posix}"']):
+        print(f"  ✓ Saved to {local}")
+        pulled = True
+    else:
+        r = adb("pull", crashlog_device, str(local), check=False)
+        if r.returncode == 0:
+            print(f"  ✓ Saved to {local} (via ADB)")
+            pulled = True
+
+    if pulled:
+        # Clear crash log on device after successful pull
+        adb_shell(f'rm "{crashlog_device}" 2>/dev/null', check=False)
+        print(f"  ✓ Cleared crash log on device")
+        return True
+
+    print(f"  ✗ No crash log found (good — no crashes!)")
+    return True  # Not having a crash log is not an error
 
 
 def cmd_sdk():
@@ -825,7 +869,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["modloader", "mods", "all", "log", "pe_trace", "sdk",
+        choices=["modloader", "mods", "all", "log", "crashlog", "pe_trace", "sdk",
                  "tombstones", "restart", "launch", "ensure", "status",
                  "forward", "console"],
         help="What to deploy/pull"
@@ -881,6 +925,9 @@ def main():
 
     elif args.command == "log":
         ok = cmd_log()
+
+    elif args.command == "crashlog":
+        ok = cmd_crashlog()
 
     elif args.command == "pe_trace":
         ok = cmd_pe_trace()

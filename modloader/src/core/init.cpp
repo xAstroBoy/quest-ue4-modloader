@@ -527,6 +527,11 @@ namespace init
         auto boot_end = std::chrono::steady_clock::now();
         auto boot_ms = std::chrono::duration_cast<std::chrono::milliseconds>(boot_end - boot_start).count();
 
+        // Mark boot complete — enables SIGABRT interception.
+        // Before this point, Frida's gadget may call abort() which we
+        // intentionally let through. Now all signals are fully caught.
+        crash_handler::mark_boot_complete();
+
         logger::log_info("BOOT", "Boot complete in %lldms — %d mods, ADB on :%d",
                          (long long)boot_ms, mods_loaded, adb_bridge::ADB_BRIDGE_PORT);
         logger::log_info("BOOT", "Deferring GUObjectArray wait + reflection + SDK + PAK to background thread");

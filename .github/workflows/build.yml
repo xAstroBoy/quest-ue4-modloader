@@ -124,12 +124,14 @@ jobs:
           retention-days: 30
 
   # ════════════════════════════════════════════════════════════════════
-  #  Job 3: Package Release (on tag push only)
+  #  Job 3: Package Release
+  #  • On tag push (v*): creates a full versioned GitHub Release
+  #  • On push to main: creates/updates a "dev-latest" pre-release
   # ════════════════════════════════════════════════════════════════════
   package:
     name: Package Release
     needs: [build-modloader, build-installer]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
@@ -154,6 +156,19 @@ jobs:
           name: installer-x86_64-unknown-linux-gnu
           path: release/linux/
 
+      - name: Set release tag
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "name=Release ${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-latest" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "name=Development Build (latest main)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Package mods & tools
         run: |
           # ── Game mods ──
@@ -168,13 +183,20 @@ jobs:
             done
           done
 
+          # ── PAK files ──
+          if [ -d "PAKS" ]; then
+            mkdir -p release/PAKS
+            cp PAKS/*.pak release/PAKS/ 2>/dev/null || true
+          fi
+
           # ── Tools ──
           mkdir -p release/tools
-          cp tools/deploy.py release/tools/
-          cp tools/uncook.py release/tools/
-          cp tools/extract_paks.py release/tools/
-          cp tools/dump_uasset.py release/tools/
-          cp tools/kismet_decompiler.py release/tools/
+          cp tools/deploy.py release/tools/ 2>/dev/null || true
+          cp tools/uncook.py release/tools/ 2>/dev/null || true
+          cp tools/extract_paks.py release/tools/ 2>/dev/null || true
+          cp tools/dump_uasset.py release/tools/ 2>/dev/null || true
+          cp tools/kismet_decompiler.py release/tools/ 2>/dev/null || true
+          cp tools/build_debug_pak.py release/tools/ 2>/dev/null || true
 
           # ── Examples ──
           cp -r examples/ release/examples/ 2>/dev/null || true
@@ -192,7 +214,7 @@ jobs:
         run: |
           cd release
           # Remove linux subdir from main zip
-          zip -r ../quest-ue-modloader-${{ github.ref_name }}-windows.zip . -x "linux/*"
+          zip -r ../quest-ue-modloader-${{ steps.tag.outputs.tag }}-windows.zip . -x "linux/*"
 
       - name: Create Linux release archive
         run: |
@@ -201,17 +223,28 @@ jobs:
           cp -r release/mods release/linux/mods 2>/dev/null || true
           cp -r release/tools release/linux/tools 2>/dev/null || true
           cp -r release/examples release/linux/examples 2>/dev/null || true
+          cp -r release/PAKS release/linux/PAKS 2>/dev/null || true
           cp release/README.md release/linux/ 2>/dev/null || true
           cp release/LICENSE release/linux/ 2>/dev/null || true
           cd release/linux
-          tar czf ../../quest-ue-modloader-${{ github.ref_name }}-linux.tar.gz .
+          tar czf ../../quest-ue-modloader-${{ steps.tag.outputs.tag }}-linux.tar.gz .
+
+      # For dev-latest: delete old release first so we can recreate it
+      - name: Delete existing dev-latest release
+        if: steps.tag.outputs.tag == 'dev-latest'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev-latest --yes --cleanup-tag 2>/dev/null || true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
           files: |
-            quest-ue-modloader-${{ github.ref_name }}-windows.zip
-            quest-ue-modloader-${{ github.ref_name }}-linux.tar.gz
+            quest-ue-modloader-${{ steps.tag.outputs.tag }}-windows.zip
+            quest-ue-modloader-${{ steps.tag.outputs.tag }}-linux.tar.gz
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
