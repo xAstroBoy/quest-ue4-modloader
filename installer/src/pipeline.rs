@@ -55,26 +55,17 @@ pub fn patch_local_apk(
     let so_path = find_modloader_so(so_override)?;
     log::info!("libmodloader.so: {}", so_path.display());
 
-    // Determine game profile from package hint or APK name
-    let game_name = if let Some(pkg) = package_hint {
-        game_db::find_by_package(pkg)
-            .map(|g| g.name)
-            .unwrap_or(pkg)
+    // Resolve game profile if we have a package hint
+    let game_profile = package_hint
+        .and_then(|pkg| game_db::find_by_package(pkg));
+
+    // Determine game name from profile or APK filename
+    let game_name = if let Some(g) = game_profile {
+        g.name
     } else {
         let stem = apk.file_stem().unwrap_or_default().to_string_lossy();
-        // Try to detect game from APK filename
         let detected = game_db::GAMES.iter().find(|g| stem.contains(g.package));
         detected.map(|g| g.name).unwrap_or("Unknown Game")
-    };
-
-    // Detect smali target — use game_db if we know the package, otherwise guess UE4 default
-    let smali_target = if let Some(pkg) = package_hint {
-        game_db::find_by_package(pkg)
-            .map(|g| g.smali_target)
-            .unwrap_or("com/epicgames/unreal/GameActivity")
-    } else {
-        // Auto-detect: try to find the smali target after decompilation
-        "com/epicgames/unreal/GameActivity"
     };
 
     let work_dir = tempfile::tempdir()?;
@@ -84,26 +75,10 @@ pub fn patch_local_apk(
     let decompiled = work_dir.path().join("decompiled");
     smali::decompile(&apk, &decompiled)?;
 
-    // 2. Try known smali targets, then auto-detect
+    // 2. Smart injection — tries profile targets, manifest auto-detect, common UE activities
     log::info!("[2/5] Injecting modloader...");
-    let inject_result = smali::inject_loadlibrary(&decompiled, smali_target);
-    if inject_result.is_err() && package_hint.is_none() {
-        // Try all known targets
-        let mut injected = false;
-        for g in game_db::GAMES {
-            if smali::inject_loadlibrary(&decompiled, g.smali_target).is_ok() {
-                log::info!("Auto-detected smali target: {} ({})", g.smali_target, g.name);
-                injected = true;
-                break;
-            }
-        }
-        if !injected {
-            bail!("Could not find smali injection target.\n\
-                   Use --package <com.package.name> to specify the game.");
-        }
-    } else {
-        inject_result?;
-    }
+    let target = smali::find_injection_target(&decompiled, game_profile)?;
+    smali::inject_loadlibrary(&decompiled, &target)?;
 
     smali::add_native_lib(&decompiled, &so_path)?;
     smali::fix_manifest(&decompiled)?;
@@ -177,9 +152,11 @@ pub fn install(
     let decompiled = work_dir.path().join("decompiled");
     smali::decompile(&apk, &decompiled)?;
 
-    // 5. Inject loadLibrary + add .so + fix manifest
+    // 5. Smart injection — tries profile targets, manifest auto-detect, common UE activities
     report(4, "Injecting modloader...");
-    smali::inject_loadlibrary(&decompiled, game.smali_target)?;
+    let target = smali::find_injection_target(&decompiled, Some(game))?;
+    log::info!("Injection target: {}", target);
+    smali::inject_loadlibrary(&decompiled, &target)?;
     smali::add_native_lib(&decompiled, so_path)?;
     smali::fix_manifest(&decompiled)?;
 

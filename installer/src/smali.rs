@@ -7,6 +7,8 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::game_db;
+
 // ── Find apktool ────────────────────────────────────────────────────────
 
 pub fn find_apktool() -> Result<PathBuf> {
@@ -57,7 +59,7 @@ pub fn decompile(apk: &Path, out_dir: &Path) -> Result<PathBuf> {
 
 fn find_smali_file(decompiled: &Path, class_path: &str) -> Result<PathBuf> {
     // Try smali, smali_classes2, smali_classes3...
-    for i in 0..10 {
+    for i in 0..20 {
         let dir = if i == 0 {
             decompiled.join("smali")
         } else {
@@ -68,7 +70,205 @@ fn find_smali_file(decompiled: &Path, class_path: &str) -> Result<PathBuf> {
             return Ok(file);
         }
     }
-    bail!("Smali class not found: {}.smali\nSearched in smali/ through smali_classes10/", class_path)
+    bail!("Smali class not found: {}.smali\nSearched in smali/ through smali_classes20/", class_path)
+}
+
+// ── Auto-detect main activity from AndroidManifest.xml ──────────────────
+
+/// Parse the decompiled AndroidManifest.xml to find the main launcher Activity.
+/// Returns the smali-style class path (e.g. "com/epicgames/ue4/GameActivity").
+pub fn detect_main_activity(decompiled: &Path) -> Result<String> {
+    let manifest = decompiled.join("AndroidManifest.xml");
+    if !manifest.exists() {
+        bail!("AndroidManifest.xml not found in {}", decompiled.display());
+    }
+    let content = std::fs::read_to_string(&manifest)?;
+
+    // Strategy 1: Find activity with MAIN intent filter
+    // The decompiled XML has <activity android:name="..."> with nested <intent-filter>
+    // containing <action android:name="android.intent.action.MAIN"/>
+    let re_activity = Regex::new(
+        r#"(?s)<activity[^>]*android:name="([^"]+)"[^>]*>.*?</activity>"#
+    ).unwrap();
+
+    for cap in re_activity.captures_iter(&content) {
+        let block = cap.get(0).unwrap().as_str();
+        let name = cap.get(1).unwrap().as_str();
+        if block.contains("android.intent.action.MAIN") {
+            let class_path = activity_name_to_smali(name, &content);
+            log::info!("Auto-detected main activity from manifest: {}", class_path);
+            return Ok(class_path);
+        }
+    }
+
+    // Strategy 2: Find any activity with VR category (Quest games)
+    for cap in re_activity.captures_iter(&content) {
+        let block = cap.get(0).unwrap().as_str();
+        let name = cap.get(1).unwrap().as_str();
+        if block.contains("com.oculus.intent.category.VR") {
+            let class_path = activity_name_to_smali(name, &content);
+            log::info!("Auto-detected VR activity from manifest: {}", class_path);
+            return Ok(class_path);
+        }
+    }
+
+    // Strategy 3: Find activity whose name contains "GameActivity" or "MainActivity"
+    for cap in re_activity.captures_iter(&content) {
+        let name = cap.get(1).unwrap().as_str();
+        if name.contains("GameActivity") || name.contains("MainActivity") || name.contains("SplashActivity") {
+            let class_path = activity_name_to_smali(name, &content);
+            log::info!("Auto-detected activity by name pattern: {}", class_path);
+            return Ok(class_path);
+        }
+    }
+
+    bail!("Could not detect main activity from AndroidManifest.xml")
+}
+
+/// Convert an Android activity name to a smali-style class path.
+/// Handles both fully-qualified ("com.epicgames.ue4.GameActivity") and
+/// shorthand (".GameActivity") forms.
+fn activity_name_to_smali(name: &str, manifest_content: &str) -> String {
+    let full_name = if name.starts_with('.') {
+        // Shorthand: prepend the package name
+        let re_pkg = Regex::new(r#"package="([^"]+)""#).unwrap();
+        if let Some(cap) = re_pkg.captures(manifest_content) {
+            format!("{}{}", cap.get(1).unwrap().as_str(), name)
+        } else {
+            name.to_string()
+        }
+    } else {
+        name.to_string()
+    };
+    // Convert dots to slashes for smali path
+    full_name.replace('.', "/")
+}
+
+/// Try to find a working smali injection target. Tries in order:
+/// 1. Game profile's primary target
+/// 2. Game profile's fallback targets
+/// 3. Auto-detected from AndroidManifest.xml
+/// 4. Common UE4/UE5 activities
+///
+/// Returns the smali class path that was found.
+pub fn find_injection_target(decompiled: &Path, game: Option<&game_db::GameProfile>) -> Result<String> {
+    let mut tried = Vec::new();
+
+    // 1. Try game profile's primary target
+    if let Some(g) = game {
+        if find_smali_file(decompiled, g.smali_target).is_ok() {
+            log::info!("Using game profile smali target: {}", g.smali_target);
+            return Ok(g.smali_target.to_string());
+        }
+        tried.push(g.smali_target.to_string());
+
+        // 2. Try game profile's fallbacks
+        for fb in g.smali_fallbacks {
+            if find_smali_file(decompiled, fb).is_ok() {
+                log::info!("Using fallback smali target: {}", fb);
+                return Ok(fb.to_string());
+            }
+            tried.push(fb.to_string());
+        }
+    }
+
+    // 3. Auto-detect from AndroidManifest.xml
+    if let Ok(detected) = detect_main_activity(decompiled) {
+        if find_smali_file(decompiled, &detected).is_ok() {
+            log::info!("Using manifest-detected smali target: {}", detected);
+            return Ok(detected);
+        }
+        tried.push(detected);
+    }
+
+    // 4. Try common UE4/UE5 activity classes
+    for common in game_db::UE_COMMON_ACTIVITIES {
+        if !tried.iter().any(|t| t == *common) {
+            if find_smali_file(decompiled, common).is_ok() {
+                log::info!("Using common UE activity: {}", common);
+                return Ok(common.to_string());
+            }
+            tried.push(common.to_string());
+        }
+    }
+
+    // 5. Last resort: scan all smali dirs for any GameActivity
+    if let Some(found) = scan_for_game_activity(decompiled) {
+        log::info!("Found GameActivity via filesystem scan: {}", found);
+        return Ok(found);
+    }
+
+    bail!(
+        "Could not find smali injection target.\n\
+         Tried: {}\n\
+         The APK may use a non-standard activity class.",
+        tried.join(", ")
+    )
+}
+
+/// Scan all smali directories for any file named *GameActivity.smali or *Activity.smali
+/// that contains an onCreate method.
+fn scan_for_game_activity(decompiled: &Path) -> Option<String> {
+    for i in 0..20 {
+        let dir = if i == 0 {
+            decompiled.join("smali")
+        } else {
+            decompiled.join(format!("smali_classes{}", i + 1))
+        };
+        if !dir.exists() { continue; }
+
+        // Look for GameActivity.smali files
+        if let Some(found) = walk_for_activity(&dir, &dir, "GameActivity.smali") {
+            return Some(found);
+        }
+    }
+
+    // Broader: look for any Activity with onCreate
+    for i in 0..20 {
+        let dir = if i == 0 {
+            decompiled.join("smali")
+        } else {
+            decompiled.join(format!("smali_classes{}", i + 1))
+        };
+        if !dir.exists() { continue; }
+
+        if let Some(found) = walk_for_activity(&dir, &dir, "Activity.smali") {
+            // Verify it has onCreate
+            let smali_path = dir.join(format!("{}.smali", found));
+            if let Ok(content) = std::fs::read_to_string(&smali_path) {
+                if content.contains("onCreate(Landroid/os/Bundle;)V") {
+                    return Some(found);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Walk a directory tree looking for a file ending with the given suffix.
+/// Returns the smali-style class path relative to the smali root.
+fn walk_for_activity(root: &Path, dir: &Path, suffix: &str) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = walk_for_activity(root, &path, suffix) {
+                return Some(found);
+            }
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.ends_with(suffix) {
+                // Convert filesystem path to smali class path
+                let rel = path.strip_prefix(root).ok()?;
+                let class_path = rel.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_end_matches(".smali")
+                    .to_string();
+                return Some(class_path);
+            }
+        }
+    }
+    None
 }
 
 // ── Inject loadLibrary ──────────────────────────────────────────────────

@@ -1,20 +1,23 @@
--- mods/Rapidfire/main.lua v12.2
+-- mods/Rapidfire/main.lua v13.0
 -- ═══════════════════════════════════════════════════════════════════════
 -- Rapidfire — Forces fully automatic rapid fire on all weapons.
 --
--- v12.2 — Fixed: WasTriggerJustPressed is NOT a UFunction — removed
---   invalid PostHook. 3 valid PostHooks remain. IsFullyAutomatic→true
---   effectively handles semi-auto guns by making them full-auto.
--- v12.1 — pcall-wrapped PostHooks for safety.
--- v12.0 — Simplified. No trigger state machine, no BLOCK, no crash risk.
---   1. PostHook IsFiringBlocked → false (gun can always fire)
---   2. PostHook IsFullyAutomatic → true (holding trigger keeps firing)
---   3. PostHook IsReadyToFire → true (fire timer always "done")
---   4. Native hook UpdateFireTimer → accelerate cooldown timer
---   5. Native hook IsFireTimerDone → always returns 1 (ready)
---   6. Native hook GetEnemyReactionCooldown → 0 (no stagger cooldown)
+-- v13.0 — Complete rewrite with mangled symbol resolution + direct parms writes.
+--   PostHooks: WriteU8(parms) for bool returns (CastParms removed)
+--   Native hooks: Use mangled C++ names with fallback offsets for reliability
+--   Removed: GetEnemyReactionCooldown (wrong class — was on VR4GamePlayerKnife)
+--   Added: Diagnostic logging to verify hooks fire
 --
--- Fire rate controlled by state.cooldown — lower = faster.
+-- Architecture:
+--   1. PostHook IsFiringBlocked → false (override via ProcessEvent path)
+--   2. PostHook IsFullyAutomatic → true (ProcessEvent path)
+--   3. PostHook IsReadyToFire → true (ProcessEvent path)
+--   4. Native hook UpdateFireTimer → dt=999.0 (force timer completion)
+--   5. Native hook IsFireTimerDone → always returns 1
+--
+-- Note: PostHooks fire when game calls via ProcessEvent (Blueprint paths).
+-- Native hooks fire when game calls via C++ vtable (primary code path).
+-- Both are installed for maximum coverage.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Rapidfire"
 local VERBOSE = false
@@ -22,7 +25,7 @@ local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) 
 
 local state = {
     enabled = true,
-    cooldown = 0.15,  -- seconds between shots (lower = faster)
+    cooldown = 0.10,  -- seconds between shots (lower = faster)
 }
 
 local saved = ModConfig.Load("Rapidfire")
@@ -37,26 +40,30 @@ end
 local modReady = false
 ExecuteWithDelay(500, function()
     modReady = true
-    Log(TAG .. ": Startup delay complete — mod active (cooldown=" .. state.cooldown .. "s)")
+    Log(TAG .. ": Startup delay complete — mod active")
 end)
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS POST-HOOKS — Override return values via ProcessEvent (safe)
 --
 -- These fire AFTER the original function runs. We overwrite the return
--- value in the parms buffer so the caller sees our value.
--- No BLOCK needed. Original always runs safely.
+-- value directly in the parms buffer (bool @ offset 0x0 for parameterless
+-- bool-returning functions).
 -- ═══════════════════════════════════════════════════════════════════════
 
 local hookCount = 0
+local postHookFires = 0  -- diagnostic counter
 
 -- IsFiringBlocked → always false (gun is never blocked from firing)
+-- Parms layout: {bool ReturnValue @ 0x0}
 pcall(function()
     RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFiringBlocked", function(self, func, parms)
         if not state.enabled or not modReady then return end
-        V("PostHook IsFiringBlocked → false")
-        local p = CastParms(parms, "VR4GamePlayerGun:IsFiringBlocked")
-        if p then p:SetReturnValue(false) end
+        pcall(function() WriteU8(parms, 0) end)  -- false = not blocked
+        postHookFires = postHookFires + 1
+        if postHookFires <= 3 then
+            Log(TAG .. ": PostHook IsFiringBlocked → false (fire #" .. postHookFires .. ")")
+        end
     end)
     hookCount = hookCount + 1
 end)
@@ -65,75 +72,94 @@ end)
 pcall(function()
     RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsFullyAutomatic", function(self, func, parms)
         if not state.enabled or not modReady then return end
-        V("PostHook IsFullyAutomatic → true")
-        local p = CastParms(parms, "VR4GamePlayerGun:IsFullyAutomatic")
-        if p then p:SetReturnValue(true) end
+        pcall(function() WriteU8(parms, 1) end)  -- true = full auto
     end)
     hookCount = hookCount + 1
 end)
 
--- IsReadyToFire → always true (fire timer always "done" from ProcessEvent perspective)
+-- IsReadyToFire → always true (fire timer always "done")
 pcall(function()
     RegisterPostHook("/Script/Game.VR4GamePlayerGun:IsReadyToFire", function(self, func, parms)
         if not state.enabled or not modReady then return end
-        V("PostHook IsReadyToFire → true")
-        local p = CastParms(parms, "VR4GamePlayerGun:IsReadyToFire")
-        if p then p:SetReturnValue(true) end
+        pcall(function() WriteU8(parms, 1) end)  -- true = ready
     end)
     hookCount = hookCount + 1
 end)
-
--- WasTriggerJustPressed → NOT a UFunction (native C++ only, no exec thunk).
--- Cannot be hooked via PostHook. Skipping.
--- For semi-auto guns, IsFullyAutomatic→true handles this case by making
--- the gun behave as full-auto, so trigger-press detection is bypassed.
-Log(TAG .. ": Note: WasTriggerJustPressed is native-only (no UFunction), skipped PostHook")
 
 Log(TAG .. ": " .. hookCount .. "/3 PostHooks registered (IsFiringBlocked, IsFullyAutomatic, IsReadyToFire)")
 
 -- ═══════════════════════════════════════════════════════════════════════
--- NATIVE HOOKS — Fire timer acceleration + enemy reaction bypass
+-- NATIVE HOOKS — Fire timer acceleration via Dobby (C++ code path)
+--
+-- These are the PRIMARY mechanism for rapid fire since the game's
+-- shooting logic calls these functions via C++ vtable, not ProcessEvent.
 -- ═══════════════════════════════════════════════════════════════════════
 
 local lastFireTime = 0  -- os.clock() of last rapid fire shot
+local nativeHookFires = 0  -- diagnostic counter
 
--- UpdateFireTimer(self, float deltaTime) — accelerate the cooldown timer
-pcall(function()
-    RegisterNativeHook("UpdateFireTimer",
-        function(self_ptr, dt)
-            if not state.enabled or not modReady then return self_ptr, dt end
-            V("UpdateFireTimer pre-hook dt=%.3f", dt)
-            local now = os.clock()
-            if (now - lastFireTime) >= state.cooldown then
-                lastFireTime = now
-                return self_ptr, 999.0  -- complete timer instantly → fires now
-            end
-            return self_ptr, 0.0  -- hold timer at zero until next cooldown window
-        end, nil, "pf")
-    Log(TAG .. ": UpdateFireTimer hooked (cooldown=" .. state.cooldown .. "s)")
-end)
+-- UpdateFireTimer(float deltaTime)
+-- Mangled: _ZN17AVR4GamePlayerGun15UpdateFireTimerEf @ 0x062D9E20
+-- Pre-hook: override dt to control fire rate
+local sym_UpdateFireTimer = nil
+pcall(function() sym_UpdateFireTimer = Resolve("_ZN17AVR4GamePlayerGun15UpdateFireTimerEf", 0x062D9E20) end)
+if not sym_UpdateFireTimer then
+    pcall(function() sym_UpdateFireTimer = Resolve("UpdateFireTimer", 0x062D9E20) end)
+end
+
+if sym_UpdateFireTimer then
+    pcall(function()
+        RegisterNativeHookAt(sym_UpdateFireTimer, "UpdateFireTimer_gun",
+            function(self_ptr, dt)
+                if not state.enabled or not modReady then return self_ptr, dt end
+                nativeHookFires = nativeHookFires + 1
+                if nativeHookFires <= 3 then
+                    Log(TAG .. ": Native UpdateFireTimer fire #" .. nativeHookFires)
+                end
+                local now = os.clock()
+                if (now - lastFireTime) >= state.cooldown then
+                    lastFireTime = now
+                    return self_ptr, 999.0  -- complete timer instantly → fires now
+                end
+                return self_ptr, 0.0  -- hold timer at zero until next cooldown window
+            end, nil, "pf")
+        Log(TAG .. ": UpdateFireTimer hooked (mangled) — cooldown=" .. state.cooldown .. "s")
+    end)
+else
+    Log(TAG .. ": [WARN] UpdateFireTimer not resolved")
+end
 
 -- IsFireTimerDone() → always returns 1 (timer complete, ready to fire)
-pcall(function()
-    RegisterNativeHook("IsFireTimerDone", nil,
-        function(retval)
-            if not state.enabled or not modReady then return retval end
-            V("IsFireTimerDone post-hook → 1")
-            return 1  -- timer done
-        end)
-    Log(TAG .. ": IsFireTimerDone hooked")
-end)
+-- Mangled: _ZNK17AVR4GamePlayerGun15IsFireTimerDoneEv @ 0x062DBAF8
+-- Post-hook: override return value to 1
+local sym_IsFireTimerDone = nil
+pcall(function() sym_IsFireTimerDone = Resolve("_ZNK17AVR4GamePlayerGun15IsFireTimerDoneEv", 0x062DBAF8) end)
+if not sym_IsFireTimerDone then
+    pcall(function() sym_IsFireTimerDone = Resolve("IsFireTimerDone", 0x062DBAF8) end)
+end
 
--- GetEnemyReactionCooldown() → 0 (no stagger/reaction delay between hits)
-pcall(function()
-    RegisterNativeHook("GetEnemyReactionCooldown", nil,
-        function(retval)
-            if not state.enabled or not modReady then return retval end
-            V("GetEnemyReactionCooldown post-hook → 0.0")
-            return 0.0  -- instant reaction
-        end, ">f")
-    Log(TAG .. ": GetEnemyReactionCooldown hooked")
-end)
+if sym_IsFireTimerDone then
+    pcall(function()
+        RegisterNativeHookAt(sym_IsFireTimerDone, "IsFireTimerDone_gun",
+            nil,
+            function(retval)
+                if not state.enabled or not modReady then return retval end
+                -- Rate-limit to match UpdateFireTimer's cooldown
+                local now = os.clock()
+                if (now - lastFireTime) < state.cooldown then
+                    return retval  -- respect cooldown — return original value
+                end
+                return 1  -- timer done → ready to fire
+            end)
+        Log(TAG .. ": IsFireTimerDone hooked (mangled)")
+    end)
+else
+    Log(TAG .. ": [WARN] IsFireTimerDone not resolved")
+end
+
+-- GetEnemyReactionCooldown — REMOVED
+-- This function is on VR4GamePlayerKnife (wrong class), not VR4GamePlayerGun.
+-- It does not affect gun fire rate. Hooking it would only affect knife stagger.
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- CDO — force laser sight while firing (cosmetic)
@@ -148,9 +174,6 @@ end)
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- COMMANDS — toggle + cooldown tuning via ADB bridge
---
---   echo '{"cmd":"rapidfire"}' | nc 127.0.0.1 19420           → toggle
---   echo '{"cmd":"rapidfire","args":"0.05"}' | nc ...          → set 0.05s
 -- ═══════════════════════════════════════════════════════════════════════
 RegisterCommand("rapidfire", function(args)
     V("rapidfire command args=%s", tostring(args))
@@ -186,4 +209,4 @@ if SharedAPI and SharedAPI.DebugMenu then
         end)
 end
 
-Log(TAG .. ": v12.2 loaded — cooldown=" .. state.cooldown .. "s | 3 PostHooks + native timer acceleration")
+Log(TAG .. ": v13.0 loaded — cooldown=" .. state.cooldown .. "s | " .. hookCount .. " PostHooks + mangled native hooks")

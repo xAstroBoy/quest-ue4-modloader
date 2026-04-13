@@ -534,7 +534,7 @@ end
 local state = {
     difficulty    = "NORMAL",
     spawnCount    = 1,
-    spawnDistance  = 500,   -- world units from player (enemies spawn in circle)
+    spawnDistance  = 200,   -- world units from player (enemies spawn in circle)
     selectedIdx   = 1,
     totalSpawned  = 0,
     lastSpawnedEm = nil,   -- last cEm* returned by EmSetEvent
@@ -547,10 +547,10 @@ if saved then
         state.difficulty = saved.difficulty
     end
     if saved.spawnCount then
-        state.spawnCount = math.max(1, math.min(10, saved.spawnCount))
+        state.spawnCount = math.max(1, math.min(5, saved.spawnCount))
     end
     if saved.spawnDistance then
-        state.spawnDistance = math.max(100, math.min(5000, saved.spawnDistance))
+        state.spawnDistance = math.max(50, math.min(2000, saved.spawnDistance))
     end
 end
 
@@ -631,10 +631,11 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     pcall(function() WriteU16(Offset(emListBuf, 0x10), toU16(spawnZ)) end)  -- posZ
 
     -- Rotation: face toward player (compute angle from spawn pos to player)
+    -- RE4 engine: rotY=0 faces +Z axis. Use atan2(dx, dz) for angle from +Z.
     local dx = -(offsetX or 0)
     local dz = -(offsetZ or 0)
     if dx ~= 0 or dz ~= 0 then
-        local faceAngle = math.atan(dz, dx)  -- radians toward player
+        local faceAngle = math.atan(dx, dz)  -- radians from +Z toward player
         -- EM_LIST rotY: EmSetEvent multiplies by pi/16384, so inverse = 16384/pi
         local rotInt = math.floor(faceAngle * 16384.0 / math.pi)
         pcall(function() WriteU16(Offset(emListBuf, 0x12), toU16(rotInt)) end)
@@ -798,15 +799,15 @@ end)
 RegisterCommand("spawn_count", function(args)
     V("cmd:spawn_count args='%s'", tostring(args))
     local n = tonumber(args) or 1
-    state.spawnCount = math.max(1, math.min(10, n))
+    state.spawnCount = math.max(1, math.min(5, n))
     ModConfig.Save("EnemySpawner", state)
     Log(TAG .. ": Count -> " .. state.spawnCount)
 end)
 
 RegisterCommand("spawn_distance", function(args)
     V("cmd:spawn_distance args='%s'", tostring(args))
-    local n = tonumber(args) or 500
-    state.spawnDistance = math.max(100, math.min(5000, n))
+    local n = tonumber(args) or 200
+    state.spawnDistance = math.max(50, math.min(2000, n))
     ModConfig.Save("EnemySpawner", state)
     Log(TAG .. ": Distance -> " .. state.spawnDistance)
 end)
@@ -889,13 +890,13 @@ if SharedAPI and SharedAPI.DebugMenu then
             end)
             api.AddItem("Count: " .. state.spawnCount, function()
                 V("DebugMenu: cycling count from %d", state.spawnCount)
-                state.spawnCount = (state.spawnCount % 10) + 1
+                state.spawnCount = (state.spawnCount % 5) + 1
                 ModConfig.Save("EnemySpawner", state)
                 api.Refresh()
             end)
             api.AddItem("Distance: " .. state.spawnDistance, function()
                 V("DebugMenu: cycling distance from %d", state.spawnDistance)
-                local dists = {200, 500, 1000, 2000, 3000, 5000}
+                local dists = {50, 100, 200, 500, 1000, 2000}
                 local cur = 1
                 for i, d in ipairs(dists) do
                     if d >= state.spawnDistance then cur = i; break end

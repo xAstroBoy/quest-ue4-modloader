@@ -1,4 +1,4 @@
--- mods/Randomizer/main.lua v9.0
+-- mods/Randomizer/main.lua v9.1
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-enhanced Enemy Randomizer — re-randomizes on EVERY level load
 --
@@ -304,8 +304,8 @@ V("Resolve: readEmList="    .. ptrfmt(sym_readEmList)
 
 local slotMap = {}          -- [emListPtr_value] = {name, replEmId} for double-randomization prevention
 
--- Safety: settle period after level change — let ESL memory stabilize before writing
-local SETTLE_CALLS = 5      -- Skip this many EmSetEvent calls after level change
+-- No settle period needed — EmSetEvent is sole randomization hook (no double-randomization risk)
+local SETTLE_CALLS = 0      -- No skip needed (was 5 in old eslPointers architecture)
 local settleCounter = 0     -- Counts down after level change detected (0 = ready)
 local hookErrors = 0        -- Consecutive hook/write errors (reset on success)
 local MAX_HOOK_ERRORS = 20  -- Auto-disable writes after this many consecutive errors
@@ -354,8 +354,12 @@ end
 -- This is the ONLY hook that modifies enemy data. readEmList is used
 -- solely for level-change detection (it fires once per room load).
 local sym_EmSetEvent = nil
-pcall(function() sym_EmSetEvent = Resolve("EmSetEvent", 0x062E9E8C) end)
-V("Resolve: EmSetEvent=" .. ptrfmt(sym_EmSetEvent))
+-- Use mangled C++ name for reliable dlsym resolution (plain "EmSetEvent" may fall back to wrong offset)
+pcall(function() sym_EmSetEvent = Resolve("_Z10EmSetEventP7EM_LIST", 0x062E9E8C) end)
+if not sym_EmSetEvent then
+    pcall(function() sym_EmSetEvent = Resolve("EmSetEvent", 0x062E9E8C) end)
+end
+Log(TAG .. ": Resolve: EmSetEvent=" .. ptrfmt(sym_EmSetEvent))
 
 local emSetEventHooked = false
 if sym_EmSetEvent then
@@ -388,6 +392,12 @@ if sym_EmSetEvent then
                         settleCounter = settleCounter - 1
                         V("EmSetEvent: SETTLE skip (" .. settleCounter .. " remaining)")
                         return
+                    end
+
+                    -- Diagnostic: log first 3 hook fires to confirm hook is working
+                    if state.swapCount < 3 then
+                        Log(TAG .. ": EmSetEvent PRE-HOOK FIRED #" .. (state.swapCount + 1)
+                            .. " gen=" .. currentGen .. " enabled=" .. tostring(state.enabled))
                     end
 
                     -- Read original emId from correct offset (+0x01)
@@ -706,7 +716,7 @@ if SharedAPI and SharedAPI.DebugMenu then
     end)
 end
 
-Log(TAG .. ": v9.0 loaded — " .. #ENEMIES .. " enemies, "
+Log(TAG .. ": v9.1 loaded — " .. #ENEMIES .. " enemies, "
     .. #GROUPS .. " groups, "
     .. (state.enabled and "ON" or "OFF")
     .. " hpMode=" .. state.hpMode

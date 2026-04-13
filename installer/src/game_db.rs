@@ -10,26 +10,43 @@ pub struct GameProfile {
     pub name: &'static str,
     /// Android package name
     pub package: &'static str,
-    /// Smali class to inject System.loadLibrary("modloader") into
+    /// Primary smali class to inject System.loadLibrary("modloader") into
     /// (the main Activity's onCreate)
     pub smali_target: &'static str,
+    /// Fallback smali targets to try if the primary is not found
+    pub smali_fallbacks: &'static [&'static str],
     /// Native library name the game uses (for reference only)
     #[allow(dead_code)]
     pub native_lib: &'static str,
 }
+
+/// Common UE4/UE5 Activity classes found on Quest games.
+/// Used as a last-resort fallback when no game profile matches.
+pub const UE_COMMON_ACTIVITIES: &[&str] = &[
+    "com/epicgames/ue4/GameActivity",
+    "com/epicgames/unreal/GameActivity",
+    "com/epicgames/ue4/SplashActivity",
+];
 
 /// All supported games
 pub const GAMES: &[GameProfile] = &[
     GameProfile {
         name: "Resident Evil 4 VR",
         package: "com.Armature.VR4",
-        smali_target: "com/Armature/VR4/OculusMobileActivity",
+        smali_target: "com/epicgames/ue4/GameActivity",
+        smali_fallbacks: &[
+            "com/Armature/VR4/OculusMobileActivity",
+            "com/epicgames/unreal/GameActivity",
+        ],
         native_lib: "libUE4.so",
     },
     GameProfile {
         name: "Pinball FX VR",
         package: "com.zenstudios.PFXVRQuest",
         smali_target: "com/epicgames/unreal/GameActivity",
+        smali_fallbacks: &[
+            "com/epicgames/ue4/GameActivity",
+        ],
         native_lib: "libUnreal.so",
     },
 ];
