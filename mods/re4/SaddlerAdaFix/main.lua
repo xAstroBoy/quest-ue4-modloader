@@ -29,34 +29,24 @@ local MESH_TABLE_PATHS = {
 
 local cachedClass = nil
 
--- Pre-search using UE4SS StaticFindObject
+-- Pre-search using UE4SS StaticFindObject (safe — no asset loading)
 for _, path in ipairs(MESH_TABLE_PATHS) do
     V("Trying StaticFindObject: %s", path)
-    local found = StaticFindObject(path)
-    if found and found:IsValid() then
+    local ok, found = pcall(StaticFindObject, path)
+    if ok and found and found:IsValid() then
         cachedClass = found:GetAddress()
         Log(TAG .. ": Pre-cached em3f mesh table via StaticFindObject: " .. path)
         break
     end
 end
 
-if not cachedClass then
-    -- Try StaticLoadClass as fallback
-    for _, path in ipairs(MESH_TABLE_PATHS) do
-        V("Trying StaticLoadClass: %s", path)
-        local loaded = StaticLoadClass("Actor", path)
-        if loaded then
-            cachedClass = loaded:GetAddress()
-            Log(TAG .. ": Pre-cached em3f mesh table via StaticLoadClass: " .. path)
-            break
-        end
-    end
-end
-
+-- NOTE: StaticLoadClass is NOT safe at boot time — it can crash the engine.
+-- We defer the StaticLoadClass fallback to the native hook where the engine
+-- is guaranteed to be in a stable state (asset system initialized).
 if cachedClass then
     Log(TAG .. ": em3f mesh table found @ " .. ToHex(cachedClass))
 else
-    LogWarn(TAG .. ": em3f mesh table not found in pre-search — will retry in hook")
+    Log(TAG .. ": em3f mesh table not pre-cached — will use StaticLoadClass in hook (deferred)")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -79,6 +69,17 @@ RegisterNativeHook("GetEtcModelClass",
         end
         -- Return cached class from UE4SS pre-search
         if cachedClass then return cachedClass end
+
+        -- Deferred StaticLoadClass (safe at hook time — engine is initialized)
+        V("em3f cache miss, trying deferred StaticLoadClass")
+        for _, path in ipairs(MESH_TABLE_PATHS) do
+            local ok2, loaded = pcall(StaticLoadClass, "Actor", path)
+            if ok2 and loaded then
+                cachedClass = loaded:GetAddress()
+                Log(TAG .. ": Deferred StaticLoadClass found em3f: " .. path)
+                return cachedClass
+            end
+        end
 
         -- Last resort: manual C++ lookup
         V("em3f cache miss, attempting manual C++ lookup")

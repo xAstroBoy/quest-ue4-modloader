@@ -18,6 +18,7 @@
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 #include "modloader/types.h"
+#include "modloader/safe_call.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -395,7 +396,14 @@ namespace lua_bindings
         }
 
         std::u16string wpath(path.begin(), path.end());
-        ue::UClass* loaded = symbols::StaticLoadClass(base, nullptr, wpath.c_str(), nullptr, 0, nullptr);
+        ue::UClass* loaded = nullptr;
+        auto result = safe_call::execute([&]() {
+            loaded = symbols::StaticLoadClass(base, nullptr, wpath.c_str(), nullptr, 0, nullptr);
+        }, "StaticLoadClass");
+        if (!result.ok) {
+            logger::log_warn("LUA", "StaticLoadClass crashed for path '%s' — recovered via safe_call", path.c_str());
+            return sol::nil;
+        }
         if (!loaded) return sol::nil;
         return lua_uobject::wrap_or_nil(lua, reinterpret_cast<ue::UObject*>(loaded)); });
 
@@ -412,7 +420,14 @@ namespace lua_bindings
         }
 
         std::u16string wpath(path.begin(), path.end());
-        ue::UObject* loaded = symbols::StaticLoadObject(base, nullptr, wpath.c_str(), nullptr, 0, nullptr, false);
+        ue::UObject* loaded = nullptr;
+        auto result = safe_call::execute([&]() {
+            loaded = symbols::StaticLoadObject(base, nullptr, wpath.c_str(), nullptr, 0, nullptr, false);
+        }, "StaticLoadObject");
+        if (!result.ok) {
+            logger::log_warn("LUA", "StaticLoadObject crashed for path '%s' — recovered via safe_call", path.c_str());
+            return sol::nil;
+        }
         if (!loaded) return sol::nil;
         return lua_uobject::wrap_or_nil(lua, loaded); });
 
@@ -1968,6 +1983,16 @@ namespace lua_bindings
                          {
         if (!base) return sol::lightuserdata_value(nullptr);
         return sol::lightuserdata_value(offset_ptr(base, off)); });
+
+        // ── Pointer ↔ integer conversion ────────────────────────────────────
+        // Native hooks pass all X-register values as lightuserdata (void*).
+        // PtrToInt converts lightuserdata → Lua integer for arithmetic/format.
+        // IntToPtr converts Lua integer → lightuserdata for ReadU8/WriteU8/Offset.
+        lua.set_function("PtrToInt", [](void *ptr) -> int64_t
+                         { return static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptr)); });
+
+        lua.set_function("IntToPtr", [](int64_t val) -> sol::lightuserdata_value
+                         { return sol::lightuserdata_value(reinterpret_cast<void *>(static_cast<uintptr_t>(val))); });
 
         // ── PAK mounting ────────────────────────────────────────────────────
         lua.set_function("MountPak", [](const std::string &pak_name) -> bool
