@@ -2,7 +2,7 @@
 //  GUI — simple egui wizard: detect → select → install → done
 // ═══════════════════════════════════════════════════════════════════════
 
-use crate::{adb, game_db, pipeline};
+use crate::{adb, game_db, pipeline, tools_setup};
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,8 +11,8 @@ use std::thread;
 pub fn run(so_override: Option<String>) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 480.0])
-            .with_min_inner_size([520.0, 480.0])
+            .with_inner_size([520.0, 520.0])
+            .with_min_inner_size([520.0, 520.0])
             .with_title("UE Modloader Installer"),
         ..Default::default()
     };
@@ -27,6 +27,7 @@ pub fn run(so_override: Option<String>) -> anyhow::Result<()> {
 
 #[derive(Clone, PartialEq)]
 enum Phase {
+    SetupTools,
     Detecting,
     Ready,
     Installing,
@@ -39,6 +40,11 @@ struct App {
     so_override: Option<String>,
     so_path: Option<PathBuf>,
     so_error: Option<String>,
+
+    // Tools
+    tools_status: Option<tools_setup::ToolsStatus>,
+    tools_error: Option<String>,
+    tools_setting_up: bool,
 
     // Device
     devices: Vec<adb::Device>,
@@ -66,10 +72,13 @@ struct ProgressState {
 impl App {
     fn new(so_override: Option<String>) -> Self {
         Self {
-            phase: Phase::Detecting,
+            phase: Phase::SetupTools,
             so_override,
             so_path: None,
             so_error: None,
+            tools_status: None,
+            tools_error: None,
+            tools_setting_up: false,
             devices: Vec::new(),
             selected_device: 0,
             device_error: None,
@@ -79,6 +88,33 @@ impl App {
             progress: Arc::new(Mutex::new(ProgressState {
                 step: 0, total: 9, message: String::new(), done: false, error: None,
             })),
+        }
+    }
+
+    fn check_tools(&mut self) {
+        self.tools_status = Some(tools_setup::get_tools_status());
+        let status = self.tools_status.as_ref().unwrap();
+        // We need at least ADB and apktool
+        if status.adb.is_some() && status.apktool.is_some() {
+            self.phase = Phase::Detecting;
+            self.detect();
+        }
+    }
+
+    fn setup_tools(&mut self) {
+        self.tools_setting_up = true;
+        self.tools_error = None;
+        match tools_setup::ensure_tools() {
+            Ok(_) => {
+                self.tools_status = Some(tools_setup::get_tools_status());
+                self.tools_setting_up = false;
+                self.phase = Phase::Detecting;
+                self.detect();
+            }
+            Err(e) => {
+                self.tools_error = Some(e.to_string());
+                self.tools_setting_up = false;
+            }
         }
     }
 
@@ -175,7 +211,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Auto-detect on first frame
+        // Auto-check tools on first frame
+        if self.phase == Phase::SetupTools && self.tools_status.is_none() && !self.tools_setting_up {
+            self.check_tools();
+        }
+
+        // Auto-detect on first frame of Detecting phase
         if self.phase == Phase::Detecting && self.devices.is_empty() && self.device_error.is_none() {
             self.detect();
         }
@@ -198,6 +239,7 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             match self.phase {
+                Phase::SetupTools => self.ui_setup_tools(ui),
                 Phase::Detecting => self.ui_detecting(ui),
                 Phase::Ready => self.ui_ready(ui, ctx),
                 Phase::Installing => self.ui_installing(ui),
@@ -209,6 +251,89 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn ui_setup_tools(&mut self, ui: &mut egui::Ui) {
+        ui.label("Checking required tools...");
+        ui.add_space(8.0);
+
+        if let Some(ref status) = self.tools_status {
+            // Show tool status
+            let adb_ok = status.adb.is_some();
+            let apktool_ok = status.apktool.is_some();
+            let java_ok = status.java.is_some();
+            
+            ui.group(|ui| {
+                ui.label("📦 Required Tools:");
+                ui.add_space(4.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label(if adb_ok { "✅" } else { "❌" });
+                    ui.label("ADB:");
+                    if let Some(ref p) = status.adb {
+                        ui.monospace(p.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Not found");
+                    }
+                });
+                
+                ui.horizontal(|ui| {
+                    ui.label(if apktool_ok { "✅" } else { "❌" });
+                    ui.label("apktool:");
+                    if let Some(ref p) = status.apktool {
+                        ui.monospace(p.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    } else {
+                        ui.colored_label(egui::Color32::RED, "Not found");
+                    }
+                });
+                
+                ui.horizontal(|ui| {
+                    ui.label(if java_ok { "✅" } else { "⚠" });
+                    ui.label("Java:");
+                    if let Some(ref p) = status.java {
+                        ui.monospace(p.file_name().unwrap_or_default().to_string_lossy().to_string());
+                    } else {
+                        ui.colored_label(egui::Color32::YELLOW, "Not found (needed for apktool)");
+                    }
+                });
+                
+                ui.add_space(4.0);
+                
+                // Optional tools
+                ui.label("📦 Optional Tools:");
+                ui.horizontal(|ui| {
+                    ui.label(if status.uber_signer.is_some() { "✅" } else { "⚪" });
+                    ui.label("uber-apk-signer:");
+                    if status.uber_signer.is_some() {
+                        ui.label("Found");
+                    } else {
+                        ui.colored_label(egui::Color32::GRAY, "Not found (will download if needed)");
+                    }
+                });
+            });
+            
+            ui.add_space(8.0);
+            
+            if let Some(ref e) = self.tools_error {
+                ui.colored_label(egui::Color32::RED, format!("❌ {}", e));
+                ui.add_space(8.0);
+            }
+            
+            if !adb_ok || !apktool_ok {
+                if self.tools_setting_up {
+                    ui.spinner();
+                    ui.label("Downloading tools...");
+                } else {
+                    if ui.button("📥 Download Missing Tools").clicked() {
+                        self.setup_tools();
+                    }
+                    ui.add_space(4.0);
+                    ui.label("This will download ADB and/or apktool from official sources.");
+                }
+            }
+        } else {
+            ui.spinner();
+        }
+    }
+
     fn ui_detecting(&mut self, ui: &mut egui::Ui) {
         // Show errors
         if let Some(ref e) = self.so_error {

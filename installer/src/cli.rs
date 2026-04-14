@@ -2,7 +2,7 @@
 //  CLI — interactive command-line mode
 // ═══════════════════════════════════════════════════════════════════════
 
-use crate::{adb, game_db, pipeline};
+use crate::{adb, game_db, pipeline, tools_setup};
 use anyhow::{bail, Result};
 use console::style;
 use dialoguer::{Select, Confirm};
@@ -19,6 +19,11 @@ pub fn run(
     println!("{}", style("║    UE Modloader Installer (CLI)         ║").cyan());
     println!("{}", style("╚══════════════════════════════════════════╝").cyan());
     println!();
+
+    // ── Auto-setup required tools ───────────────────────────────────
+    println!("{}", style("Checking required tools...").dim());
+    let (_adb, _apktool) = tools_setup::ensure_tools()?;
+    println!("{} Tools ready", style("✓").green());
 
     // ── Find modloader .so ──────────────────────────────────────────
     let so_path = pipeline::find_modloader_so(so_override.as_deref())?;

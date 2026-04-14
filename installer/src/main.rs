@@ -5,6 +5,7 @@ mod gui;
 mod pipeline;
 mod signer;
 mod smali;
+mod tools_setup;
 
 use clap::Parser;
 
@@ -15,6 +16,10 @@ struct Args {
     /// Run in CLI mode instead of GUI
     #[arg(long)]
     cli: bool,
+
+    /// Download and setup required tools (ADB, apktool, etc.)
+    #[arg(long)]
+    setup_tools: bool,
 
     /// Target game package (e.g. com.Armature.VR4) — CLI only
     #[arg(long)]
@@ -49,8 +54,20 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    // Setup tools mode — download ADB, apktool, etc.
+    if args.setup_tools {
+        println!("Setting up required tools...");
+        let (adb, apktool) = tools_setup::ensure_tools()?;
+        println!("\n✅ All tools ready:");
+        println!("   ADB:     {}", adb.display());
+        println!("   apktool: {}", apktool.display());
+        return Ok(());
+    }
+
     // Local APK patching mode (no device required)
     if let Some(ref apk_path) = args.apk {
+        // Auto-setup tools if needed
+        let _ = tools_setup::setup_apktool();
         return pipeline::patch_local_apk(
             apk_path,
             args.package.as_deref(),

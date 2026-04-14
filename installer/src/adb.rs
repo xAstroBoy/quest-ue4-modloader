@@ -6,30 +6,16 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::tools_setup;
+
 // ── Find ADB ────────────────────────────────────────────────────────────
 
 pub fn find_adb() -> Result<PathBuf> {
-    if let Ok(p) = which::which("adb") {
+    // Use tools_setup which has auto-download capability
+    if let Some(p) = tools_setup::find_adb() {
         return Ok(p);
     }
-    for dir in [
-        r"C:\platform-tools",
-        r"C:\Android\platform-tools",
-        r"C:\AstroTools\scrcpy",
-        r"C:\Rookie Sideloader\platform-tools",
-        r"C:\Program Files\Meta Quest Developer Hub\resources\bin",
-        r"C:\Program Files (x86)\Android\android-sdk\platform-tools",
-    ] {
-        let p = PathBuf::from(dir).join("adb.exe");
-        if p.exists() { return Ok(p); }
-    }
-    for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
-        if let Ok(sdk) = std::env::var(var) {
-            let p = PathBuf::from(&sdk).join("platform-tools").join("adb.exe");
-            if p.exists() { return Ok(p); }
-        }
-    }
-    bail!("ADB not found. Install Android Platform-Tools and add to PATH.")
+    bail!("ADB not found. The installer can download it automatically — use the GUI or run with --setup-tools")
 }
 
 fn adb_s(serial: &str, args: &[&str]) -> Result<std::process::Output> {

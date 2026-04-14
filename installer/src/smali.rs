@@ -8,21 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::game_db;
+use crate::tools_setup;
 
 // ── Find apktool ────────────────────────────────────────────────────────
 
 pub fn find_apktool() -> Result<PathBuf> {
-    // Try apktool on PATH
-    if let Ok(p) = which::which("apktool") { return Ok(p); }
-    if let Ok(p) = which::which("apktool.bat") { return Ok(p); }
-    // Common locations
-    for dir in [r"C:\apktool", r"C:\tools\apktool"] {
-        let bat = PathBuf::from(dir).join("apktool.bat");
-        let jar = PathBuf::from(dir).join("apktool.jar");
-        if bat.exists() { return Ok(bat); }
-        if jar.exists() { return Ok(jar); }
+    // Use tools_setup which has auto-download capability
+    if let Some(p) = tools_setup::find_apktool() {
+        return Ok(p);
     }
-    bail!("apktool not found. Install it: https://apktool.org/docs/install")
+    bail!("apktool not found. The installer can download it automatically — use the GUI or run with --setup-tools")
 }
 
 fn run_apktool(args: &[&str]) -> Result<String> {
@@ -345,32 +340,65 @@ pub fn add_native_lib(decompiled: &Path, so_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// ── Fix manifest: extractNativeLibs ─────────────────────────────────────
+// ── Fix manifest: extractNativeLibs, debuggable, allowBackup ────────────
 
 pub fn fix_manifest(decompiled: &Path) -> Result<()> {
     let manifest = decompiled.join("AndroidManifest.xml");
     let content = std::fs::read_to_string(&manifest)?;
 
     let mut new_content = content.clone();
+    let mut changes = Vec::new();
 
-    // Ensure extractNativeLibs="true" in <application>
+    // ── extractNativeLibs="true" — required for native .so loading ──
     if new_content.contains("android:extractNativeLibs=\"false\"") {
         new_content = new_content.replace(
             "android:extractNativeLibs=\"false\"",
             "android:extractNativeLibs=\"true\"",
         );
-        log::info!("Fixed extractNativeLibs → true");
+        changes.push("extractNativeLibs → true");
     } else if !new_content.contains("android:extractNativeLibs") {
-        // Add it to <application> tag
         new_content = new_content.replace(
             "<application ",
             "<application android:extractNativeLibs=\"true\" ",
         );
-        log::info!("Added extractNativeLibs=\"true\" to manifest");
+        changes.push("added extractNativeLibs=\"true\"");
+    }
+
+    // ── debuggable="true" — enables ADB debugging, logcat, etc. ──
+    if new_content.contains("android:debuggable=\"false\"") {
+        new_content = new_content.replace(
+            "android:debuggable=\"false\"",
+            "android:debuggable=\"true\"",
+        );
+        changes.push("debuggable → true");
+    } else if !new_content.contains("android:debuggable") {
+        new_content = new_content.replace(
+            "<application ",
+            "<application android:debuggable=\"true\" ",
+        );
+        changes.push("added debuggable=\"true\"");
+    }
+
+    // ── allowBackup="true" — enables ADB backup, data persistence ──
+    if new_content.contains("android:allowBackup=\"false\"") {
+        new_content = new_content.replace(
+            "android:allowBackup=\"false\"",
+            "android:allowBackup=\"true\"",
+        );
+        changes.push("allowBackup → true");
+    } else if !new_content.contains("android:allowBackup") {
+        new_content = new_content.replace(
+            "<application ",
+            "<application android:allowBackup=\"true\" ",
+        );
+        changes.push("added allowBackup=\"true\"");
     }
 
     if new_content != content {
-        std::fs::write(&manifest, new_content)?;
+        std::fs::write(&manifest, &new_content)?;
+        log::info!("Manifest fixes: {}", changes.join(", "));
+    } else {
+        log::info!("Manifest already has required attributes");
     }
     Ok(())
 }
