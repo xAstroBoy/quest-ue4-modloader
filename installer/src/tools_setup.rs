@@ -123,9 +123,6 @@ pub fn setup_adb() -> Result<PathBuf> {
 const APKTOOL_VERSION: &str = "2.10.0";
 const APKTOOL_JAR_URL: &str = "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.10.0.jar";
 
-#[cfg(target_os = "windows")]
-const APKTOOL_WRAPPER_URL: &str = "https://raw.githubusercontent.com/nicehash/uber-apk-signer/refs/heads/main/apktool.bat";
-
 /// Check if apktool is available
 pub fn find_apktool() -> Option<PathBuf> {
     // 1. Check PATH
@@ -197,7 +194,7 @@ pub fn setup_apktool() -> Result<PathBuf> {
 // ═══════════════════════════════════════════════════════════════════════
 
 const UBER_SIGNER_VERSION: &str = "1.3.0";
-const UBER_SIGNER_URL: &str = "https://github.com/nicehash/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar";
+const UBER_SIGNER_URL: &str = "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar";
 
 /// Check if uber-apk-signer is available
 pub fn find_uber_signer() -> Option<PathBuf> {

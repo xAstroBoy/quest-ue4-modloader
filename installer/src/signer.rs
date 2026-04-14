@@ -152,7 +152,7 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
          Then restart the installer.\n\n\
          Alternatively, install one of:\n\
          • Android SDK Build-Tools (includes apksigner + zipalign)\n\
-         • uber-apk-signer: https://github.com/nicehash/uber-apk-signer\n\
+         • uber-apk-signer: https://github.com/patrickfav/uber-apk-signer\n\
          • JDK (includes jarsigner + keytool)"
     )
 }
