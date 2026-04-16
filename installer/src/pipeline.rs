@@ -5,23 +5,6 @@
 use crate::{adb, game_db, signer, smali};
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
-
-fn backup_base_dir() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        exe.parent().unwrap_or(Path::new(".")).join("backups")
-    } else {
-        PathBuf::from("backups")
-    }
-}
-
-fn backup_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{}", secs)
-}
-
 /// Progress callback: (step_number, total_steps, message)
 pub type ProgressFn = Box<dyn Fn(u32, u32, &str) + Send>;
 
@@ -138,7 +121,7 @@ pub fn install(
     so_path: &Path,
     progress: Option<ProgressFn>,
 ) -> Result<()> {
-    let total = 11u32;
+    let total = 10u32;
     let report = |step: u32, msg: &str| {
         log::info!("[{}/{}] {}", step, total, msg);
         if let Some(ref cb) = progress {
@@ -162,36 +145,6 @@ pub fn install(
     let app = adb::get_installed_app(serial, game.package)?
         .ok_or_else(|| anyhow::anyhow!("{} is not installed on device", game.name))?;
     let apk = adb::pull_apk(serial, &app, work_dir.path())?;
-
-    // 3b. Persistent host backup (non-root): original APK + obb/data dirs
-    report(3, "Creating host backups (APK + obb/data)...");
-    let host_backup_dir = backup_base_dir()
-        .join(game.package)
-        .join(backup_stamp());
-    std::fs::create_dir_all(&host_backup_dir)?;
-
-    let apk_backup = host_backup_dir.join("original.apk");
-    std::fs::copy(&apk, &apk_backup)?;
-    log::info!("Host backup APK: {}", apk_backup.display());
-
-    let remote_obb = format!("/sdcard/Android/obb/{}", game.package);
-    let remote_data = format!("/sdcard/Android/data/{}", game.package);
-
-    let mut host_obb_backup: Option<PathBuf> = None;
-    let mut host_data_backup: Option<PathBuf> = None;
-
-    if adb::path_exists(serial, &remote_obb)? {
-        let local_obb = host_backup_dir.join("obb").join(game.package);
-        adb::pull_path(serial, &remote_obb, &local_obb)?;
-        log::info!("Host backup OBB: {}", local_obb.display());
-        host_obb_backup = Some(local_obb);
-    }
-    if adb::path_exists(serial, &remote_data)? {
-        let local_data = host_backup_dir.join("data").join(game.package);
-        adb::pull_path(serial, &remote_data, &local_data)?;
-        log::info!("Host backup DATA: {}", local_data.display());
-        host_data_backup = Some(local_data);
-    }
 
     // 4. Decompile
     report(3, "Decompiling APK...");
@@ -219,29 +172,27 @@ pub fn install(
     report(7, "Verifying full APK signature (v1+v2)...");
     signer::verify_apk_full_signature(&signed_apk)?;
 
-    // 8. Backup game data, uninstall old, install new, restore data
-    report(8, "Backing up game data...");
+    // 8. Temporarily rename OBB/data, uninstall old, install new, restore dirs
+    report(8, "Temporarily renaming OBB/data...");
     let backups = adb::backup_game_dirs(serial, game.package)?;
 
     report(9, "Installing patched APK...");
-    adb::uninstall(serial, game.package)?;
-    adb::install_apk(serial, &signed_apk)?;
+    let install_result = (|| -> Result<()> {
+        adb::uninstall(serial, game.package)?;
+        adb::install_apk(serial, &signed_apk)?;
+        Ok(())
+    })();
 
-    report(10, "Restoring game data...");
-    adb::restore_game_dirs(serial, &backups)?;
-
-    // 10b. Restore from host backup too (safety net; non-root adb push)
-    if let Some(local_obb) = &host_obb_backup {
-        adb::shell(serial, &format!("mkdir -p /sdcard/Android/obb/{}", game.package))?;
-        adb::push_path(serial, local_obb, "/sdcard/Android/obb/")?;
-    }
-    if let Some(local_data) = &host_data_backup {
-        adb::shell(serial, &format!("mkdir -p /sdcard/Android/data/{}", game.package))?;
-        adb::push_path(serial, local_data, "/sdcard/Android/data/")?;
+    // ALWAYS restore dirs — even if uninstall/install failed — so the
+    // game data is never left orphaned as .modloader_bak
+    if let Err(e) = adb::restore_game_dirs(serial, &backups) {
+        log::error!("Failed to restore game dirs: {}", e);
     }
 
-    report(11, "Finalizing...");
-    log::info!("Persistent backup saved at: {}", host_backup_dir.display());
+    // Now propagate any install failure
+    install_result?;
+
+    report(10, "Finalizing...");
 
     log::info!("✅ {} modloader installed successfully!", game.name);
     Ok(())

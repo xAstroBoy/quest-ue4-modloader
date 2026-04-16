@@ -127,7 +127,7 @@ pub fn run(
 
     // ── Run pipeline ────────────────────────────────────────────────
     println!();
-    let pb = ProgressBar::new(9);
+    let pb = ProgressBar::new(10);
     pb.set_style(ProgressStyle::with_template(
         "{spinner:.green} [{bar:30.cyan/dim}] {pos}/{len} {msg}"
     )?.tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","✓"]));

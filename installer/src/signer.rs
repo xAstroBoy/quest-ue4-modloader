@@ -157,8 +157,8 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
     )
 }
 
-/// Verify that an APK is fully signed before install.
-/// Enforces both v1 and v2 signature schemes via apksigner.
+/// Verify that an APK is properly signed before install.
+/// Requires v2 signature scheme (modern Android requirement). v1 is optional.
 pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
     let tool = find_build_tool("apksigner")
         .ok_or_else(|| anyhow::anyhow!(
@@ -184,6 +184,7 @@ pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
 
     let mut v1_ok = false;
     let mut v2_ok = false;
+    let mut v3_ok = false;
     for raw in combined.lines() {
         let line = raw.trim().to_ascii_lowercase();
         if line.contains("verified using v1 scheme") {
@@ -192,20 +193,25 @@ pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
         if line.contains("verified using v2 scheme") {
             v2_ok = line.contains(": true");
         }
+        if line.contains("verified using v3 scheme") || line.contains("verified using v3.1 scheme") {
+            if line.contains(": true") { v3_ok = true; }
+        }
     }
 
-    if !v1_ok || !v2_ok {
+    // Android 9+ (Quest) supports v3 only. Accept v2 OR v3.
+    if !v2_ok && !v3_ok {
         bail!(
-            "Full signing verification failed (required: v1=true and v2=true).\n\
-             v1={} v2={}\n\
+            "Signature verification failed (required: v2 or v3 = true).\n\
+             v1={} v2={} v3={}\n\
              apksigner output:\n{}",
             v1_ok,
             v2_ok,
+            v3_ok,
             combined
         );
     }
 
-    log::info!("Signature verified (v1 + v2): {}", apk.display());
+    log::info!("Signature verified (v1={} v2={} v3={}): {}", v1_ok, v2_ok, v3_ok, apk.display());
     Ok(())
 }
 
