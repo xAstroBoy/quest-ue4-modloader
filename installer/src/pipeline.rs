@@ -227,8 +227,13 @@ fn setup_game_dirs(serial: &str, game: &game_db::GameProfile) -> Result<()> {
         "appops set {} MANAGE_EXTERNAL_STORAGE allow 2>/dev/null", pkg
     ))?;
 
-    // Clean up damage from previous installer versions that ran chmod/chown
-    // on /sdcard/ paths. If .modloader_bak dirs are left over, remove them.
+    // Create the non-scoped data directory
+    // /sdcard/UnrealModloader/<pkg>/ is outside scoped storage — fully accessible
+    // by MTP, file browsers, adb, etc. No ownership issues.
+    adb::shell(serial, &format!("mkdir -p /sdcard/UnrealModloader/{}/mods", pkg))?;
+    adb::shell(serial, &format!("mkdir -p /sdcard/UnrealModloader/{}/paks", pkg))?;
+
+    // Clean up old scoped-storage leftovers from previous installer versions
     let cleanup_paths = [
         format!("/sdcard/Android/data/{}.modloader_bak", pkg),
         format!("/sdcard/Android/obb/{}.modloader_bak", pkg),
@@ -237,6 +242,6 @@ fn setup_game_dirs(serial: &str, game: &game_db::GameProfile) -> Result<()> {
         adb::shell(serial, &format!("rm -rf '{}' 2>/dev/null", path))?;
     }
 
-    log::info!("Runtime permissions granted (dirs will be created by modloader on first launch)");
+    log::info!("Modloader dirs created at /sdcard/UnrealModloader/{}/", pkg);
     Ok(())
 }

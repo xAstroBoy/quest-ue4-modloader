@@ -79,7 +79,7 @@ namespace pak_mounter
                 fclose(f);
                 if (n > 0 && buf[0] != '\0')
                 {
-                    return std::string("/storage/emulated/0/Android/data/") + buf + "/modloader/paks";
+                    return std::string("/sdcard/UnrealModloader/") + buf + "/paks";
                 }
             }
             // Absolute last resort — cannot determine package. This path won't
@@ -88,7 +88,7 @@ namespace pak_mounter
                                 "[PAK] CRITICAL: Cannot determine package name for PAK path!");
             return "";
         }
-        return "/storage/emulated/0/Android/data/" + pkg + "/modloader/paks";
+        return "/sdcard/UnrealModloader/" + pkg + "/paks";
     }
 
     static std::string s_early_paks_path;
