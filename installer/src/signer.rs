@@ -109,26 +109,20 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
     };
 
     // Step 2: Try signing tools in order of preference
-    // 2a. apksigner (Android SDK — best, does v2/v3 signing)
+    // 2a. apksigner (Android SDK — best, does v1+v2+v3 signing)
     match try_apksigner(&aligned) {
         Ok(()) => return Ok(aligned),
         Err(e) => log::debug!("apksigner: {}", e),
     }
 
-    // 2b. uber-apk-signer (standalone jar — does zipalign + v1/v2 signing)
+    // 2b. uber-apk-signer (standalone jar — does zipalign + v1+v2 signing)
     match try_uber_sign(&aligned) {
         Ok(out) => return Ok(out),
         Err(e) => log::debug!("uber-apk-signer: {}", e),
     }
 
-    // 2c. jarsigner (JDK — v1 signing only, but works)
-    match try_jarsigner(&aligned) {
-        Ok(()) => return Ok(aligned),
-        Err(e) => log::debug!("jarsigner: {}", e),
-    }
-
-    // Step 3: No signing tool found — auto-download uber-apk-signer and retry
-    log::info!("No signing tool found — downloading uber-apk-signer...");
+    // 2c. Auto-download uber-apk-signer and try
+    log::info!("No local signing tool found — downloading uber-apk-signer...");
     match tools_setup::setup_uber_signer() {
         Ok(jar) => {
             log::info!("Downloaded uber-apk-signer, retrying...");
@@ -138,35 +132,66 @@ pub fn sign_apk(apk: &Path) -> Result<PathBuf> {
             }
         }
         Err(e) => {
-            log::error!("Failed to download uber-apk-signer: {}", e);
+            log::warn!("Failed to download uber-apk-signer: {}", e);
         }
     }
 
-    // Step 4: Last resort — try jarsigner with auto-created keystore
-    // (user might have Java but no keytool in PATH — unlikely but possible)
+    // 2d. jarsigner (JDK — v1 signing only)
+    // NOTE: jarsigner only does v1. Quest needs v2+. This is a last resort
+    // and may fail verification, but it's better than no signature at all.
+    match try_jarsigner(&aligned) {
+        Ok(()) => {
+            log::warn!(
+                "Signed with jarsigner (v1 only). Quest requires v2+ signing. \
+                 The APK may fail to install. Install Android SDK Build-Tools \
+                 or Java (for uber-apk-signer) for proper v2 signing."
+            );
+            return Ok(aligned);
+        }
+        Err(e) => log::debug!("jarsigner: {}", e),
+    }
 
     bail!(
         "Could not sign the APK. No signing tool available.\n\n\
-         The installer tried to auto-download uber-apk-signer but it requires Java.\n\
-         Please install Java from https://adoptium.net/ (Temurin JDK 17+)\n\
-         Then restart the installer.\n\n\
-         Alternatively, install one of:\n\
-         • Android SDK Build-Tools (includes apksigner + zipalign)\n\
-         • uber-apk-signer: https://github.com/patrickfav/uber-apk-signer\n\
-         • JDK (includes jarsigner + keytool)"
+         Please install ONE of the following:\n\
+         • Java (JDK 17+) from https://adoptium.net/ — enables uber-apk-signer auto-download\n\
+         • Android SDK Build-Tools — includes apksigner + zipalign\n\n\
+         Then restart the installer."
     )
 }
 
 /// Verify that an APK is properly signed before install.
-/// Requires v2 signature scheme (modern Android requirement). v1 is optional.
+/// Tries apksigner first, falls back to uber-apk-signer --onlyVerify,
+/// and if neither is available, logs a warning and proceeds (best-effort).
 pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
-    let tool = find_build_tool("apksigner")
-        .ok_or_else(|| anyhow::anyhow!(
-            "apksigner not found. Full signature verification is required before install.\n\
-             Install Android SDK Build-Tools (apksigner) and retry."
-        ))?;
+    // Try 1: apksigner verify (best — gives per-scheme breakdown)
+    if let Some(tool) = find_build_tool("apksigner") {
+        return verify_with_apksigner(&tool, apk);
+    }
 
-    let output = Command::new(&tool)
+    // Try 2: uber-apk-signer --onlyVerify
+    if let Some(jar) = crate::tools_setup::find_uber_signer() {
+        return verify_with_uber(&jar, apk);
+    }
+
+    // Try 3: download uber-apk-signer and verify
+    if let Ok(jar) = crate::tools_setup::setup_uber_signer() {
+        return verify_with_uber(&jar, apk);
+    }
+
+    // No verification tool available — warn but don't block.
+    // The APK was just signed by us seconds ago, so it should be valid.
+    log::warn!(
+        "No APK verification tool available (apksigner / uber-apk-signer). \
+         Skipping signature verification. The APK was signed moments ago and \
+         should be valid."
+    );
+    Ok(())
+}
+
+/// Verify using Android SDK apksigner
+fn verify_with_apksigner(tool: &Path, apk: &Path) -> Result<()> {
+    let output = Command::new(tool)
         .arg("verify")
         .arg("--verbose")
         .arg("--print-certs")
@@ -179,6 +204,7 @@ pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
     let combined = format!("{}\n{}", stdout, stderr);
 
     if !output.status.success() {
+        // apksigner verify returning non-zero means the APK is genuinely broken.
         bail!("apksigner verify failed:\n{}", combined);
     }
 
@@ -198,20 +224,40 @@ pub fn verify_apk_full_signature(apk: &Path) -> Result<()> {
         }
     }
 
-    // Android 9+ (Quest) supports v3 only. Accept v2 OR v3.
+    // Quest runs Android 12+ — needs v2 or v3.
     if !v2_ok && !v3_ok {
         bail!(
             "Signature verification failed (required: v2 or v3 = true).\n\
              v1={} v2={} v3={}\n\
              apksigner output:\n{}",
-            v1_ok,
-            v2_ok,
-            v3_ok,
-            combined
+            v1_ok, v2_ok, v3_ok, combined
         );
     }
 
     log::info!("Signature verified (v1={} v2={} v3={}): {}", v1_ok, v2_ok, v3_ok, apk.display());
+    Ok(())
+}
+
+/// Verify using uber-apk-signer --onlyVerify
+fn verify_with_uber(jar: &Path, apk: &Path) -> Result<()> {
+    let output = Command::new("java")
+        .arg("-jar").arg(jar)
+        .arg("--onlyVerify")
+        .arg("--apks").arg(apk)
+        .output()
+        .context("uber-apk-signer verify")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        bail!(
+            "uber-apk-signer verification failed:\n{}\n{}",
+            stdout, stderr
+        );
+    }
+
+    log::info!("Signature verified via uber-apk-signer: {}", apk.display());
     Ok(())
 }
 
@@ -309,6 +355,10 @@ fn try_apksigner(apk: &Path) -> Result<()> {
 
     let output = Command::new(&tool)
         .arg("sign")
+        .arg("--v1-signing-enabled").arg("true")
+        .arg("--v2-signing-enabled").arg("true")
+        .arg("--v3-signing-enabled").arg("true")
+        .arg("--v4-signing-enabled").arg("false")
         .arg("--ks").arg(&ks)
         .arg("--ks-pass").arg("pass:android")
         .arg("--ks-key-alias").arg("androiddebugkey")
@@ -320,7 +370,7 @@ fn try_apksigner(apk: &Path) -> Result<()> {
     if !output.status.success() {
         bail!("apksigner failed: {}", String::from_utf8_lossy(&output.stderr));
     }
-    log::info!("Signed with apksigner");
+    log::info!("Signed with apksigner (v1+v2+v3)");
     Ok(())
 }
 

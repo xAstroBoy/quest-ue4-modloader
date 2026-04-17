@@ -58,6 +58,11 @@ namespace aes_extractor
     std::string key_to_base64(const AESKey &key);
 
     // Manually add a known key (e.g., from config file or user input)
+    void add_key(const AESKey &key);
+
+    // Enable/disable AES key capture (disabled by default to avoid log spam).
+    // When disabled, keys are not logged but PAK decryption still works.
+    void set_capture_enabled(bool enabled);
     void add_key(const uint8_t *key_bytes, const std::string &source);
 
     // Try to scan memory for potential AES keys.

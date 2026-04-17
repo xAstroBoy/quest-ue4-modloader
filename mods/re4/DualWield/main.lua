@@ -14,6 +14,30 @@ local TAG = "DualWield"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 local state = {
     enabled = true,
 }
@@ -52,8 +76,8 @@ local function applyDualWieldSetting(enable)
 
     -- Method 2: Via pawn's player settings (runtime property)
     local ok2 = pcall(function()
-        local pawn = FindFirstOf("VR4Bio4PlayerPawn")
-        if not pawn then pawn = FindFirstOf("VR4GamePlayerPawn") end
+        local pawn = findFirstNonDefault("VR4Bio4PlayerPawn")
+        if not pawn then pawn = findFirstNonDefault("VR4GamePlayerPawn") end
         if not pawn then
             V("No player pawn found")
             return
@@ -70,7 +94,7 @@ local function applyDualWieldSetting(enable)
 
     -- Method 3: Via save game settings
     local ok3 = pcall(function()
-        local sg = FindFirstOf("VR4Bio4SaveGame")
+        local sg = findFirstNonDefault("VR4Bio4SaveGame")
         if not sg then
             V("No save game found")
             return
@@ -112,21 +136,15 @@ ExecuteWithDelay(3000, function()
     end
 end)
 
--- Re-enforce every 10 seconds (game may reset settings on level load)
+-- Do one later retry after content settles, but avoid perpetual background churn.
 local enforceCount = 0
-local function scheduleEnforcement()
-    ExecuteWithDelay(10000, function()
-        if state.enabled then
-            pcall(function() applyDualWieldSetting(true) end)
-            enforceCount = enforceCount + 1
-            if enforceCount <= 3 then
-                V("Enforcement #%d: EnableDualWielding=true", enforceCount)
-            end
-        end
-        scheduleEnforcement()  -- reschedule
-    end)
-end
-scheduleEnforcement()
+ExecuteWithDelay(15000, function()
+    if state.enabled then
+        pcall(function() applyDualWieldSetting(true) end)
+        enforceCount = enforceCount + 1
+        V("Late enforcement #%d: EnableDualWielding=true", enforceCount)
+    end
+end)
 
 -- =====================================================================
 -- POST-HOOKS: Override grab/present checks via ProcessEvent

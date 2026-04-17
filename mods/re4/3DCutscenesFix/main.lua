@@ -1,4 +1,4 @@
--- mods/3DCutscenesFix/main.lua v12.3
+-- mods/3DCutscenesFix/main.lua v12.4
 -- ═══════════════════════════════════════════════════════════════════════
 -- UE4SS-style 3D Cutscenes — teleports VR player to cinematic camera.
 --
@@ -11,15 +11,47 @@
 local TAG = "3DCutscenesFix"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
+local function fmtAddr(v)
+    if type(v) == "number" then
+        return string.format("0x%X", v)
+    end
+    return tostring(v)
+end
+
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
 
 local state = {
     enabled    = true,
     inCutscene = false,
+    experimentalNativeHook = false,
 }
 
 local saved = ModConfig.Load("3DCutscenesFix")
 if saved then
     if saved.enabled ~= nil then state.enabled = saved.enabled end
+    if saved.experimentalNativeHook ~= nil then state.experimentalNativeHook = saved.experimentalNativeHook end
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -30,7 +62,7 @@ local cachedPawn = nil
 local gamePawnReady = false  -- gate: don't touch camera until real game pawn exists
 
 local function refreshPawn()
-    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    local pawn = findFirstNonDefault("VR4GamePlayerPawn")
     V("refreshPawn: FindFirstOf(VR4GamePlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         cachedPawn = pawn:GetAddress()
@@ -47,7 +79,7 @@ NotifyOnNewObject("VR4GamePlayerPawn", function(obj)
     V("NewObject VR4GamePlayerPawn: %s valid=%s", tostring(obj), tostring(obj and obj:IsValid()))
     if obj and obj:IsValid() then
         cachedPawn = obj:GetAddress()
-        Log(TAG .. ": VR4GamePlayerPawn spawned — cached @ " .. ToHex(cachedPawn) .. " (delaying ready 3s)")
+        Log(TAG .. ": VR4GamePlayerPawn spawned — cached @ " .. fmtAddr(cachedPawn) .. " (delaying ready 3s)")
         -- Wait 3 seconds for camera manager to fully initialize
         ExecuteWithDelay(3000, function()
             if obj:IsValid() then
@@ -91,6 +123,7 @@ end
 
 RegisterHook("/Script/Game.VR4GamePlayerPawn:OnCameraModeChanged", function(Context, Parms)
     V("PostHook OnCameraModeChanged fired")
+    ---@diagnostic disable-next-line: undefined-field
     local self = Context:get()
     if self and self:IsValid() then
         local addr = self:GetAddress()
@@ -118,63 +151,65 @@ local sym_setAnchor = Resolve(
 local sym_updateCamera = Resolve(
     "_ZN22AVR4CutscenePlayerPawn12UpdateCameraERK10FTransformfb", 0x06843E64)
 
-if sym_updateCamera and sym_setAnchor then
+if state.experimentalNativeHook and sym_updateCamera and sym_setAnchor then
     pcall(function()
     RegisterNativeHookAt(sym_updateCamera, "CutsceneUpdateCamera", nil,
         function(retval, self_ptr, transform_ptr, fovY, screenOn)
             V("Native post CutsceneUpdateCamera, enabled=%s gamePawnReady=%s cachedPawn=%s", tostring(state.enabled), tostring(gamePawnReady), tostring(cachedPawn ~= nil))
-            if not state.enabled then return retval end
-            if not transform_ptr then return retval end
+            if not state.enabled then return end
+            if not state.inCutscene then return end
+            if not transform_ptr then return end
             -- CRITICAL: Don't engage until the real VR game pawn exists.
             -- At boot the game runs intro cutscenes before the world is ready.
             -- Teleporting the camera then = black void.
-            if not gamePawnReady or not cachedPawn then return retval end
-            -- Validate the cached pawn is still alive before touching its camera
-            local pawn = FindFirstOf("VR4GamePlayerPawn")
-            V("FindFirstOf(VR4GamePlayerPawn) in UpdateCamera = %s", tostring(pawn))
-            if not pawn or not pawn:IsValid() then return retval end
-            cachedPawn = pawn:GetAddress() -- refresh in case it moved
-            state.inCutscene = true
+            if not gamePawnReady or not cachedPawn then return end
+            -- SAFETY: do not do UObject reflection queries inside this native hook.
+            -- Reflection calls from this callback were a likely crash source.
             -- CRITICAL: Do NOT use self_ptr as target — that's the CutscenePlayerPawn,
             -- not the real VR game pawn. SetAnchorInternal must be called on the
             -- actual VR4GamePlayerPawn (cachedPawn) to move the VR camera.
             CallNative(sym_setAnchor, "v", cachedPawn, transform_ptr)
-            return retval
         end, "ppfi")
-    Log(TAG .. ": Native hook — CutsceneUpdateCamera → SetAnchorInternal teleport (gated on game pawn)")
+    Log(TAG .. ": Native hook — CutsceneUpdateCamera → SetAnchorInternal teleport (cutscene+pawn gated, no reflection in callback)")
     end)
 else
-    if not sym_updateCamera then LogError(TAG .. ": UpdateCamera NOT FOUND") end
-    if not sym_setAnchor then LogError(TAG .. ": SetAnchorInternal NOT FOUND") end
+    if not state.experimentalNativeHook then
+        Log(TAG .. ": Native camera hook disabled (safe mode) — use 'cutscene_native' to toggle")
+    else
+        if not sym_updateCamera then LogError(TAG .. ": UpdateCamera NOT FOUND") end
+        if not sym_setAnchor then LogError(TAG .. ": SetAnchorInternal NOT FOUND") end
+    end
 end
 
 -- SceEvent hooks for cutscene begin/end detection
 local sym_begin = Resolve("OnSceEventBegin", 0x0684080C)
 local sym_end   = Resolve("OnSceEventEnd",   0x068408D4)
 
-if sym_begin then
-    pcall(function()
-    RegisterNativeHookAt(sym_begin, "OnSceEventBegin", nil,
-        function(retval, self_ptr)
-            V("Native post OnSceEventBegin, enabled=%s", tostring(state.enabled))
-            if not state.enabled then return retval end
-            state.inCutscene = true
-            Log(TAG .. ": Cutscene BEGIN")
-            return retval
+if state.experimentalNativeHook then
+    if sym_begin then
+        pcall(function()
+        RegisterNativeHookAt(sym_begin, "OnSceEventBegin", nil,
+            function(retval, self_ptr)
+                V("Native post OnSceEventBegin, enabled=%s", tostring(state.enabled))
+                if not state.enabled then return end
+                state.inCutscene = true
+                Log(TAG .. ": Cutscene BEGIN")
+            end)
         end)
-    end)
-end
+    end
 
-if sym_end then
-    pcall(function()
-    RegisterNativeHookAt(sym_end, "OnSceEventEnd", nil,
-        function(retval, self_ptr)
-            V("Native post OnSceEventEnd")
-            state.inCutscene = false
-            Log(TAG .. ": Cutscene END")
-            return retval
+    if sym_end then
+        pcall(function()
+        RegisterNativeHookAt(sym_end, "OnSceEventEnd", nil,
+            function(retval, self_ptr)
+                V("Native post OnSceEventEnd")
+                state.inCutscene = false
+                Log(TAG .. ": Cutscene END")
+            end)
         end)
-    end)
+    end
+else
+    Log(TAG .. ": Native cutscene event hooks disabled (safe mode)")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -188,13 +223,21 @@ RegisterCommand("cutscene", function()
     Notify(TAG, state.enabled and "3D Cutscenes ON" or "3D Cutscenes OFF")
 end)
 
+RegisterCommand("cutscene_native", function()
+    state.experimentalNativeHook = not state.experimentalNativeHook
+    ModConfig.Save("3DCutscenesFix", state)
+    Log(TAG .. ": experimentalNativeHook=" .. tostring(state.experimentalNativeHook)
+        .. " (requires restart to apply)")
+    Notify(TAG, state.experimentalNativeHook and "Native hook ON (restart)" or "Native hook OFF (restart)")
+end)
+
 RegisterCommand("cutscene_status", function()
     refreshPawn()
     local info = TAG .. ": enabled=" .. tostring(state.enabled)
         .. " inCutscene=" .. tostring(state.inCutscene)
         .. " pawn=" .. tostring(cachedPawn ~= nil)
     -- Read player state via UE4SS
-    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    local pawn = findFirstNonDefault("VR4GamePlayerPawn")
     V("FindFirstOf(VR4GamePlayerPawn) for status = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()
@@ -215,7 +258,8 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) state.enabled = v; ModConfig.Save("3DCutscenesFix", state) end)
 end
 
-Log(TAG .. ": v12.1 loaded — UE4SS RegisterHook OnCameraModeChanged"
+Log(TAG .. ": v12.4 loaded — UE4SS RegisterHook OnCameraModeChanged"
     .. " + NotifyOnNewObject pawn tracking + native Dobby CutsceneUpdateCamera"
+    .. " | safeMode=" .. tostring(not state.experimentalNativeHook)
     .. " | setAnchor=" .. tostring(sym_setAnchor ~= nil)
     .. " updateCamera=" .. tostring(sym_updateCamera ~= nil))

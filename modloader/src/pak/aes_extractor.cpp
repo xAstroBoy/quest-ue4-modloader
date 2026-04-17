@@ -27,6 +27,7 @@ namespace aes_extractor
     static std::mutex s_mutex;
     static std::vector<AESKey> s_keys;
     static std::atomic<bool> s_initialized{false};
+    static std::atomic<bool> s_capture_enabled{false}; // Disabled by default — too noisy
 
     // ── Primary hook: T-table FAES::DecryptData (the REAL PAK decrypt) ────────
     // sub_13FBEE4: void FAES_DecryptData(void* data, int64_t size, uint8_t* key32)
@@ -154,6 +155,10 @@ namespace aes_extractor
     // ═══ Core: capture and log a key (shared by all hooks) ═════════════════
     static void capture_key(const uint8_t *key_bytes, const char *source, int bits)
     {
+        // AES capture disabled by default — too noisy in logs
+        if (!s_capture_enabled)
+            return;
+
         if (!key_bytes || is_key_all_zeros(key_bytes))
             return;
 
@@ -847,6 +852,16 @@ namespace aes_extractor
 
         fclose(f);
         logger::log_info("AES", "Keys dumped to %s (%zu keys)", path.c_str(), s_keys.size());
+    }
+
+    void set_capture_enabled(bool enabled)
+    {
+        std::lock_guard<std::mutex> lock(s_mutex);
+        s_capture_enabled = enabled;
+        if (enabled)
+            logger::log_info("AES", "AES key capture ENABLED");
+        else
+            logger::log_info("AES", "AES key capture DISABLED (no log spam)");
     }
 
 } // namespace aes_extractor

@@ -14,6 +14,30 @@ local TAG = "NoInventoryCollision"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 local state = {
     enabled = true,
 }
@@ -135,7 +159,7 @@ end)
 
 RegisterCommand("inventory_info", function()
     local info = TAG .. ": enabled=" .. tostring(state.enabled)
-    local case = FindFirstOf("AttacheCase")
+    local case = findFirstNonDefault("AttacheCase")
     V("FindFirstOf AttacheCase -> %s", tostring(case))
     if case and case:IsValid() then
         pcall(function()

@@ -137,3 +137,5 @@ quest_root*
 
 # ── UE4SS reference doc (large) ──────────────────────────────────────
 UE4SS_LUA_API_COMPLETE_REFERENCE.md
+/tools
+.github/copilot-instructions.md

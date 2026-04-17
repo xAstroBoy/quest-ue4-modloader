@@ -1,6 +1,10 @@
--- mods/NoRecoil/main.lua v2.0
+-- mods/NoRecoil/main.lua v2.1
 -- ═══════════════════════════════════════════════════════════════════════
 -- No Recoil / No Spread — eliminates weapon recoil and bullet spread.
+--
+-- v2.1: Removed native IsRecoiling hook — log showed repeated SIGSEGV
+--   safe-call recovery in that hook's original path during gameplay.
+--   Keep UpdateRecoil/GetShotSpreadMM/Filter00SetAddSpread only.
 --
 -- v2.0: Restored native hooks (modloader now has DobbyHook crash guard).
 --   If any hook fails to install (stripped symbol, bad address), the
@@ -45,20 +49,6 @@ else
     Log(TAG .. ": UpdateRecoil hook skipped (symbol not found or install failed)")
 end
 
--- IsRecoiling(self) — return false (0)
-ok = RegisterNativeHook("IsRecoiling", function(self)
-    if state.enabled then
-        V("Native IsRecoiling -> 0")
-        return 0  -- false
-    end
-end, nil, "p")
-if ok then
-    hookCount = hookCount + 1
-    Log(TAG .. ": Hooked IsRecoiling (force false when enabled)")
-else
-    Log(TAG .. ": IsRecoiling hook skipped (symbol not found or install failed)")
-end
-
 -- GetShotSpreadMM(self) — return 0.0 spread via post-hook
 -- sig: "fp" = float return, self(ptr/X0)
 ok = RegisterNativeHook("GetShotSpreadMM", nil, function(ret_d0, self)
@@ -89,7 +79,7 @@ else
     Log(TAG .. ": Filter00SetAddSpread hook skipped (symbol not found or install failed)")
 end
 
-Log(TAG .. ": " .. hookCount .. "/4 native hooks installed")
+Log(TAG .. ": " .. hookCount .. "/3 native hooks installed")
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- COMMAND
@@ -113,4 +103,4 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) state.enabled = v; ModConfig.Save("NoRecoil", state) end)
 end
 
-Log(TAG .. ": v2.0 loaded — native hooks restored (modloader crash guard active)")
+Log(TAG .. ": v2.1 loaded — IsRecoiling hook removed; recoil/spread native hooks active")

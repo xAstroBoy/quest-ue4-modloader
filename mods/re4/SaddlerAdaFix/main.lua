@@ -1,12 +1,18 @@
--- mods/SaddlerAdaFix/main.lua v2.1
+-- mods/SaddlerAdaFix/main.lua v3.0
 -- ═══════════════════════════════════════════════════════════════════════
--- UE4SS-style SaddlerAda Fix — uses StaticFindObject/StaticLoadClass
--- directly from UE4SS API instead of manual CallNative.
+-- SaddlerAda Fix — fixes em3f (Saddler-Ada) mesh table so the entity
+-- is visible when spawned.
 --
--- v2.0 — Full UE4SS API:
---   StaticFindObject(path) for UObject lookup (no CallNative wrapper)
---   StaticLoadClass(base, path) for asset loading
---   Native hooks on GetEtcModelClass for mesh table override
+-- v3.0 — Fixed mesh paths from EnemyFixes_P.pak analysis.
+--   The em3f_meshTable asset lives at:
+--     /Game/Blueprints/Characters/Bosses/em3f_meshTable
+--   This asset is inside EnemyFixes_P.pak. If that PAK is not mounted
+--   on the device, em3f spawns will be invisible (no mesh data).
+--
+--   Also tries EM3F_meshData and EM3F_Poseable_BP as fallbacks.
+--
+-- REQUIREMENT: EnemyFixes_P.pak must be installed on the device at:
+--   /sdcard/Android/data/com.Armature.VR4/files/UE4Game/VR4/Content/Paks/
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "SaddlerAdaFix"
 local VERBOSE = false
@@ -18,13 +24,28 @@ local EM3F_INDEX = 0x3F
 -- UE4SS ASSET DISCOVERY — Try to find em3f mesh table via reflection
 -- ═══════════════════════════════════════════════════════════════════════
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- ASSET PATHS — Verified from EnemyFixes_P.pak contents
+-- PAK mount point: ../../../VR4/Content/
+-- Assets found:
+--   Blueprints/Characters/Bosses/em3f_meshTable.uasset
+--   Blueprints/Characters/Bosses/EM3F_meshData.uasset
+--   Blueprints/Characters/Bosses/EM3F_Poseable_BP.uasset
+-- NOTE: These assets ONLY exist if EnemyFixes_P.pak is mounted!
+-- ═══════════════════════════════════════════════════════════════════════
 local MESH_TABLE_PATHS = {
+    -- Primary: em3f_meshTable (the actual mesh table class from PAK)
     "/Game/Blueprints/Characters/Bosses/em3f_meshTable.em3f_meshTable_C",
+    "/Game/Blueprints/Characters/Bosses/em3f_meshTable",
+    -- Case variations
     "/Game/Blueprints/Characters/Bosses/Em3f_meshTable.Em3f_meshTable_C",
-    "/Game/Blueprints/Characters/Bosses/em3f_MeshTable.em3f_MeshTable_C",
-    "/Game/Blueprints/Characters/Bosses/Em3f_MeshTable.Em3f_MeshTable_C",
-    "/Game/Blueprints/Characters/Enemies/Em3f/em3f_meshTable.em3f_meshTable_C",
-    "/Game/Blueprints/Characters/Enemies/em3f_meshTable.em3f_meshTable_C",
+    "/Game/Blueprints/Characters/Bosses/EM3F_meshTable.EM3F_meshTable_C",
+    -- MeshData asset (may serve as mesh table)
+    "/Game/Blueprints/Characters/Bosses/EM3F_meshData.EM3F_meshData_C",
+    "/Game/Blueprints/Characters/Bosses/EM3F_meshData",
+    -- Poseable BP fallback
+    "/Game/Blueprints/Characters/Bosses/EM3F_Poseable_BP.EM3F_Poseable_BP_C",
+    "/Game/Blueprints/Characters/Bosses/EM3F_Poseable_BP",
 }
 
 local cachedClass = nil
@@ -46,7 +67,10 @@ end
 if cachedClass then
     Log(TAG .. ": em3f mesh table found @ " .. ToHex(cachedClass))
 else
-    Log(TAG .. ": em3f mesh table not pre-cached — will use StaticLoadClass in hook (deferred)")
+    Log(TAG .. ": ⚠️ em3f mesh table NOT FOUND at boot!")
+    Log(TAG .. ": Ensure EnemyFixes_P.pak is installed at:")
+    Log(TAG .. ":   /sdcard/Android/data/com.Armature.VR4/files/UE4Game/VR4/Content/Paks/EnemyFixes_P.pak")
+    Log(TAG .. ": Will retry via StaticLoadClass in GetEtcModelClass hook (deferred)")
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -54,8 +78,9 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 local sym_AVR4Model_SC = Resolve("AVR4Model_StaticClass", 0x068EF580)
-local sym_StaticFindObj = Resolve("StaticFindObject")
-local sym_StaticLoadCls = Resolve("StaticLoadClass")
+-- Mangled names + fallback offsets from RE4 VR symbol_dump.txt
+local sym_StaticFindObj = Resolve("_Z16StaticFindObjectP6UClassP7UObjectPKDsb", 0x06A1AE74)
+local sym_StaticLoadCls = Resolve("_Z15StaticLoadClassP6UClassP7UObjectPKDsS4_jP11UPackageMap", 0x06A1DE74)
 
 pcall(function()
 RegisterNativeHook("GetEtcModelClass",
@@ -118,4 +143,4 @@ pcall(function()
         end, nil)
 end)
 
-Log(TAG .. ": v2.1 loaded — UE4SS StaticFindObject/StaticLoadClass + native GetEtcModelClass")
+Log(TAG .. ": v3.0 loaded — UE4SS StaticFindObject/StaticLoadClass + native GetEtcModelClass")

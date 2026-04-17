@@ -4,7 +4,7 @@
 -- GameInstance config moved to Patches mod.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "DebugViewmodes"
-local VERBOSE = false  -- NOTE: keep OFF — AllowDebugViewmodes fires every frame (~90fps)
+local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

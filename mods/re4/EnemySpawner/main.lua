@@ -1,13 +1,26 @@
--- mods/EnemySpawner/main.lua v8.0
+-- mods/EnemySpawner/main.lua v10.1
 -- ═══════════════════════════════════════════════════════════════════════
--- Direct EmSetEvent Enemy Spawner — 170+ enemies via native EmSetEvent()
+-- Direct EmSetEvent Enemy Spawner — 200+ enemies via native EmSetEvent()
 --
--- v8.0 — COMPLETE REWRITE: Direct EmSetEvent() spawning
---   Replaces broken ESL-write approach with direct EmSetEvent() calls
---   Spawns enemies REGARDLESS of level or ESL slots
---   Uses AllocateMemory + CallNative for native function invocation
---   Gets player position from pPL for near-player spawning
---   Distributes spawns in a circle around the player
+-- v10.1 — Safer in-bounds placement
+--   Prefer grounded/body-style pawn locations, clamp distance harder, build
+--   multiple near-player candidate offsets, and write RE4 EM_LIST Y/Z using
+--   RE4's Y-up layout instead of blindly copying UE's XYZ ordering.
+--
+-- v10.0 — Debug player pawn support + explicit +/- controls
+--   Prefers `VR4DebugPlayerPawn` position whenever the special debug pawn is
+--   active. Default spawn distance is now 10 and default count is 1.
+--   Debug menu now has explicit Count +/- and Distance +/- controls instead
+--   of only cycling values.
+--
+-- v9.0 — SDK-based player position + NPC crash safety
+--   Uses VR4Bio4PlayerPawn SDK methods (GetBio4Transform, GetBodyLocation,
+--   GetHeadLocation) for accurate player position instead of generic
+--   FindFirstOf("Pawn"). Prevents enemies spawning outside the map.
+--   NPCs marked with "npc" hpType for crash warning.
+--
+-- v8.1 — Rotation safety for flying/vehicle spawns
+-- v8.0 — Direct EmSetEvent() spawning (replaces broken ESL-write approach)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "EnemySpawner"
 local VERBOSE = false
@@ -273,21 +286,25 @@ local BOSSES = {
 }
 
 local NPCS = {
-    { "Merchant",            {24,6,0,0,0,0,0, 232,3} },
-    { "Saddler NPC 0",      {48,0,0,0,0,0,0, 232,3}, "boss" },
-    { "Saddler NPC 1",      {48,1,0,0,0,0,0, 232,3}, "boss" },
-    { "Mendez NPC",          {52,0,0,0,0,0,0, 232,3} },
-    { "Salazar NPC",         {52,1,0,0,0,0,0, 232,3} },
+    -- ⚠️ NPCs are EXPERIMENTAL — they require specific level context and
+    -- initialization that EmSetEvent alone may not provide. Spawning NPCs
+    -- outside their intended levels can crash the game.
+    -- hpType is "npc" to flag them for extra safety warnings.
+    { "Merchant",            {24,6,0,0,0,0,0, 232,3}, "npc" },
+    { "Saddler NPC 0",      {48,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Saddler NPC 1",      {48,1,0,0,0,0,0, 232,3}, "npc" },
+    { "Mendez NPC",          {52,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Salazar NPC",         {52,1,0,0,0,0,0, 232,3}, "npc" },
     { "Red Cloak Verdugo",   {52,2,0,0,0,0,0, 232,3}, "boss" },
     { "Black Cloak Verdugo", {52,3,0,0,0,0,0, 232,3}, "boss" },
-    { "Ashley",              {3,0,0,0,0,0,0, 232,3} },
-    { "Ashley 2",            {5,0,0,0,0,0,0, 232,3} },
-    { "Ashley 3",            {12,0,0,0,0,0,0, 232,3} },
-    { "Luis Sera",           {4,0,0,0,0,0,0, 232,3} },
-    { "HUNK",                {6,0,0,0,0,0,0, 232,3} },
-    { "Wesker",              {13,0,0,0,0,0,0, 232,3} },
-    { "Krauser (NPC)",       {10,0,0,0,0,0,0, 232,3} },
-    { "Police",              {7,0,0,0,0,0,0, 232,3} },
+    { "Ashley",              {3,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Ashley 2",            {5,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Ashley 3",            {12,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Luis Sera",           {4,0,0,0,0,0,0, 232,3}, "npc" },
+    { "HUNK",                {6,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Wesker",              {13,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Krauser (NPC)",       {10,0,0,0,0,0,0, 232,3}, "npc" },
+    { "Police",              {7,0,0,0,0,0,0, 232,3}, "npc" },
 }
 
 local ADA_ENEMIES = {
@@ -449,62 +466,196 @@ local function initNative()
     nativeReady = true
     Log(TAG .. ": Native engine ready")
     Log(TAG .. ":   EmSetEvent  @ " .. ToHex(sym_EmSetEvent))
-    pcall(function() Log(TAG .. ":   pPL var     @ " .. ToHex(addr_pPL)) end)
-    pcall(function() Log(TAG .. ":   errEm var   @ " .. ToHex(addr_errEm)) end)
-    pcall(function() Log(TAG .. ":   emListBuf   @ " .. ToHex(emListBuf)) end)
+    if addr_pPL then pcall(function() Log(TAG .. ":   pPL var     @ " .. ToHex(addr_pPL)) end) end
+    if addr_errEm then pcall(function() Log(TAG .. ":   errEm var   @ " .. ToHex(addr_errEm)) end) end
+    if emListBuf then pcall(function() Log(TAG .. ":   emListBuf   @ " .. ToHex(emListBuf)) end) end
     return true
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
--- PLAYER POSITION — UE4 reflection (primary) + native pPL fallback
+-- PLAYER POSITION — VR4Bio4PlayerPawn SDK methods (primary) + fallback
 -- ═══════════════════════════════════════════════════════════════════════
 
-local function getPlayerPosition()
-    -- Method 1: UE4 reflection — reliable, works as long as pawn is spawned
-    -- Try multiple class names (VR4Bio4PlayerPawn is the actual class in RE4 VR)
-    local pawn = nil
-    for _, cls in ipairs({"VR4Bio4PlayerPawn", "VR4GamePlayerPawn", "Pawn"}) do
-        if not pawn then
-            pcall(function()
-                local p = FindFirstOf(cls)
-                if p and p:IsValid() then pawn = p end
-            end)
+local cachedPawn = nil
+local cachedDebugPawn = nil
+
+local function isPawnValid(pawn)
+    if not pawn then return false end
+    local ok, valid = pcall(function() return pawn:IsValid() end)
+    return ok and valid and true or false
+end
+
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function isDebugPawnActive()
+    local active = false
+    pcall(function()
+        local pc = findFirstNonDefault("VR4PlayerController_BP_C")
+        if pc and pc:IsValid() then
+            local ok, result = pcall(function() return pc:Call("IsSpecialDebugPawnActive") end)
+            if ok and result ~= nil then active = result and true or false end
+        end
+    end)
+    return active
+end
+
+local function getDebugPlayerPawn()
+    if cachedDebugPawn and isPawnValid(cachedDebugPawn) then
+        return cachedDebugPawn
+    end
+    cachedDebugPawn = nil
+
+    if not isDebugPawnActive() then
+        return nil
+    end
+
+    local classes = {"VR4DebugPlayerPawn_BP_C", "VR4DebugPlayerPawn"}
+    for _, cls in ipairs(classes) do
+        local pawn = nil
+        pcall(function()
+            local p = findFirstNonDefault(cls)
+            if p and p:IsValid() then pawn = p end
+        end)
+        if pawn then
+            cachedDebugPawn = pawn
+            V("getDebugPlayerPawn: found %s", cls)
+            return pawn
+        end
+    end
+    return nil
+end
+
+local function extractVectorXYZ(vec)
+    if not vec then return nil end
+    local x, y, z
+    pcall(function() x = vec.X end)
+    pcall(function() y = vec.Y end)
+    pcall(function() z = vec.Z end)
+    if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
+        return x, y or 0, z or 0
+    end
+    return nil
+end
+
+local function getPawnPositionFromMethods(pawn, label)
+    if not isPawnValid(pawn) then return nil end
+
+    local ok2, loc2 = pcall(function() return pawn:Call("GetBodyLocation") end)
+    if ok2 and loc2 then
+        local x, y, z = extractVectorXYZ(loc2)
+        if x then
+            V("getPlayerPosition[%s]: GetBodyLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+            return x, y, z
         end
     end
 
-    if pawn then
-        -- Try K2_GetActorLocation → returns FVector LuaUStruct {X, Y, Z}
-        -- RE4 VR wraps the RE4 engine inside UE4 — actor positions are stored
-        -- in RE4 native coords: X=horizontal, Y=height, Z=horizontal
-        -- The cEm position at +0xA4/+0xA8/+0xAC matches the UE4 actor location
-        local ok, loc = pcall(function() return pawn:Call("K2_GetActorLocation") end)
-        if ok and loc then
-            local x, y, z
-            pcall(function() x = loc.X end)
-            pcall(function() y = loc.Y end)
-            pcall(function() z = loc.Z end)
-            if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
-                V("getPlayerPosition: K2_GetActorLocation=(%.1f, %.1f, %.1f)", x, y or 0, z or 0)
-                -- Return RE4 native: (posX, posY_height, posZ)
-                return x, y or 0, z or 0
-            end
+    local ok1, transform = pcall(function() return pawn:Call("GetBio4Transform") end)
+    if ok1 and transform then
+        local x, y, z
+        pcall(function()
+            local loc = transform.Translation or transform
+            x = loc.X
+            y = loc.Y
+            z = loc.Z
+        end)
+        if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
+            V("getPlayerPosition[%s]: GetBio4Transform=(%.1f, %.1f, %.1f)", label, x, y or 0, z or 0)
+            return x, y or 0, z or 0
         end
+    end
 
-        -- Try reading RootComponent.RelativeLocation
-        local ok2, root = pcall(function() return pawn:Get("RootComponent") end)
-        if ok2 and root and root:IsValid() then
-            local ok3, rloc = pcall(function() return root:Get("RelativeLocation") end)
-            if ok3 and rloc then
-                local x, y, z
-                pcall(function() x = rloc.X end)
-                pcall(function() y = rloc.Y end)
-                pcall(function() z = rloc.Z end)
-                if x and z and (x ~= 0 or y ~= 0 or z ~= 0) then
-                    V("getPlayerPosition: RelativeLocation=(%.1f, %.1f, %.1f)", x, y or 0, z or 0)
-                    return x, y or 0, z or 0
-                end
+    local ok3, loc3 = pcall(function() return pawn:Call("GetHeadLocation") end)
+    if ok3 and loc3 then
+        local x, y, z = extractVectorXYZ(loc3)
+        if x then
+            V("getPlayerPosition[%s]: GetHeadLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+            return x, y, z
+        end
+    end
+
+    local ok4, loc4 = pcall(function() return pawn:Call("K2_GetActorLocation") end)
+    if ok4 and loc4 then
+        local x, y, z = extractVectorXYZ(loc4)
+        if x then
+            V("getPlayerPosition[%s]: K2_GetActorLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+            return x, y, z
+        end
+    end
+
+    local ok5, root = pcall(function() return pawn:Get("RootComponent") end)
+    if ok5 and root and root:IsValid() then
+        local ok6, rloc = pcall(function() return root:Get("RelativeLocation") end)
+        if ok6 and rloc then
+            local x, y, z = extractVectorXYZ(rloc)
+            if x then
+                V("getPlayerPosition[%s]: RelativeLocation=(%.1f, %.1f, %.1f)", label, x, y, z)
+                return x, y, z
             end
         end
+    end
+
+    return nil
+end
+
+local function getPlayerPawn()
+    -- Try cached pawn first
+    if cachedPawn then
+        local ok, valid = pcall(function() return cachedPawn:IsValid() end)
+        if ok and valid then return cachedPawn end
+        cachedPawn = nil
+    end
+
+    -- SDK class hierarchy: VR4Bio4PlayerPawn_BP_C → VR4Bio4PlayerPawn → VR4GamePlayerPawn
+    -- VR4Bio4PlayerPawn has GetBio4Transform(), GetPlayerCurrentHealth(), etc.
+    local classes = {"VR4Bio4PlayerPawn_BP_C", "VR4Bio4PlayerPawn", "VR4GamePlayerPawn", "VR4PlayerPawn"}
+    for _, cls in ipairs(classes) do
+        local pawn = nil
+        pcall(function()
+            local p = findFirstNonDefault(cls)
+            if p and p:IsValid() then pawn = p end
+        end)
+        if pawn then
+            cachedPawn = pawn
+            V("getPlayerPawn: found %s", cls)
+            return pawn
+        end
+    end
+    return nil
+end
+
+local function getPlayerPosition()
+    local debugPawn = getDebugPlayerPawn()
+    if debugPawn then
+        local x, y, z = getPawnPositionFromMethods(debugPawn, "debugPawn")
+        if x then return x, y, z end
+    end
+
+    local pawn = getPlayerPawn()
+    if pawn then
+        local x, y, z = getPawnPositionFromMethods(pawn, "playerPawn")
+        if x then return x, y, z end
     end
 
     -- Fallback: native pPL (original method — may return 0,0,0)
@@ -527,14 +678,38 @@ local function getPlayerPosition()
     return nil
 end
 
+local state
+local clampSpawnCount, clampSpawnDistance, adjustSpawnCount, adjustSpawnDistance
+
+clampSpawnCount = function(n)
+    return math.max(1, math.min(10, tonumber(n) or 1))
+end
+
+clampSpawnDistance = function(n)
+    return math.max(5, math.min(250, tonumber(n) or 10))
+end
+
+adjustSpawnCount = function(delta)
+    state.spawnCount = clampSpawnCount((state.spawnCount or 1) + (delta or 0))
+    ModConfig.Save("EnemySpawner", state)
+    return state.spawnCount
+end
+
+adjustSpawnDistance = function(delta)
+    state.spawnDistance = clampSpawnDistance((state.spawnDistance or 10) + (delta or 0))
+    ModConfig.Save("EnemySpawner", state)
+    return state.spawnDistance
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════════════════════════════════════
 
-local state = {
+state = {
     difficulty    = "NORMAL",
     spawnCount    = 1,
-    spawnDistance  = 200,   -- world units from player (enemies spawn in circle)
+    spawnDistance  = 10,    -- world units from player (enemies spawn in circle)
+    facePlayer    = false,  -- false = neutral rotation (safer for helicopter/vehicles)
     selectedIdx   = 1,
     totalSpawned  = 0,
     lastSpawnedEm = nil,   -- last cEm* returned by EmSetEvent
@@ -547,10 +722,13 @@ if saved then
         state.difficulty = saved.difficulty
     end
     if saved.spawnCount then
-        state.spawnCount = math.max(1, math.min(5, saved.spawnCount))
+        state.spawnCount = clampSpawnCount(saved.spawnCount)
     end
     if saved.spawnDistance then
-        state.spawnDistance = math.max(50, math.min(2000, saved.spawnDistance))
+        state.spawnDistance = clampSpawnDistance(saved.spawnDistance)
+    end
+    if saved.facePlayer ~= nil then
+        state.facePlayer = saved.facePlayer and true or false
     end
 end
 
@@ -584,6 +762,45 @@ local function toU16(v)
     return v
 end
 
+local function isVehicleLikeEnemy(enemy)
+    if not enemy or not enemy.name then return false end
+    if enemy.name:find("Helicopter", 1, true) then return true end
+    if enemy.category == "Vehicles + Turrets" then return true end
+    return false
+end
+
+local function buildSpawnCandidates(baseDistance, countIndex, countTotal)
+    local dist = clampSpawnDistance(baseDistance or state.spawnDistance)
+    local candidates = {}
+
+    local function push(ox, oz)
+        candidates[#candidates + 1] = {ox = ox, oz = oz}
+    end
+
+    local forwardBias = math.max(5, math.min(dist, 35))
+    push(0, forwardBias)
+    push(forwardBias * 0.65, forwardBias * 0.65)
+    push(-forwardBias * 0.65, forwardBias * 0.65)
+    push(0, -math.max(4, forwardBias * 0.5))
+
+    local ringCount = math.max(countTotal or 1, 6)
+    local baseAngle = ((countIndex or 1) - 1) * (2 * math.pi / ringCount)
+    local radii = {
+        math.max(5, dist * 0.5),
+        math.max(6, dist * 0.75),
+        dist,
+    }
+
+    for _, radius in ipairs(radii) do
+        for _, delta in ipairs({0, math.pi / 6, -math.pi / 6, math.pi / 3, -math.pi / 3}) do
+            local angle = baseAngle + delta
+            push(math.cos(angle) * radius, math.sin(angle) * radius)
+        end
+    end
+
+    return candidates
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- SPAWN ENGINE — Direct EmSetEvent() call
 -- ═══════════════════════════════════════════════════════════════════════
@@ -591,6 +808,17 @@ end
 local function spawnSingle(enemy, offsetX, offsetZ)
     V("spawnSingle: enemy=%s offX=%s offZ=%s", enemy.name, tostring(offsetX), tostring(offsetZ))
     if not initNative() then V("spawnSingle: native init failed"); return false, "Native init failed" end
+
+    local buf = emListBuf
+    local emSetEvent = sym_EmSetEvent
+    local errEmAddr = addr_errEm
+    if not buf or IsNull(buf) then return false, "EM_LIST buffer missing" end
+    if not emSetEvent or IsNull(emSetEvent) then return false, "EmSetEvent missing" end
+
+    -- Safety: warn about NPC spawns (they often crash without level context)
+    if enemy.hpType == "npc" then
+        Log(TAG .. ": ⚠️ NPC spawn attempted: " .. enemy.name .. " — may crash without level context!")
+    end
 
     -- Get player position in RE4 world coords
     local px, py, pz = getPlayerPosition()
@@ -605,44 +833,60 @@ local function spawnSingle(enemy, offsetX, offsetZ)
 
     -- Zero-fill the entire 32-byte EM_LIST buffer
     for i = 0, 31 do
-        pcall(function() WriteU8(Offset(emListBuf, i), 0) end)
+        pcall(function() WriteU8(Offset(buf, i), 0) end)
     end
 
     -- Fill EM_LIST struct fields from database entry
     -- +0x00: status = 0 (ready for EmSetEvent, it sets to 7 after spawn)
-    pcall(function() WriteU8(Offset(emListBuf, 0x01), b[1]) end)       -- emId
-    pcall(function() WriteU8(Offset(emListBuf, 0x02), b[2]) end)       -- subType
-    pcall(function() WriteU8(Offset(emListBuf, 0x03), b[3]) end)       -- param1 -> cEm+0x47d
-    pcall(function() WriteU8(Offset(emListBuf, 0x04), b[4]) end)       -- param2 -> cEm+0x4c4
-    pcall(function() WriteU8(Offset(emListBuf, 0x05), b[5] or 0) end)  -- compat (unused by EmSetEvent)
-    pcall(function() WriteU8(Offset(emListBuf, 0x06), b[6] or 0) end)  -- compat
-    pcall(function() WriteU8(Offset(emListBuf, 0x07), b[7] or 0) end)  -- compat
+    pcall(function() WriteU8(Offset(buf, 0x01), b[1]) end)       -- emId
+    pcall(function() WriteU8(Offset(buf, 0x02), b[2]) end)       -- subType
+    pcall(function() WriteU8(Offset(buf, 0x03), b[3]) end)       -- param1 -> cEm+0x47d
+    pcall(function() WriteU8(Offset(buf, 0x04), b[4]) end)       -- param2 -> cEm+0x4c4
+    pcall(function() WriteU8(Offset(buf, 0x05), b[5] or 0) end)  -- compat (unused by EmSetEvent)
+    pcall(function() WriteU8(Offset(buf, 0x06), b[6] or 0) end)  -- compat
+    pcall(function() WriteU8(Offset(buf, 0x07), b[7] or 0) end)  -- compat
 
     -- HP (int16 LE at +0x08)
-    pcall(function() WriteU16(Offset(emListBuf, 0x08), hp) end)
+    pcall(function() WriteU16(Offset(buf, 0x08), hp) end)
 
-    -- Position: convert world coords -> EM_LIST int16 (worldCoord / 10.0)
-    local spawnX = (px + (offsetX or 0)) / 10.0
-    local spawnY = py / 10.0
-    local spawnZ = (pz + (offsetZ or 0)) / 10.0
+    -- Position: convert UE world coords -> RE4 EM_LIST int16 (coord / 10.0)
+    -- RE4 EM_LIST is Y-up while UE vectors are Z-up, so map:
+    --   EM posX <- UE X
+    --   EM posY <- UE Z (height)
+    --   EM posZ <- UE Y
+    local worldX = px + (offsetX or 0)
+    local worldY = py + (offsetZ or 0)
+    local worldZ = pz
+    local spawnX = worldX / 10.0
+    local spawnY = worldZ / 10.0
+    local spawnZ = worldY / 10.0
 
-    pcall(function() WriteU16(Offset(emListBuf, 0x0c), toU16(spawnX)) end)  -- posX
-    pcall(function() WriteU16(Offset(emListBuf, 0x0e), toU16(spawnY)) end)  -- posY
-    pcall(function() WriteU16(Offset(emListBuf, 0x10), toU16(spawnZ)) end)  -- posZ
+    pcall(function() WriteU16(Offset(buf, 0x0c), toU16(spawnX)) end)  -- posX
+    pcall(function() WriteU16(Offset(buf, 0x0e), toU16(spawnY)) end)  -- posY / height
+    pcall(function() WriteU16(Offset(buf, 0x10), toU16(spawnZ)) end)  -- posZ / horizontal
 
-    -- Rotation: face toward player (compute angle from spawn pos to player)
-    -- RE4 engine: rotY=0 faces +Z axis. Use atan2(dx, dz) for angle from +Z.
-    local dx = -(offsetX or 0)
-    local dz = -(offsetZ or 0)
-    if dx ~= 0 or dz ~= 0 then
-        local faceAngle = math.atan(dx, dz)  -- radians from +Z toward player
-        -- EM_LIST rotY: EmSetEvent multiplies by pi/16384, so inverse = 16384/pi
-        local rotInt = math.floor(faceAngle * 16384.0 / math.pi)
-        pcall(function() WriteU16(Offset(emListBuf, 0x12), toU16(rotInt)) end)
+    -- Rotation safety:
+    --   - Default: neutral rotation to avoid side/up orientation on helicopter/vehicles.
+    --   - Optional: face-player yaw for grounded enemies.
+    local neutralRot = isVehicleLikeEnemy(enemy) or (not state.facePlayer)
+
+    if neutralRot then
+        pcall(function() WriteU16(Offset(buf, 0x12), 0) end)  -- rotY neutral
+    else
+        local dx = -(offsetX or 0)
+        local dz = -(offsetZ or 0)
+        if dx ~= 0 or dz ~= 0 then
+            local faceAngle = math.atan(dx, dz)  -- radians from +Z toward player
+            local rotInt = math.floor(faceAngle * 16384.0 / math.pi)
+            pcall(function() WriteU16(Offset(buf, 0x12), toU16(rotInt)) end)
+        else
+            pcall(function() WriteU16(Offset(buf, 0x12), 0) end)
+        end
     end
-    -- Zero rotX and rotZ to prevent upside-down spawns
-    pcall(function() WriteU16(Offset(emListBuf, 0x14), 0) end)  -- rotX = 0 (no pitch)
-    pcall(function() WriteU16(Offset(emListBuf, 0x16), 0) end)  -- rotZ = 0 (no roll)
+
+    -- Force neutral pitch/roll always.
+    pcall(function() WriteU16(Offset(buf, 0x14), 0) end)  -- rotX neutral
+    pcall(function() WriteU16(Offset(buf, 0x16), 0) end)  -- rotZ neutral
 
     V("spawnSingle: calling EmSetEvent emId=%d subType=%d hp=%d", b[1], b[2], hp)
     -- Call EmSetEvent(EM_LIST*) -> returns cEm* or errEm
@@ -650,7 +894,7 @@ local function spawnSingle(enemy, offsetX, offsetZ)
     if SharedAPI then SharedAPI._skipRandomizer = true end
     local result = nil
     local callOk, callErr = pcall(function()
-        result = CallNative(sym_EmSetEvent, "pp", emListBuf)
+        result = CallNative(emSetEvent, "pp", buf)
     end)
     if SharedAPI then SharedAPI._skipRandomizer = false end
 
@@ -666,7 +910,9 @@ local function spawnSingle(enemy, offsetX, offsetZ)
 
     -- Check against errEm sentinel (spawn failure = pool full or invalid emId)
     local errEm = nil
-    pcall(function() errEm = ReadPtr(addr_errEm) end)
+    if errEmAddr then
+        pcall(function() errEm = ReadPtr(errEmAddr) end)
+    end
     if errEm and not IsNull(errEm) and result == errEm then
         V("spawnSingle: result matches errEm sentinel - pool full/invalid emId")
         return false, "Pool full or invalid emId (errEm)"
@@ -674,7 +920,7 @@ local function spawnSingle(enemy, offsetX, offsetZ)
 
     -- Check status byte — EmSetEvent sets EM_LIST[0] = 7 on success
     local statusByte = 0
-    pcall(function() statusByte = ReadU8(emListBuf) end)
+    pcall(function() statusByte = ReadU8(buf) end)
     V("spawnSingle: statusByte=%d (7=success)", statusByte)
     if statusByte ~= 7 then
         Log(TAG .. ":   Warning: EM_LIST status=" .. statusByte .. " (expected 7)")
@@ -697,23 +943,24 @@ local function spawnEnemy(enemy, count)
     local lastErr = nil
 
     for i = 1, count do
-        -- Distribute enemies in a circle around the player
-        local angle = (i - 1) * (2 * math.pi / math.max(count, 1))
-        if count > 1 then
-            angle = angle + math.random() * 0.3  -- slight random jitter
-        end
-        local dist = state.spawnDistance
-        local ox = math.cos(angle) * dist
-        local oz = math.sin(angle) * dist
-        V("spawnEnemy: #%d/%d angle=%.2f ox=%.1f oz=%.1f", i, count, angle, ox, oz)
+        local candidates = buildSpawnCandidates(state.spawnDistance, i, count)
+        local spawnedThisOne = false
 
-        local ok, result = spawnSingle(enemy, ox, oz)
-        if ok then
-            spawned = spawned + 1
-            state.lastSpawnedEm = result
-        else
-            lastErr = result
-            Log(TAG .. ":   #" .. i .. " failed: " .. tostring(result))
+        for candidateIndex, candidate in ipairs(candidates) do
+            V("spawnEnemy: #%d/%d try=%d ox=%.1f oz=%.1f", i, count, candidateIndex, candidate.ox, candidate.oz)
+            local ok, result = spawnSingle(enemy, candidate.ox, candidate.oz)
+            if ok then
+                spawned = spawned + 1
+                state.lastSpawnedEm = result
+                spawnedThisOne = true
+                break
+            else
+                lastErr = result
+            end
+        end
+
+        if not spawnedThisOne then
+            Log(TAG .. ":   #" .. i .. " failed after " .. #candidates .. " attempts: " .. tostring(lastErr))
         end
     end
 
@@ -799,17 +1046,32 @@ end)
 RegisterCommand("spawn_count", function(args)
     V("cmd:spawn_count args='%s'", tostring(args))
     local n = tonumber(args) or 1
-    state.spawnCount = math.max(1, math.min(5, n))
+    state.spawnCount = clampSpawnCount(n)
     ModConfig.Save("EnemySpawner", state)
     Log(TAG .. ": Count -> " .. state.spawnCount)
 end)
 
 RegisterCommand("spawn_distance", function(args)
     V("cmd:spawn_distance args='%s'", tostring(args))
-    local n = tonumber(args) or 200
-    state.spawnDistance = math.max(50, math.min(2000, n))
+    local n = tonumber(args) or 10
+    state.spawnDistance = clampSpawnDistance(n)
     ModConfig.Save("EnemySpawner", state)
     Log(TAG .. ": Distance -> " .. state.spawnDistance)
+end)
+
+RegisterCommand("spawn_face", function(args)
+    V("cmd:spawn_face args='%s'", tostring(args))
+    local a = (args or ""):lower()
+    if a == "on" or a == "1" or a == "true" then
+        state.facePlayer = true
+    elseif a == "off" or a == "0" or a == "false" then
+        state.facePlayer = false
+    else
+        state.facePlayer = not state.facePlayer
+    end
+    ModConfig.Save("EnemySpawner", state)
+    Log(TAG .. ": Face-player rotation -> " .. tostring(state.facePlayer))
+    Notify(TAG, "Face-player: " .. tostring(state.facePlayer))
 end)
 
 RegisterCommand("spawn_list", function()
@@ -822,10 +1084,12 @@ end)
 
 RegisterCommand("spawner_status", function()
     V("cmd:spawner_status")
-    local info = TAG .. ": v8.0"
+    local info = TAG .. ": v10.1"
         .. " | diff=" .. state.difficulty
         .. " | count=" .. state.spawnCount
         .. " | dist=" .. state.spawnDistance
+        .. " | pawn=" .. (isDebugPawnActive() and "debug" or "player")
+        .. " | face=" .. tostring(state.facePlayer)
         .. " | spawned=" .. state.totalSpawned
         .. " | enemies=" .. #ALL_ENEMIES
         .. " | native=" .. tostring(nativeReady)
@@ -858,9 +1122,11 @@ if SharedAPI then
         getDifficulty  = function() return state.difficulty end,
         setDifficulty  = function(d) if HP_PRESETS[d] then state.difficulty = d end end,
         getSpawnCount  = function() return state.spawnCount end,
-        setSpawnCount  = function(n) state.spawnCount = math.max(1, math.min(10, n)) end,
+        setSpawnCount  = function(n) state.spawnCount = clampSpawnCount(n) end,
         getSpawnDistance = function() return state.spawnDistance end,
-        setSpawnDistance = function(n) state.spawnDistance = math.max(100, math.min(5000, n)) end,
+        setSpawnDistance = function(n) state.spawnDistance = clampSpawnDistance(n) end,
+        getFacePlayer = function() return state.facePlayer end,
+        setFacePlayer = function(v) state.facePlayer = v and true or false end,
     }
 end
 
@@ -888,20 +1154,28 @@ if SharedAPI and SharedAPI.DebugMenu then
                 ModConfig.Save("EnemySpawner", state)
                 api.Refresh()
             end)
-            api.AddItem("Count: " .. state.spawnCount, function()
-                V("DebugMenu: cycling count from %d", state.spawnCount)
-                state.spawnCount = (state.spawnCount % 5) + 1
-                ModConfig.Save("EnemySpawner", state)
+            api.AddItem("Count - (" .. state.spawnCount .. ")", function()
+                V("DebugMenu: decrement count from %d", state.spawnCount)
+                adjustSpawnCount(-1)
                 api.Refresh()
             end)
-            api.AddItem("Distance: " .. state.spawnDistance, function()
-                V("DebugMenu: cycling distance from %d", state.spawnDistance)
-                local dists = {50, 100, 200, 500, 1000, 2000}
-                local cur = 1
-                for i, d in ipairs(dists) do
-                    if d >= state.spawnDistance then cur = i; break end
-                end
-                state.spawnDistance = dists[(cur % #dists) + 1]
+            api.AddItem("Count + (" .. state.spawnCount .. ")", function()
+                V("DebugMenu: increment count from %d", state.spawnCount)
+                adjustSpawnCount(1)
+                api.Refresh()
+            end)
+            api.AddItem("Distance - (" .. state.spawnDistance .. ")", function()
+                V("DebugMenu: decrement distance from %d", state.spawnDistance)
+                adjustSpawnDistance(-10)
+                api.Refresh()
+            end)
+            api.AddItem("Distance + (" .. state.spawnDistance .. ")", function()
+                V("DebugMenu: increment distance from %d", state.spawnDistance)
+                adjustSpawnDistance(10)
+                api.Refresh()
+            end)
+            api.AddItem("Face Player: " .. tostring(state.facePlayer), function()
+                state.facePlayer = not state.facePlayer
                 ModConfig.Save("EnemySpawner", state)
                 api.Refresh()
             end)
@@ -957,9 +1231,11 @@ V("Init: calling initNative (non-fatal)")
 pcall(initNative)
 V("Init: nativeReady=%s", tostring(nativeReady))
 
-Log(TAG .. ": v8.0 loaded — " .. #ALL_ENEMIES .. " enemies, "
+Log(TAG .. ": v10.1 loaded — " .. #ALL_ENEMIES .. " enemies, "
     .. #CATEGORIES .. " categories"
     .. " | EmSetEvent direct spawning"
+    .. " | safer body/debug pawn position + RE4 Y-up axis mapping"
     .. " | diff=" .. state.difficulty
     .. " dist=" .. state.spawnDistance
+    .. " face=" .. tostring(state.facePlayer)
     .. " | native=" .. tostring(nativeReady))

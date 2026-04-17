@@ -7,6 +7,30 @@ local TAG = "HeadBlocker"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 local state = { enabled = true }
 
 local saved = ModConfig.Load("HeadBlocker")
@@ -24,7 +48,7 @@ local destroyed = 0
 local function waitForPlayerThenDestroy(obj)
     V("waitForPlayerThenDestroy called, obj=%s", tostring(obj))
     -- Check if player pawn exists (game is fully initialized)
-    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    local pawn = findFirstNonDefault("VR4GamePlayerPawn")
     if not pawn or not pawn:IsValid() then
         -- Player not ready yet — retry in 200ms
         ExecuteWithDelay(200, function()

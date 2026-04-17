@@ -14,6 +14,30 @@ local TAG = "BossFixes"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 -- ── Boss type IDs ───────────────────────────────────────────────────────
 local BOSS_IDS = {
     [9]  = "Tyrant",       [43] = "El Gigante",
@@ -108,7 +132,7 @@ RegisterCommand("bossfixes_status", function()
     info = info .. " (total=" .. total .. ")"
 
     -- Check player health via UE4SS
-    local pawn = FindFirstOf("VR4Bio4PlayerPawn")
+    local pawn = findFirstNonDefault("VR4Bio4PlayerPawn")
     V("FindFirstOf(VR4Bio4PlayerPawn) = %s", tostring(pawn))
     if pawn and pawn:IsValid() then
         pcall(function()

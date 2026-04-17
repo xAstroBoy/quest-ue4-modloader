@@ -60,6 +60,18 @@
 local MOD_NAME = "DebugMenuAPI"
 local VERSION  = "26.0"
 
+local ipairs   = ipairs
+local math     = math
+local pairs    = pairs
+local pcall    = pcall
+local print    = print
+local rawget   = rawget
+local string   = string
+local table    = table
+local tonumber = tonumber
+local tostring = tostring
+local type     = type
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- STATE
 -- ═══════════════════════════════════════════════════════════════════════
@@ -74,6 +86,7 @@ local initialised    = false
 local _build_page    = nil
 local _refreshing    = false
 local _submenu_name  = nil
+local RegisterBridgeCommand = rawget(_G, "RegisterBridgeCommand")
 
 -- Root page — always exists, items are persistent (static)
 pages[MODS_ROOT_BYTE] = {
@@ -102,6 +115,30 @@ local TAG = "[DebugMenuAPI]"
 local VERBOSE = false
 local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- DEBUGMENU_C ACCESS
 -- ═══════════════════════════════════════════════════════════════════════
@@ -110,7 +147,7 @@ local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)
 local function get_dm()
     if dm_cache and dm_cache:IsValid() then return dm_cache end
     V("get_dm: cache miss, calling FindFirstOf('DebugMenu_C')")
-    local ok, r = pcall(FindFirstOf, "DebugMenu_C")
+    local ok, r = pcall(findFirstNonDefault, "DebugMenu_C")
     if ok and r and r:IsValid() then
         dm_cache = r
         V("get_dm: found %s", tostring(r:GetName()))
@@ -131,6 +168,39 @@ end
 local function get_current_index(dm)
     local ok, v = pcall(function() return dm:Get("CurrentIndex") end)
     return (ok and type(v) == "number") and v or nil
+end
+
+local function get_widgets(dm)
+    local ok, widgets = pcall(function() return dm:Get("ActiveOptionsWidgets") end)
+    if not ok or not widgets then return nil end
+    return widgets
+end
+
+local function get_widget_count(widgets)
+    if not widgets then return 0 end
+    local count = 0
+    pcall(function() count = #widgets end)
+    return count
+end
+
+local function get_widget_at_zero_based(widgets, zero_based_index)
+    if not widgets or type(zero_based_index) ~= "number" or zero_based_index < 0 then
+        return nil
+    end
+
+    local arr_index = zero_based_index + 1
+    local count = get_widget_count(widgets)
+    if arr_index < 1 or arr_index > count then
+        V("widget access OOB: zero_based=%s arr_index=%s count=%s",
+            tostring(zero_based_index), tostring(arr_index), tostring(count))
+        return nil
+    end
+
+    local ok, widget = pcall(function() return widgets[arr_index] end)
+    if not ok or not widget or not widget:IsValid() then
+        return nil
+    end
+    return widget
 end
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -158,11 +228,10 @@ end
 --- Called after Blueprint builds the stock 24-item Main page.
 --- Returns true if "Mods" is now present, false if injection failed.
 local function ensure_mods_option(dm)
-    local ok, widgets = pcall(function() return dm:Get("ActiveOptionsWidgets") end)
-    if not ok or not widgets then V("ensure_mods: no widgets array"); return false end
+    local widgets = get_widgets(dm)
+    if not widgets then V("ensure_mods: no widgets array"); return false end
 
-    local count = 0
-    pcall(function() count = #widgets end)
+    local count = get_widget_count(widgets)
 
     -- Need at least the stock items to be present before injecting
     if count < 10 then
@@ -369,12 +438,11 @@ local function get_selected_option_name(dm)
     local ci = get_current_index(dm)
     if not ci then return nil end
 
-    local ok_w, widgets = pcall(function() return dm:Get("ActiveOptionsWidgets") end)
-    if not ok_w or not widgets then return nil end
+    local widgets = get_widgets(dm)
+    if not widgets then return nil end
 
-    -- TArray is 1-indexed, CurrentIndex is 0-based → widget = arr[ci + 1]
-    local ok_e, widget = pcall(function() return widgets[ci + 1] end)
-    if not ok_e or not widget or not widget:IsValid() then return nil end
+    local widget = get_widget_at_zero_based(widgets, ci)
+    if not widget then return nil end
 
     local ok_n, name = pcall(function() return widget:Get("OptionName") end)
     return ok_n and tostring(name or "") or nil
@@ -413,10 +481,9 @@ local function dispatch_item(dm, page_byte)
         end
         -- Update widget label in-place (works for ALL page types — never ClearWidgets)
         pcall(function()
-            local widgets = dm:Get("ActiveOptionsWidgets")
-            -- ci is 0-based (Back=0, items start at 1), TArray is 1-based
-            local w = widgets[ci + 1]
-            if w and w:IsValid() then
+            local widgets = get_widgets(dm)
+            local w = get_widget_at_zero_based(widgets, ci)
+            if w then
                 w:Set("OptionName", make_display(item))
                 pcall(function() w:Call("Setup") end)
             end
@@ -432,9 +499,9 @@ local function dispatch_item(dm, page_byte)
         end
         -- Update widget label in-place (works for ALL page types — never ClearWidgets)
         pcall(function()
-            local widgets = dm:Get("ActiveOptionsWidgets")
-            local w = widgets[ci + 1]
-            if w and w:IsValid() then
+            local widgets = get_widgets(dm)
+            local w = get_widget_at_zero_based(widgets, ci)
+            if w then
                 w:Set("OptionName", make_display(item))
                 pcall(function() w:Call("Setup") end)
             end
@@ -810,8 +877,15 @@ local function setup_shared_api()
         -- In-place update: walk widgets and update each label
         -- Widget layout: [1]=Back, [2]=items[1], [3]=items[2], ...
         pcall(function()
-            local widgets = dm:Get("ActiveOptionsWidgets")
-            local wcount = #widgets
+            local widgets = get_widgets(dm)
+            if not widgets then
+                V("api.Refresh: widgets=nil — falling back")
+                _refreshing = false
+                refresh_page(dm, am, cursor)
+                return
+            end
+
+            local wcount = get_widget_count(widgets)
             local expected = #page.items + 1  -- +1 for Back
             if wcount ~= expected then
                 V("api.Refresh: widget count mismatch (got %d, expected %d) — falling back", wcount, expected)
@@ -821,9 +895,8 @@ local function setup_shared_api()
                 return
             end
             for i, item in ipairs(page.items) do
-                local wi = i + 1  -- +1 for Back at widget index 1
-                local w = widgets[wi]
-                if w and w:IsValid() then
+                local w = get_widget_at_zero_based(widgets, i)
+                if w then
                     w:Set("OptionName", make_display(item))
                     pcall(function() w:Call("Setup") end)
                 end
@@ -842,7 +915,7 @@ local function setup_shared_api()
     --- the root Mods page.  Returns the page table.
     ---@param page_id   string  Unique page identifier
     ---@param page_name string  Display title
-    ---@return table page handle (pass to AddItemToPage)
+    ---@return table|nil page handle (pass to AddItemToPage)
     function api.AddPage(page_id, page_name)
         local byte = next_page_byte
         next_page_byte = next_page_byte + 1
@@ -880,7 +953,7 @@ local function setup_shared_api()
     ---@param name      string    Display label
     ---@param item_type string    "toggle" | "action" | "selector"
     ---@param opts      table     {getter, setter, callback, options, default_index}
-    ---@return table item handle
+    ---@return table|nil item handle
     function api.AddItemToPage(page, mod_name, name, item_type, opts)
         if not page then Warn("AddItemToPage: nil page"); return nil end
         opts = opts or {}

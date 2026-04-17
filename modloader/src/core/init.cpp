@@ -329,6 +329,8 @@ namespace init
         // ── Deferred AES fallback scan ─────────────────────────────────────
         // Some UE5 builds do not expose FAES::DecryptData symbolically. Run
         // one delayed scan after engine startup to capture candidate keys.
+        // SKIP if we already have keys (hook or pak_key.txt captured them).
+        if (!aes_extractor::has_keys())
         {
             struct timespec ts = {8, 0};
             nanosleep(&ts, nullptr);
@@ -338,6 +340,10 @@ namespace init
 
             std::string aes_dump_path = paths::data_dir() + "/aes_keys.txt";
             aes_extractor::dump_keys_to_file(aes_dump_path);
+        }
+        else
+        {
+            logger::log_info("DEFER", "AES key already available — skipping fallback scan");
         }
 
         // Post SDK notification

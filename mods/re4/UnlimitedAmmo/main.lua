@@ -12,6 +12,12 @@ local TAG = "UnlimitedAmmo"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
 local state = {
     enabled = true,
 }
@@ -140,7 +146,7 @@ RegisterCommand("ammo_status", function()
     if guns then
         info = info .. " | Active guns: " .. #guns
         for i, gun in ipairs(guns) do
-            if gun and gun:IsValid() then
+            if gun and gun:IsValid() and not isDefaultObject(gun) then
                 pcall(function()
                     local wtype = gun:GetWeaponType()
                     local wno = gun:GetWeaponNo()

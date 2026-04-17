@@ -812,8 +812,14 @@ end
 -- The crash guard catches the signal and returns nil.
 -- Uses actual match object GameplayTag structs (not table-constructed) to
 -- correctly handle matches with identical tag names ("MATCH" duplicates).
+--
+-- IMPORTANT STABILITY GUARD:
+-- Repeated SetMatchProgress calls are known to trigger signal-11 recoveries.
+-- Those recoveries can accumulate and lead to a clean engine shutdown.
+-- Keep this disabled by default until a non-crashy write path exists.
 -- ============================================================================
-local CHAMP_BATCH_SIZE = 10  -- matches per poll cycle
+local CHAMP_BATCH_ENABLED = false
+local CHAMP_BATCH_SIZE = 1  -- 1 match per tick — isolate each crash recovery
 
 -- Process one batch of unset matches. Returns (set_count, remaining_count).
 local function process_championship_batch()
@@ -842,8 +848,10 @@ local function process_championship_batch()
             pcall(function()
                 local ml = round:Get("MatchList")
                 if not ml then return end
-                for j, match in ipairs(ml) do
+                for j = 1, #ml do
                     if set_count >= CHAMP_BATCH_SIZE then return end
+                    local match = ml[j]
+                    if not match then goto next_match end
                     local mid = nil
                     pcall(function() mid = match:Get("ID") end)
                     if not mid then goto next_match end
@@ -879,15 +887,18 @@ local function process_championship_batch()
                             pcall(function()
                                 local ml2 = rnd:Get("MatchList")
                                 if ml2 then
-                                    for _, m2 in ipairs(ml2) do
-                                        local mid2 = m2:Get("ID")
-                                        if mid2 then
-                                            local p2 = 0
-                                            pcall(function()
-                                                local mp2 = chm:Call("GetMatchProgress", mid2)
-                                                if mp2 then p2 = mp2.progress end
-                                            end)
-                                            if p2 < 3 then remaining = remaining + 1 end
+                                    for m2_idx = 1, #ml2 do
+                                        local m2 = ml2[m2_idx]
+                                        if m2 then
+                                            local mid2 = m2:Get("ID")
+                                            if mid2 then
+                                                local p2 = 0
+                                                pcall(function()
+                                                    local mp2 = chm:Call("GetMatchProgress", mid2)
+                                                    if mp2 then p2 = mp2.progress end
+                                                end)
+                                                if p2 < 3 then remaining = remaining + 1 end
+                                            end
                                         end
                                     end
                                 end
@@ -971,8 +982,11 @@ local pollCount = 0
 LoopAsync(5000, function()
     pollCount = pollCount + 1
 
-    if pollCount > MAX_POLLS or allDone then
-        if not allDone then Log(TAG .. ": GAVE UP after " .. MAX_POLLS .. " polls") end
+    if allDone then return true end
+
+    -- Poll limit only applies to initial wait phases (A + B + C), not championship batch
+    if pollCount > MAX_POLLS and not champBatchStarted then
+        Log(TAG .. ": GAVE UP after " .. MAX_POLLS .. " polls")
         return true
     end
 
@@ -1116,8 +1130,14 @@ LoopAsync(5000, function()
 
     -- Phase D: Championship batch — SetMatchProgress for ALL 220 matches
     -- Processes CHAMP_BATCH_SIZE (10) matches per poll cycle.
-    -- Each call crashes inside ProcessEvent but data is written before crash.
     if not champBatchDone then
+        if not CHAMP_BATCH_ENABLED then
+            champBatchDone = true
+            state.champ_done = false
+            Log(TAG .. ": Championship batch: DISABLED for stability (known ProcessEvent crash loop)")
+            return false
+        end
+
         if not champBatchStarted then
             champBatchStarted = true
             Log(TAG .. ": Championship batch: starting SetMatchProgress for all matches")

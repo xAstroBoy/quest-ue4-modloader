@@ -1,21 +1,50 @@
--- mods/GodMode/main.lua v7.0
+-- mods/GodMode/main.lua v8.0
 -- ═══════════════════════════════════════════════════════════════════════
--- God Mode — comprehensive invincibility blocking ALL death vectors:
+-- God Mode — Damage prevention ONLY. Does NOT block death sequences.
 --
--- v7.0 — Multi-layer protection:
---   Layer 1: bCanBeDamaged = false on pawn (engine-level block)
---   Layer 2: PreHook BLOCK on Bio4Utils:HurtPlayer/HurtPlayerWithConstDamage
+-- v8.0 — Fix softlock: Removed kill-screen/game-over/stun blocks.
+--   ONLY prevents damage. Death menu, game-over state, and stun
+--   animations are allowed to play through normally. This prevents
+--   softlocks when the player triggers a scripted death or boss kill.
+--
+-- Layers:
+--   Layer 1: bCanBeDamaged = false on pawn (engine-level damage block)
+--   Layer 2: PreHook BLOCK on Bio4Utils:HurtPlayer / HurtPlayerWithConstDamage
 --   Layer 3: PreHook BLOCK on Bio4Utils:HurtAshley (Ashley protection)
---   Layer 4: Block game-over via Bio4:IsGameOver post-hook → false
---   Layer 5: Block VR4DeathMenu from spawning
---   Layer 6: Health clamp — force heal if HP drops to 0
---   Layer 7: Block KillZ volume actor kills
+--   Layer 4: Block KillZ volume actor kills (fall-death protection)
 --
--- Ashley protection is now handled by the separate AshleyArmor mod.
+-- REMOVED (caused softlocks):
+--   - IsGameOver post-hook forcing false
+--   - VR4DeathMenu spawn blocking/destroying
+--   - OnStunnedChanged blocking (prevented grab/stun animations)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "GodMode"
 local VERBOSE = false
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
+
+local function isDefaultObject(obj)
+    if not obj then return false end
+    local ok, name = pcall(function() return obj:GetName() end)
+    return ok and type(name) == "string" and name:sub(1, 9) == "Default__"
+end
+
+local function findFirstNonDefault(className)
+    local first = nil
+    pcall(function() first = FindFirstOf(className) end)
+    if first and first:IsValid() and not isDefaultObject(first) then
+        return first
+    end
+    local all = nil
+    pcall(function() all = FindAllOf(className) end)
+    if all then
+        for _, obj in ipairs(all) do
+            if obj and obj:IsValid() and not isDefaultObject(obj) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
 
 local state = { enabled = true }
 
@@ -47,7 +76,7 @@ end
 local function refreshProtection()
     if not state.enabled then return end
     V("refreshProtection called")
-    local pawn = FindFirstOf("VR4Bio4PlayerPawn")
+    local pawn = findFirstNonDefault("VR4Bio4PlayerPawn")
     if pawn and pawn:IsValid() then
         protectPawn(pawn)
     end
@@ -89,76 +118,20 @@ end)
 
 Log(TAG .. ": PreHook BLOCK — HurtPlayer + HurtPlayerWithConstDamage + HurtAshley")
 
--- ═══════════════════════════════════════════════════════════════════════
--- LAYER 4: Block game-over state
--- ═══════════════════════════════════════════════════════════════════════
-
-RegisterPostHook("/Script/Game.Bio4:IsGameOver", function(self, func, parms)
-    if not state.enabled then return end
-    V("PostHook IsGameOver — forcing false")
-    -- Force return false — game-over never triggers
-    local p = CastParms(parms, "Bio4:IsGameOver")
-    if p then p:SetReturnValue(false) end
-end)
-Log(TAG .. ": RegisterPostHook — Bio4:IsGameOver (force false)")
+-- NOTE: Layers 4-6 from v7.0 REMOVED — they caused softlocks:
+--   Layer 4 (IsGameOver → false): blocked kill screen, game couldn't restart
+--   Layer 5 (VR4DeathMenu destroy): blocked death UI, softlocked on boss kills
+--   Layer 6 (OnStunnedChanged block): prevented grab/stun animations, broke gameplay
+-- Death sequences and game-over MUST be allowed to complete normally.
+-- Damage prevention (Layers 1-3 above) is sufficient for god mode.
 
 -- ═══════════════════════════════════════════════════════════════════════
--- LAYER 5: Block VR4DeathMenu from spawning / auto-exit if it does
--- ═══════════════════════════════════════════════════════════════════════
-
-NotifyOnNewObject("VR4DeathMenu", function(obj)
-    if not state.enabled then return end
-    if not obj or not obj:IsValid() then return end
-    V("NotifyOnNewObject VR4DeathMenu fired, obj=%s", tostring(obj))
-    Log(TAG .. ": VR4DeathMenu spawned — hiding + scheduling destroy + force heal")
-    
-    -- Hide immediately to prevent rendering
-    pcall(function() obj:SetActorHiddenInGame(true) end)
-    
-    -- Emergency heal immediately
-    pcall(function()
-        local utils = StaticFindObject("/Script/Game.Default__Bio4Utils")
-        if utils and utils:IsValid() then
-            utils:HealPlayer()
-        end
-    end)
-    
-    -- Defer destroy by 100ms to avoid tick crash
-    ExecuteWithDelay(100, function()
-        V("VR4DeathMenu deferred destroy executing")
-        if obj and obj:IsValid() then
-            pcall(function() obj:K2_DestroyActor() end)
-            Log(TAG .. ": VR4DeathMenu destroyed (deferred)")
-        end
-    end)
-end)
-Log(TAG .. ": NotifyOnNewObject — VR4DeathMenu (auto-destroy, deferred)")
-
--- ═══════════════════════════════════════════════════════════════════════
--- LAYER 6: Health clamp — periodic check + post-damage heal
--- Catches insta-kill attacks from bosses, KillZ, scripted events
--- ═══════════════════════════════════════════════════════════════════════
-
-RegisterHook("/Script/Game.Bio4Utils:HealPlayer", function(Context)
-    Log(TAG .. ": HealPlayer fired")
-end)
-
--- Monitor stun changes — block death stuns (e.g., neck snap, chain kill)
-RegisterPreHook("/Script/Game.VR4Bio4PlayerPawn:OnStunnedChanged", function(self, func, parms)
-    if not state.enabled then return end
-    V("BLOCK OnStunnedChanged")
-    -- Block all stun state changes that could lead to death animations
-    return "BLOCK"
-end)
-Log(TAG .. ": PreHook BLOCK — OnStunnedChanged (anti-insta-kill stun)")
-
--- ═══════════════════════════════════════════════════════════════════════
--- LAYER 7: Block KillZ volume kills + actor destruction of pawn
+-- LAYER 4: Block KillZ volume kills + actor destruction of pawn
 -- ═══════════════════════════════════════════════════════════════════════
 
 -- Wait for player pawn before destroying KillZ volumes
 local function waitForPlayerThenDestroyKillZ(obj)
-    local pawn = FindFirstOf("VR4GamePlayerPawn")
+    local pawn = findFirstNonDefault("VR4GamePlayerPawn")
     if not pawn or not pawn:IsValid() then
         -- Player not ready — retry in 200ms
         ExecuteWithDelay(200, function()
@@ -243,5 +216,5 @@ if SharedAPI and SharedAPI.DebugMenu then
         function(v) onToggle(v) end)
 end
 
-Log(TAG .. ": v7.0 loaded — 7-layer invincibility (bCanBeDamaged + PreHook"
-    .. " + game-over block + death menu block + stun block + KillZ block)")
+Log(TAG .. ": v8.0 loaded — damage prevention only (bCanBeDamaged + PreHook + KillZ)")
+Log(TAG .. ": Death menu, game-over, and stun animations are NOT blocked (no softlock)")
