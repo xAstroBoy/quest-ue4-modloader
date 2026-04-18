@@ -251,6 +251,15 @@ namespace pe_hook
         // Re-entrancy guard: callbacks may call original ProcessEvent which
         // triggers nested hooked_process_event. Without this guard, nested
         // calls would re-drain recursively → stack overflow.
+        //
+        // CRITICAL: tick_game_thread() and rebuilder::tick() are called INSIDE
+        // the s_draining guard. This ensures that when LoopAsync/delayed action
+        // callbacks call pe_fn() → nested hooked_process_event, the drain is
+        // SKIPPED (s_draining=true), matching the behavior when bridge callbacks
+        // call pe_fn() (bridge runs inside drain, so s_draining is also true).
+        // Without this, nested PE calls from LoopAsync would re-drain the queue,
+        // potentially executing bridge/CallBg items mid-callback and corrupting
+        // the sigsetjmp crash guard's global jmp_buf.
         {
             static thread_local bool s_draining = false;
             static constexpr int MAX_PER_TICK = 16;
@@ -275,15 +284,17 @@ namespace pe_hook
                 {
                     fn();
                 }
+
+                // Tick delayed actions (ExecuteWithDelay, LoopAsync, etc.)
+                // MUST be inside s_draining guard — see comment above.
+                lua_delayed::tick_game_thread();
+
+                // Notify class rebuilder for instance tracking (lightweight check)
+                rebuilder::tick(self, func, parms);
+
                 s_draining = false;
             }
         }
-
-        // Tick delayed actions (ExecuteWithDelay, LoopAsync, etc.)
-        lua_delayed::tick_game_thread();
-
-        // Notify class rebuilder for instance tracking (lightweight check)
-        rebuilder::tick(self, func, parms);
 
         bool blocked = false;
 

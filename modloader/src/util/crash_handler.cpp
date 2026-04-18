@@ -49,6 +49,7 @@ namespace lua_uobject
 {
     extern thread_local volatile int g_in_call_ufunction;
     extern thread_local sigjmp_buf g_call_ufunction_jmp;
+    extern thread_local volatile uintptr_t g_call_ufunction_fault_addr;
 }
 
 // Mod loading crash recovery — defined in mod_loader.cpp
@@ -350,6 +351,7 @@ namespace crash_handler
         // uninitialized state, null pointers, or unsupported parameter combos.
         if (lua_uobject::g_in_call_ufunction)
         {
+            lua_uobject::g_call_ufunction_fault_addr = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
             lua_uobject::g_in_call_ufunction = 0;
             siglongjmp(lua_uobject::g_call_ufunction_jmp, sig);
             // Never reaches here

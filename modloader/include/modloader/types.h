@@ -131,6 +131,11 @@ namespace ue
             static uint32_t v = 0x58;
             return v;
         }
+        inline uint32_t &DESTRUCTOR_LINK_OFF()
+        {
+            static uint32_t v = 0x80; // FProperty* — linked list of props needing destruction
+            return v;
+        }
     }
 
     // ═══ UFunction offsets (runtime-configurable, defaults = RE4 VR) ════════

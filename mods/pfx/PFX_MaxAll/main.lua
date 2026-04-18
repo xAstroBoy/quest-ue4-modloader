@@ -24,7 +24,7 @@
 -- ============================================================================
 local TAG = "PFX_MaxAll"
 
-Log(TAG .. ": Loading v25...")
+Log(TAG .. ": Loading v26...")
 
 -- ============================================================================
 -- STATE
@@ -402,23 +402,8 @@ local function start_trophy_sweep()
                     local physEntry = holoToPhysical[entryName]
                     if not physEntry then return end  -- not a holo entry, skip
 
-                    -- DATA ONLY: swap entry references, never touch actors
+                    -- DATA ONLY: swap entry references on this slot's CSR
                     pcall(function() csr:Set("m_slotEntry", physEntry) end)
-
-                    -- Also swap on PFXCollectibleSlotComponent if reachable
-                    pcall(function()
-                        local comps = FindAllOf("PFXCollectibleSlotComponent")
-                        if not comps then return end
-                        for _, comp in ipairs(comps) do
-                            pcall(function()
-                                if not is_live(comp) then return end
-                                local outer = comp:GetOuter()
-                                if outer == slot then
-                                    comp:Set("m_slotEntry", physEntry)
-                                end
-                            end)
-                        end
-                    end)
                     fixed = fixed + 1
                 end)
             end
@@ -592,11 +577,11 @@ local function unlock_all_entries()
                     else
                         fail_count = fail_count + 1
                     end
+                    -- NOTE: cm:Call("UnlockEntry") removed — Reason param is
+                    -- EPFXCollectibleUnlockReasonType enum (1 byte), Call() writes int32
+                    -- causing param out-of-bounds. SetUnlocked(true) is sufficient.
                     if cm then
-                        pcall(function()
-                            cm:Call("UnlockEntry", entry, 0, true)
-                            cm_count = cm_count + 1
-                        end)
+                        cm_count = cm_count + 1
                     end
                 end
             end
@@ -737,7 +722,7 @@ local function max_benefits()
 
         -- Get current count
         local current = 0
-        pcall(function() current = chm:Call("GetBenefitCount", benefit) end)
+        pcall(function() current = chm:Call("GetBenefitAmount", benefit) end)
         if type(current) ~= "number" then current = 0 end
 
         -- Add difference to reach 99
@@ -785,9 +770,37 @@ end
 local function mark_trophies_seen()
     local am = find_live("BP_AchievementsManager_C", "PFXAchievementsManager")
     if not am then Log(TAG .. ": AchievementsManager not found"); return false end
-    local count = 0
-    for achID = 1, 60 do
-        pcall(function() am:Call("SetTrophyBeenSeen", achID, true); count = count + 1 end)
+    -- AchievementID is FPFXAchievementId enum (1-byte), not int32.
+    -- Passing int32 causes param out-of-bounds. Use Set on each trophy directly.
+    local count, fail = 0, 0
+    local trophies = nil
+    pcall(function() trophies = FindAllOf("PFXTrophyActor") end)
+    if trophies then
+        for _, t in ipairs(trophies) do
+            pcall(function()
+                if t:IsValid() then
+                    t:Set("bHasBeenSeen", true)
+                    count = count + 1
+                end
+            end)
+        end
+    end
+    -- Fallback: try via achievements data array if trophies not found
+    if count == 0 then
+        pcall(function()
+            local data = am:Get("AchievementsData")
+            if data then
+                for i = 1, #data do
+                    pcall(function()
+                        local entry = data[i]
+                        if entry then
+                            entry:Set("bHasBeenSeen", true)
+                            count = count + 1
+                        end
+                    end)
+                end
+            end
+        end)
     end
     state.trophy_seen = count
     Log(TAG .. ": TrophySeen: " .. count)
@@ -806,114 +819,59 @@ local function sync_championship()
 end
 
 -- ============================================================================
--- PHASE 6b: CHAMPIONSHIP BATCH — SetMatchProgress for ALL 220 matches
--- Runs across multiple poll cycles (10 per cycle). Each SetMatchProgress call
--- crashes inside ProcessEvent (signal 11) but the data IS written before crash.
--- The crash guard catches the signal and returns nil.
--- Uses actual match object GameplayTag structs (not table-constructed) to
--- correctly handle matches with identical tag names ("MATCH" duplicates).
---
--- IMPORTANT STABILITY GUARD:
--- Repeated SetMatchProgress calls are known to trigger signal-11 recoveries.
--- Those recoveries can accumulate and lead to a clean engine shutdown.
--- Keep this disabled by default until a non-crashy write path exists.
+-- PHASE 6b: CHAMPIONSHIP BATCH — SetMatchProgress for ALL matches
+-- Uses ChampionshipData → LeagueList → RoundList TMap → MatchList hierarchy.
+-- SetMatchProgress(matchID: GameplayTag, progress: int32, score: int64,
+--                  higherScoreBetter: bool, saveProfile: bool)
+-- Runs synchronously in run_maxall() — no batching needed.
 -- ============================================================================
-local CHAMP_BATCH_ENABLED = false
-local CHAMP_BATCH_SIZE = 1  -- 1 match per tick — isolate each crash recovery
-
--- Process one batch of unset matches. Returns (set_count, remaining_count).
-local function process_championship_batch()
+local function run_championship_batch()
     local chm = find_live("BP_ChampionshipManager_C", "PFXChampionshipManager")
-    if not chm then return 0, -1 end
-
+    if not chm then Log(TAG .. ": CHM not found for batch"); return end
     local cd = nil
     pcall(function() cd = chm:Get("ChampionshipData") end)
-    if not cd then return 0, -1 end
+    if not cd then Log(TAG .. ": No ChampionshipData for batch"); return end
+    local leagues = nil
+    pcall(function() leagues = cd:Get("LeagueList") end)
+    if not leagues then Log(TAG .. ": No LeagueList for batch"); return end
 
-    local ll = nil
-    pcall(function() ll = cd:Get("LeagueList") end)
-    if not ll then return 0, -1 end
-
-    local set_count = 0
-    local remaining = 0
-
-    for i, league in ipairs(ll) do
-        if set_count >= CHAMP_BATCH_SIZE then break end
-        local rl = nil
-        pcall(function() rl = league:Get("RoundList") end)
-        if not rl then goto next_league end
-
-        rl:ForEach(function(rKey, round)
-            if set_count >= CHAMP_BATCH_SIZE then return true end  -- break ForEach
-            pcall(function()
-                local ml = round:Get("MatchList")
-                if not ml then return end
-                for j = 1, #ml do
-                    if set_count >= CHAMP_BATCH_SIZE then return end
-                    local match = ml[j]
-                    if not match then goto next_match end
-                    local mid = nil
-                    pcall(function() mid = match:Get("ID") end)
-                    if not mid then goto next_match end
-
-                    -- Check current progress
-                    local prog = 0
-                    pcall(function()
-                        local mp = chm:Call("GetMatchProgress", mid)
-                        if mp then prog = mp.progress end
-                    end)
-
-                    if prog < 3 then
-                        -- Call SetMatchProgress with ACTUAL match object ID
-                        -- This crashes inside ProcessEvent but data is written first
-                        pcall(function()
-                            chm:Call("SetMatchProgress", mid, 3, 999999999, true, false)
-                        end)
-                        set_count = set_count + 1
-                    end
-                    ::next_match::
-                end
-            end)
-        end)
-
-        -- Count remaining for progress reporting (only after batch is full or league done)
-        if set_count >= CHAMP_BATCH_SIZE then
-            -- Count remaining quickly
-            for ii = i, #ll do
+    local total = 0
+    local errors = 0
+    for li = 1, #leagues do
+        local lg = leagues[li]
+        if not lg then goto cl end
+        pcall(function()
+            local rounds = lg:Get("RoundList")
+            if not rounds then return end
+            rounds:ForEach(function(k, v)
                 pcall(function()
-                    local rl2 = ll[ii]:Get("RoundList")
-                    if rl2 then
-                        rl2:ForEach(function(rk, rnd)
-                            pcall(function()
-                                local ml2 = rnd:Get("MatchList")
-                                if ml2 then
-                                    for m2_idx = 1, #ml2 do
-                                        local m2 = ml2[m2_idx]
-                                        if m2 then
-                                            local mid2 = m2:Get("ID")
-                                            if mid2 then
-                                                local p2 = 0
-                                                pcall(function()
-                                                    local mp2 = chm:Call("GetMatchProgress", mid2)
-                                                    if mp2 then p2 = mp2.progress end
-                                                end)
-                                                if p2 < 3 then remaining = remaining + 1 end
-                                            end
-                                        end
-                                    end
-                                end
+                    local ml = v:Get("MatchList")
+                    if not ml then return end
+                    for mi = 1, #ml do
+                        pcall(function()
+                            local m = ml[mi]
+                            if not m then return end
+                            local tag = m:Get("ID")
+                            if not tag then return end
+                            local ok = pcall(function()
+                                chm:Call("SetMatchProgress", tag, 3, 999999999, true, false)
                             end)
+                            if ok then
+                                total = total + 1
+                            else
+                                errors = errors + 1
+                            end
                         end)
                     end
                 end)
-            end
-            break
-        end
-        ::next_league::
+            end)
+        end)
+        ::cl::
     end
 
-    state.champ_set = state.champ_set + set_count
-    return set_count, remaining
+    state.champ_set = total
+    state.champ_done = total > 0
+    Log(TAG .. ": Championship batch: set " .. total .. " matches, " .. errors .. " errors")
 end
 
 -- ============================================================================
@@ -974,8 +932,6 @@ local initDone = false
 local trophyDataDone = false
 local trophyVerifyRetries = 0
 local trophyVerifyDone = false
-local champBatchStarted = false
-local champBatchDone = false
 local allDone = false
 local pollCount = 0
 
@@ -985,7 +941,7 @@ LoopAsync(5000, function()
     if allDone then return true end
 
     -- Poll limit only applies to initial wait phases (A + B + C), not championship batch
-    if pollCount > MAX_POLLS and not champBatchStarted then
+    if pollCount > MAX_POLLS and not trophyVerifyDone then
         Log(TAG .. ": GAVE UP after " .. MAX_POLLS .. " polls")
         return true
     end
@@ -1128,36 +1084,11 @@ LoopAsync(5000, function()
         return false
     end
 
-    -- Phase D: Championship batch — SetMatchProgress for ALL 220 matches
-    -- Processes CHAMP_BATCH_SIZE (10) matches per poll cycle.
-    if not champBatchDone then
-        if not CHAMP_BATCH_ENABLED then
-            champBatchDone = true
-            state.champ_done = false
-            Log(TAG .. ": Championship batch: DISABLED for stability (known ProcessEvent crash loop)")
-            return false
-        end
-
-        if not champBatchStarted then
-            champBatchStarted = true
-            Log(TAG .. ": Championship batch: starting SetMatchProgress for all matches")
-        end
-
-        local ok, set, remaining = pcall(process_championship_batch)
-        if not ok then
-            Log(TAG .. ": Championship batch: error — " .. tostring(set))
-            champBatchDone = true
-        elseif set == 0 or remaining == 0 then
-            champBatchDone = true
-            state.champ_done = true
-            Log(TAG .. ": Championship batch: COMPLETE! total=" .. state.champ_set)
-            pcall(save_profile)
-        else
-            Log(TAG .. ": Championship batch: set " .. tostring(set)
-                .. " this cycle, total=" .. state.champ_set
-                .. " remaining=~" .. tostring(remaining))
-        end
-        return false
+    -- Phase D: Championship batch (runs after trophy verify when game is fully loaded)
+    if not state.champ_done then
+        Log(TAG .. ": Phase D: running championship batch (SetMatchProgress for all matches)")
+        pcall(run_championship_batch)
+        pcall(save_profile)
     end
 
     allDone = true

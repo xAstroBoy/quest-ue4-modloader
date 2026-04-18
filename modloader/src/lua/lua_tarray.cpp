@@ -15,9 +15,64 @@
 
 #include <cstring>
 #include <vector>
+#include <unordered_set>
+#include <mutex>
 
 namespace lua_tarray
 {
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Owned buffer tracker — lets us realloc our own buffers safely.
+    // First grow from UE-allocated buffer: malloc+copy (leak UE original).
+    // Subsequent grows: realloc our buffer (zero leak, fast).
+    // ═══════════════════════════════════════════════════════════════════════
+    static std::mutex s_owned_mtx;
+    static std::unordered_set<void*> s_owned_buffers;
+
+    static bool is_owned(void* ptr) {
+        std::lock_guard<std::mutex> lk(s_owned_mtx);
+        return s_owned_buffers.count(ptr) > 0;
+    }
+    static void mark_owned(void* ptr) {
+        std::lock_guard<std::mutex> lk(s_owned_mtx);
+        s_owned_buffers.insert(ptr);
+    }
+    static void unmark_owned(void* ptr) {
+        std::lock_guard<std::mutex> lk(s_owned_mtx);
+        s_owned_buffers.erase(ptr);
+    }
+
+    // Grow a buffer: realloc if ours, malloc+copy+leak if UE's.
+    // Returns new buffer (already registered as owned). old_data may be freed.
+    static void* grow_buffer(void* old_data, int32_t old_count, int32_t elem_size, int32_t new_max) {
+        size_t new_bytes = static_cast<size_t>(new_max) * elem_size;
+        size_t old_bytes = static_cast<size_t>(old_count) * elem_size;
+
+        if (old_data && is_owned(old_data)) {
+            // We allocated this — safe to realloc
+            unmark_owned(old_data);
+            void* new_data = realloc(old_data, new_bytes);
+            if (!new_data) {
+                // realloc failed, old buffer still valid
+                mark_owned(old_data);
+                return nullptr;
+            }
+            // Zero the new portion
+            if (new_bytes > old_bytes)
+                std::memset(static_cast<uint8_t*>(new_data) + old_bytes, 0, new_bytes - old_bytes);
+            mark_owned(new_data);
+            return new_data;
+        }
+
+        // UE-allocated — malloc new, copy, leak old
+        void* new_data = malloc(new_bytes);
+        if (!new_data) return nullptr;
+        std::memset(new_data, 0, new_bytes);
+        if (old_data && old_count > 0)
+            std::memcpy(new_data, old_data, old_bytes);
+        mark_owned(new_data);
+        return new_data;
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // UE4 TArray memory layout: { void* Data; int32 ArrayNum; int32 ArrayMax; }
@@ -554,8 +609,7 @@ namespace lua_tarray
             raw->num = 0; },
 
                                     // Add — appends an element to the end of the array.
-                                    // REQUIRES that Num < Max (there must be pre-allocated capacity).
-                                    // For safety, does NOT realloc — UE4 FMemory is not available from Lua.
+                                    // Auto-grows via system malloc when full (old UE buffer leaked).
                                     // Returns the new 1-based index, or 0 on failure.
                                     "Add", [](LuaTArray &self, sol::object value) -> int
                                     {
@@ -564,9 +618,14 @@ namespace lua_tarray
                                         RawTArray *raw = reinterpret_cast<RawTArray *>(self.array_ptr);
                                         if (raw->num >= raw->max)
                                         {
-                                            logger::log_warn("TARRAY", "Add: array full (Num=%d, Max=%d) — cannot append",
-                                                             raw->num, raw->max);
-                                            return 0;
+                                            int32_t new_max = (raw->max < 4) ? 8 : raw->max * 2;
+                                            void* new_data = grow_buffer(raw->data, raw->num, self.element_size, new_max);
+                                            if (!new_data) {
+                                                logger::log_error("TARRAY", "Add: grow failed (max=%d)", new_max);
+                                                return 0;
+                                            }
+                                            raw->data = new_data;
+                                            raw->max = new_max;
                                         }
                                         if (self.element_size <= 0)
                                             return 0;
@@ -585,8 +644,14 @@ namespace lua_tarray
             if (!self.array_ptr) return 0;
             RawTArray* raw = reinterpret_cast<RawTArray*>(self.array_ptr);
             if (raw->num >= raw->max) {
-                logger::log_warn("TARRAY", "AddFName: array full (Num=%d, Max=%d)", raw->num, raw->max);
-                return 0;
+                int32_t new_max = (raw->max < 4) ? 8 : raw->max * 2;
+                void* new_data = grow_buffer(raw->data, raw->num, self.element_size, new_max);
+                if (!new_data) {
+                    logger::log_error("TARRAY", "AddFName: grow failed (max=%d)", new_max);
+                    return 0;
+                }
+                raw->data = new_data;
+                raw->max = new_max;
             }
             // FName is 8 bytes: { int32 ComparisonIndex, int32 Number }
             if (self.element_size < 8 && self.element_size != 4) {
@@ -651,8 +716,14 @@ namespace lua_tarray
             if (!self.array_ptr || !self.inner_prop || self.element_size <= 0) return false;
             RawTArray* raw = reinterpret_cast<RawTArray*>(self.array_ptr);
             if (raw->num >= raw->max) {
-                logger::log_warn("TARRAY", "Insert: array full (Num=%d, Max=%d)", raw->num, raw->max);
-                return false;
+                int32_t new_max = (raw->max < 4) ? 8 : raw->max * 2;
+                void* new_data = grow_buffer(raw->data, raw->num, self.element_size, new_max);
+                if (!new_data) {
+                    logger::log_error("TARRAY", "Insert: grow failed (max=%d)", new_max);
+                    return false;
+                }
+                raw->data = new_data;
+                raw->max = new_max;
             }
             int idx = index - 1;
             if (idx < 0 || idx > raw->num) {
@@ -1335,7 +1406,238 @@ namespace lua_tarray
             int32_t array_num = *reinterpret_cast<const int32_t*>(b + 8);
             int32_t num_free  = *reinterpret_cast<const int32_t*>(b + 52);
             if (num_free < 0 || num_free > array_num) num_free = 0;
-            return (array_num - num_free) <= 0; });
+            return (array_num - num_free) <= 0; },
+
+                                  // ═══════════════════════════════════════════════════════
+                                  // MUTATION OPERATIONS
+                                  // ═══════════════════════════════════════════════════════
+
+                                  // ── Clear — reset map to empty (zero entries, keep buffer) ─
+                                  "Clear", [](LuaTMap &self)
+                                  {
+            if (!self.map_ptr) return;
+            uint8_t* b = reinterpret_cast<uint8_t*>(self.map_ptr);
+            int32_t array_num = *reinterpret_cast<const int32_t*>(b + 8);
+
+            // Zero all element data if buffer exists
+            void* data = *reinterpret_cast<void**>(b);
+            if (data && array_num > 0 && self.entry_stride > 0) {
+                std::memset(data, 0, array_num * self.entry_stride);
+            }
+
+            // Reset sparse array counts
+            *reinterpret_cast<int32_t*>(b + 8)  = 0;  // ArrayNum = 0
+            // ArrayMax stays (keep buffer capacity)
+            // Zero allocation bits (TBitArray inline data, 16 bytes at offset 16)
+            std::memset(b + 16, 0, 16);
+            // NumBits = 0, MaxBits stays
+            *reinterpret_cast<int32_t*>(b + 40) = 0;  // NumBits = 0
+            *reinterpret_cast<int32_t*>(b + 48) = -1;  // FirstFreeIndex = -1
+            *reinterpret_cast<int32_t*>(b + 52) = 0;   // NumFreeIndices = 0
+
+            // Zero hash table (starts at offset 56 in FScriptSet)
+            // Hash is a TBitArray-like: InlineData[16] + ptr(8) + NumBits(4) + MaxBits(4) = 32 bytes
+            // Then int32 HashSize at offset 88
+            std::memset(b + 56, 0, 32); // zero hash allocation bits
+            *reinterpret_cast<int32_t*>(b + 88) = 0; // HashSize = 0
+
+            logger::log_info("TMAP", "Clear: map zeroed"); },
+
+                                  // ── Remove — remove entry by key (add to free list) ──────
+                                  // Returns true if found and removed.
+                                  "Remove", [](sol::this_state ts, LuaTMap &self, sol::object key_lua) -> bool
+                                  {
+            sol::state_view lua(ts);
+            if (!self.map_ptr || !self.key_prop) return false;
+            if (self.key_size <= 0 || self.entry_stride <= 0) return false;
+
+            uint8_t* sparse_base = reinterpret_cast<uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void**>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<const int32_t*>(sparse_base + 8);
+            int32_t first_free   = *reinterpret_cast<const int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<const int32_t*>(sparse_base + 52);
+
+            if (!data || array_num <= 0) return false;
+            if (num_free_idx < 0) num_free_idx = 0;
+            int32_t num_valid = array_num - num_free_idx;
+            if (num_valid <= 0) return false;
+
+            // Build free set
+            std::vector<bool> is_free(array_num, false);
+            if (first_free >= 0 && num_free_idx > 0) {
+                int32_t idx = first_free;
+                int32_t safety = num_free_idx + 1;
+                while (idx >= 0 && idx < array_num && safety-- > 0) {
+                    is_free[idx] = true;
+                    const uint8_t* slot = reinterpret_cast<const uint8_t*>(data) + idx * self.entry_stride;
+                    idx = *reinterpret_cast<const int32_t*>(slot + 4);
+                }
+            }
+
+            // Convert target key to string
+            std::string target_key;
+            if (key_lua.is<lua_types::LuaFName>()) target_key = key_lua.as<lua_types::LuaFName&>().to_string();
+            else if (key_lua.is<std::string>()) target_key = key_lua.as<std::string>();
+            else if (key_lua.is<int>()) target_key = std::to_string(key_lua.as<int>());
+            else if (key_lua.is<double>()) target_key = std::to_string(static_cast<int64_t>(key_lua.as<double>()));
+            else return false;
+
+            // Linear scan for key
+            int32_t visited = 0;
+            for (int32_t i = 0; i < array_num && visited < num_valid; i++) {
+                if (is_free[i]) continue;
+
+                uint8_t* entry = reinterpret_cast<uint8_t*>(data) + i * self.entry_stride;
+                const uint8_t* key_ptr = entry + self.key_offset;
+                if (!ue::is_mapped_ptr(key_ptr)) { visited++; continue; }
+
+                sol::object key_obj = read_element(lua, key_ptr, self.key_prop);
+                std::string key_str;
+                if (key_obj.is<lua_types::LuaFName>()) key_str = key_obj.as<lua_types::LuaFName&>().to_string();
+                else if (key_obj.is<std::string>()) key_str = key_obj.as<std::string>();
+                else if (key_obj.is<lua_types::LuaFString>()) key_str = key_obj.as<lua_types::LuaFString&>().to_string();
+                else if (key_obj.is<int>()) key_str = std::to_string(key_obj.as<int>());
+                else if (key_obj.is<double>()) key_str = std::to_string(static_cast<int64_t>(key_obj.as<double>()));
+
+                if (key_str == target_key) {
+                    // Found it — add to free list
+                    // Free element layout: { int32 PrevFreeIndex, int32 NextFreeIndex }
+                    // Zero the entry first
+                    std::memset(entry, 0, self.entry_stride);
+                    // Link into free list: prev = -1 (head), next = old first_free
+                    *reinterpret_cast<int32_t*>(entry + 0) = -1;             // PrevFreeIndex
+                    *reinterpret_cast<int32_t*>(entry + 4) = first_free;     // NextFreeIndex = old head
+
+                    // Update old head's PrevFreeIndex to point to us
+                    if (first_free >= 0 && first_free < array_num) {
+                        uint8_t* old_head = reinterpret_cast<uint8_t*>(data) + first_free * self.entry_stride;
+                        *reinterpret_cast<int32_t*>(old_head + 0) = i;       // PrevFreeIndex = our index
+                    }
+
+                    // Update sparse array header
+                    *reinterpret_cast<int32_t*>(sparse_base + 48) = i;       // FirstFreeIndex = this slot
+                    *reinterpret_cast<int32_t*>(sparse_base + 52) = num_free_idx + 1; // NumFreeIndices++
+
+                    // Clear allocation bit for this index
+                    // TBitArray inline data at offset 16, each uint32 holds 32 bits
+                    int32_t word = i / 32;
+                    int32_t bit  = i % 32;
+                    if (word < 4) { // inline storage (4 uint32s = 128 bits)
+                        uint32_t* bits = reinterpret_cast<uint32_t*>(sparse_base + 16);
+                        bits[word] &= ~(1u << bit);
+                    }
+
+                    logger::log_info("TMAP", "Remove: '%s' removed at slot %d", target_key.c_str(), i);
+                    return true;
+                }
+                visited++;
+            }
+
+            logger::log_warn("TMAP", "Remove: key '%s' not found", target_key.c_str());
+            return false; },
+
+                                  // ── Add — insert a new key-value pair into the map ───────
+                                  // Uses free list slot if available, otherwise appends if capacity allows.
+                                  // REQUIRES pre-allocated capacity (ArrayNum < ArrayMax) when no free slots.
+                                  // Does NOT update hash table — Lua-side lookups use linear scan.
+                                  // Returns true if added successfully.
+                                  "Add", [](sol::this_state ts, LuaTMap &self, sol::object key_lua, sol::object value_lua) -> bool
+                                  {
+            sol::state_view lua(ts);
+            if (!self.map_ptr || !self.key_prop || !self.value_prop) return false;
+            if (self.key_size <= 0 || self.value_size <= 0 || self.entry_stride <= 0) return false;
+
+            uint8_t* sparse_base = reinterpret_cast<uint8_t*>(self.map_ptr);
+            void* data = *reinterpret_cast<void**>(sparse_base);
+            int32_t array_num    = *reinterpret_cast<int32_t*>(sparse_base + 8);
+            int32_t array_max    = *reinterpret_cast<int32_t*>(sparse_base + 12);
+            int32_t first_free   = *reinterpret_cast<int32_t*>(sparse_base + 48);
+            int32_t num_free_idx = *reinterpret_cast<int32_t*>(sparse_base + 52);
+            if (num_free_idx < 0) num_free_idx = 0;
+
+            int32_t slot = -1;
+
+            if (num_free_idx > 0 && first_free >= 0 && first_free < array_num) {
+                // Reuse a free slot
+                slot = first_free;
+                uint8_t* entry = reinterpret_cast<uint8_t*>(data) + slot * self.entry_stride;
+
+                // Read NextFreeIndex before we overwrite
+                int32_t next_free = *reinterpret_cast<int32_t*>(entry + 4);
+
+                // Update head of free list
+                *reinterpret_cast<int32_t*>(sparse_base + 48) = next_free; // FirstFreeIndex
+                *reinterpret_cast<int32_t*>(sparse_base + 52) = num_free_idx - 1;
+
+                // If next_free is valid, clear its PrevFreeIndex
+                if (next_free >= 0 && next_free < array_num) {
+                    uint8_t* next_entry = reinterpret_cast<uint8_t*>(data) + next_free * self.entry_stride;
+                    *reinterpret_cast<int32_t*>(next_entry + 0) = -1; // PrevFreeIndex = -1 (new head)
+                }
+
+                logger::log_info("TMAP", "Add: reusing free slot %d (remaining free=%d)", slot, num_free_idx - 1);
+            }
+            else if (data && array_num < array_max) {
+                // Append to end — there's capacity
+                slot = array_num;
+                *reinterpret_cast<int32_t*>(sparse_base + 8) = array_num + 1; // ArrayNum++
+
+                // Set allocation bit
+                int32_t word = slot / 32;
+                int32_t bit  = slot % 32;
+                if (word < 4) {
+                    uint32_t* bits = reinterpret_cast<uint32_t*>(sparse_base + 16);
+                    bits[word] |= (1u << bit);
+                }
+                // Update NumBits if needed
+                int32_t num_bits = *reinterpret_cast<int32_t*>(sparse_base + 40);
+                if (slot >= num_bits) {
+                    *reinterpret_cast<int32_t*>(sparse_base + 40) = slot + 1;
+                }
+
+                logger::log_info("TMAP", "Add: appending at slot %d (num=%d, max=%d)", slot, array_num + 1, array_max);
+            }
+            else {
+                // Auto-grow sparse array
+                int32_t new_max = (array_max < 4) ? 8 : array_max * 2;
+                void* new_data = grow_buffer(data, array_num, self.entry_stride, new_max);
+                if (!new_data) {
+                    logger::log_error("TMAP", "Add: grow failed (max=%d)", new_max);
+                    return false;
+                }
+                // Update sparse array header
+                *reinterpret_cast<void**>(sparse_base) = new_data;          // Data ptr
+                *reinterpret_cast<int32_t*>(sparse_base + 12) = new_max;    // ArrayMax
+                data = new_data;
+
+                // Now append at end
+                slot = array_num;
+                *reinterpret_cast<int32_t*>(sparse_base + 8) = array_num + 1; // ArrayNum++
+
+                // Set allocation bit
+                int32_t word = slot / 32;
+                int32_t bit  = slot % 32;
+                if (word < 4) {
+                    uint32_t* bits = reinterpret_cast<uint32_t*>(sparse_base + 16);
+                    bits[word] |= (1u << bit);
+                }
+                int32_t num_bits = *reinterpret_cast<int32_t*>(sparse_base + 40);
+                if (slot >= num_bits) {
+                    *reinterpret_cast<int32_t*>(sparse_base + 40) = slot + 1;
+                }
+
+                logger::log_info("TMAP", "Add: grew buffer to max=%d, appending at slot %d (leaked old)",
+                                 new_max, slot);
+            }
+
+            // Zero the slot and write key + value
+            uint8_t* entry = reinterpret_cast<uint8_t*>(data) + slot * self.entry_stride;
+            std::memset(entry, 0, self.entry_stride);
+            write_element(entry + self.key_offset, self.key_prop, key_lua);
+            write_element(entry + self.value_offset, self.value_prop, value_lua);
+
+            logger::log_info("TMAP", "Add: key+value written at slot %d", slot);
+            return true; });
     }
 
     // ═══════════════════════════════════════════════════════════════════════

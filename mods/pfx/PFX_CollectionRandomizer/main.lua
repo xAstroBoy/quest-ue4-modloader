@@ -25,7 +25,7 @@
 --     the new randomized entry (replace even when slot already occupied).
 --
 local TAG = "PFX_Randomizer"
-Log(TAG .. ": Loading v27...")
+Log(TAG .. ": Loading v28...")
 
 -- ============================================================================
 -- CATEGORY CONSTANTS
@@ -259,10 +259,18 @@ local ENTRY_CLASSES = {
 local entryPool = {}   -- catID -> { entry UObject, ... }
 local poolReady = false
 
--- Pre-filtered pools for table cosmetics (only entries with valid meshes/objects)
-local ballPoolValid = {}   -- entries with non-nil ballskin mesh
-local trailPoolValid = {}  -- entries with non-nil BallTrail
-local flipperPoolAll = {}  -- all flipper entries (pass entry directly)
+-- Pre-filtered pools for table cosmetics grouped by IP
+-- ALL ball/trail/flipper entries are IP-locked (zero global)
+-- Tags: Collectibles.IP.<IP>.<TableHint>.<ItemName>
+local ballByIP = {}    -- IP -> { {entry=, mesh=}, ... }
+local trailByIP = {}   -- IP -> { {entry=, trail=}, ... }
+local flipperByIP = {} -- IP -> { entry, ... }
+local tableHintToIP = {}  -- lowercase table hint -> IP (e.g. "doom" -> "Bethesda")
+-- Legacy totals for logging
+local ballPoolValid = {}
+local trailPoolValid = {}
+local flipperPoolAll = {}
+local pendingFlipperOverrides = {}
 
 local stats = {
     hook_ok = 0, hook_skip = 0, hook_err = 0,
@@ -272,8 +280,23 @@ local stats = {
     empty_filled = 0,
 }
 
+local function extract_ip_from_tag(tagStr)
+    -- Tag format: Collectibles.IP.<IP>.<TableHint>.<ItemName>
+    if not tagStr or tagStr == "" then return nil, nil end
+    local parts = {}
+    for p in tagStr:gmatch("[^.]+") do parts[#parts + 1] = p end
+    if #parts >= 4 and parts[2] == "IP" then
+        return parts[3], parts[4]  -- IP, tableHint
+    end
+    return nil, nil
+end
+
 local function build_entry_pool()
     entryPool = {}
+    ballByIP = {}
+    trailByIP = {}
+    flipperByIP = {}
+    tableHintToIP = {}
     ballPoolValid = {}
     trailPoolValid = {}
     flipperPoolAll = {}
@@ -291,8 +314,19 @@ local function build_entry_pool()
                     if is_live(entry) then
                         pcall(function()
                             local catID = get_category_id(entry)
-                            local entryName = name_of(entry)
                             local key = entry_key(entry)
+
+                            -- Extract tag for IP classification
+                            local tagStr = ""
+                            pcall(function()
+                                local tag = entry:Call("GetEntryID")
+                                if tag then
+                                    local tn = nil
+                                    pcall(function() tn = tag.TagName end)
+                                    if tn then tagStr = tostring(tn) end
+                                end
+                            end)
+                            local ip, hint = extract_ip_from_tag(tagStr)
 
                             if catID and not SKIP_CATEGORIES[catID] then
                                 if not entryPool[catID] then entryPool[catID] = {} end
@@ -304,25 +338,43 @@ local function build_entry_pool()
                                 end
                             end
 
-                            -- Build pre-filtered table cosmetics pools
+                            -- Build IP-grouped table cosmetics pools
+                            if ip and hint then
+                                tableHintToIP[hint:lower()] = ip
+                            end
+
                             if catID == 10 then  -- BallSkin
                                 local mesh = nil
                                 pcall(function() mesh = entry:Get("ballskin") end)
                                 if mesh and key ~= "" and not seenBall[key] then
                                     seenBall[key] = true
-                                    ballPoolValid[#ballPoolValid + 1] = { entry = entry, mesh = mesh }
+                                    local item = { entry = entry, mesh = mesh }
+                                    ballPoolValid[#ballPoolValid + 1] = item
+                                    if ip then
+                                        if not ballByIP[ip] then ballByIP[ip] = {} end
+                                        ballByIP[ip][#ballByIP[ip] + 1] = item
+                                    end
                                 end
                             elseif catID == 11 then  -- BallTrail
                                 local trail = nil
                                 pcall(function() trail = entry:Get("BallTrail") end)
                                 if trail and key ~= "" and not seenTrail[key] then
                                     seenTrail[key] = true
-                                    trailPoolValid[#trailPoolValid + 1] = { entry = entry, trail = trail }
+                                    local item = { entry = entry, trail = trail }
+                                    trailPoolValid[#trailPoolValid + 1] = item
+                                    if ip then
+                                        if not trailByIP[ip] then trailByIP[ip] = {} end
+                                        trailByIP[ip][#trailByIP[ip] + 1] = item
+                                    end
                                 end
                             elseif catID == 9 then  -- FlipperArm
                                 if key ~= "" and not seenFlipper[key] then
                                     seenFlipper[key] = true
                                     flipperPoolAll[#flipperPoolAll + 1] = entry
+                                    if ip then
+                                        if not flipperByIP[ip] then flipperByIP[ip] = {} end
+                                        flipperByIP[ip][#flipperByIP[ip] + 1] = entry
+                                    end
                                 end
                             end
                         end)
@@ -339,8 +391,21 @@ local function build_entry_pool()
         Log(TAG .. ":   " .. (CATEGORY_NAMES[catID] or ("Cat" .. catID))
             .. ": " .. #items .. " entries")
     end
+    -- Log IP pool sizes
+    local ipList = {}
+    for ip, items in pairs(flipperByIP) do
+        ipList[#ipList + 1] = ip .. "=" .. #items
+    end
+    table.sort(ipList)
     Log(TAG .. ": Pool: " .. total .. " entries | BallValid=" .. #ballPoolValid
         .. " TrailValid=" .. #trailPoolValid .. " Flipper=" .. #flipperPoolAll)
+    Log(TAG .. ": FlipperByIP: " .. table.concat(ipList, ", "))
+    Log(TAG .. ": TableHints: " .. (function()
+        local out = {}
+        for h, ip in pairs(tableHintToIP) do out[#out+1] = h .. "->" .. ip end
+        table.sort(out)
+        return table.concat(out, ", ")
+    end)())
     return poolReady
 end
 
@@ -420,30 +485,15 @@ end
 local function swap_slot_entry(slot, newEntry)
     if not slot or not newEntry then return false end
 
-    local catID = get_category_id(newEntry)
-    local strictReplace = (catID and STRICT_REPLACE_CATEGORIES[catID]) and true or false
-
     local previousEntry = nil
     pcall(function() previousEntry = slot:Get("m_slotEntry") end)
     local hadPrevious = previousEntry and is_live(previousEntry)
 
     local ok = false
 
-    if strictReplace and hadPrevious then
-        if has_function(slot, "RemovePreviousCollectible") then
-            pcall(function() slot:Call("RemovePreviousCollectible", true) end)
-        end
-        if has_function(slot, "DestroyPreviousCollectible") then
-            pcall(function() slot:Call("DestroyPreviousCollectible", true) end)
-        end
-        if has_function(slot, "ClearSlot") then
-            pcall(function() slot:Call("ClearSlot") end)
-        end
-        if has_function(slot, "ResetSlotEntry") then
-            pcall(function() slot:Call("ResetSlotEntry") end)
-        end
-        pcall(function() slot:Set("m_slotEntry", nil) end)
-    end
+    -- For strict-replace categories (Gadget, Statue): assign new entry FIRST,
+    -- only destroy the old collectible AFTER confirming the swap succeeded.
+    -- This prevents leaving empty slots when the swap fails.
 
     if has_function(slot, "ChangeSlotEntry") then
         local changed = false
@@ -481,7 +531,8 @@ local function swap_slot_entry(slot, newEntry)
         end
     end
 
-    if not ok and strictReplace and hadPrevious then
+    if not ok and hadPrevious then
+        -- Swap failed — leave old entry in place, don't destroy anything
         pcall(function()
             if has_function(slot, "ChangeSlotEntry") then
                 slot:Call("ChangeSlotEntry", previousEntry, true)
@@ -500,6 +551,7 @@ local function swap_slot_entry(slot, newEntry)
                 slot:Call("FinalizeEntrySetup", previousEntry)
             end
         end)
+        return false
     end
 
     pcall(function() slot:Call("OnSlotEntryChanged", newEntry) end)
@@ -813,14 +865,26 @@ local hook_used_by_category = {}
 Log(TAG .. ": Hook: RestoreSlotEntryFromProfile auto-scramble disabled in v25 for stability")
 
 -- ============================================================================
--- PER-TABLE COSMETICS — Ball + Trail + Flippers
+-- PER-TABLE COSMETICS — Ball + Trail + Flippers (IP-MATCHED)
 -- ============================================================================
--- v18 Fixes:
---   Ball:    Use pre-filtered ballPoolValid (skip nil ballskin entries)
---   Trail:   Use pre-filtered trailPoolValid (skip nil BallTrail entries)
---   Flipper: Pass entry object directly as armSkinData param (bridge verified!)
---            v17 used {OverrideMaterials=mats} which failed with type 23 TArray
+-- v28 Fix: ALL ball/trail/flipper entries are IP-locked (table-specific).
+-- Each table only gets cosmetics from its own IP group.
+-- Table→IP mapping is built from entry tags + bundle name matching.
 -- ============================================================================
+
+-- Resolve table ID to IP by matching bundle name against tableHintToIP map
+local function resolve_table_ip(bundleKey)
+    if not bundleKey or bundleKey == "" then return nil end
+    local bk = bundleKey:lower()
+    -- Try matching each known table hint in the bundle key
+    for hint, ip in pairs(tableHintToIP) do
+        if bk:find(hint, 1, true) then
+            return ip
+        end
+    end
+    return nil
+end
+
 local function scramble_table_cosmetics()
     local tcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
     if not tcm then
@@ -861,21 +925,22 @@ local function scramble_table_cosmetics()
         return 0
     end
 
-    local ballOk, trailOk, flipperOk, failed = 0, 0, 0, 0
+    local ballOk, trailOk, flipperOk, flipperFail, failed, noIP = 0, 0, 0, 0, 0, 0
     local tableCount = 0
 
-    local ballCycle = make_cycle_state(ballPoolValid, function(v) return entry_key(v.entry) end)
-    local trailCycle = make_cycle_state(trailPoolValid, function(v) return entry_key(v.entry) end)
-    local flipperCycle = make_cycle_state(flipperPoolAll, entry_key)
+    -- Build per-IP cycles lazily
+    local ballCycleByIP = {}
+    local trailCycleByIP = {}
+    local flipperCycleByIP = {}
 
-    local tableIDs = {}
+    local tableEntries = {}
     local seenTableID = {}
 
     bnm:ForEach(function(k, bundle)
         local tableID = nil
+        local bundleKey = tostring(k)
 
-        local key = tostring(k)
-        local num = key:match("^(%d+)_")
+        local num = bundleKey:match("^(%d+)_")
         if num then
             tableID = tonumber(num)
         end
@@ -892,19 +957,30 @@ local function scramble_table_cosmetics()
 
         if type(tableID) == "number" and tableID > 0 and not seenTableID[tableID] then
             seenTableID[tableID] = true
-            tableIDs[#tableIDs + 1] = tableID
+            tableEntries[#tableEntries + 1] = { tableID = tableID, bundleKey = bundleKey }
         end
     end)
 
-    table.sort(tableIDs)
+    table.sort(tableEntries, function(a, b) return a.tableID < b.tableID end)
 
-    for _, tableID in ipairs(tableIDs) do
+    for _, te in ipairs(tableEntries) do
+        local tableID = te.tableID
+        local ip = resolve_table_ip(te.bundleKey)
         tableCount = tableCount + 1
 
-        -- Apply random BallSkin (pre-filtered: all have valid ballskin mesh)
-        if #ballPoolValid > 0 then
+        if not ip then
+            noIP = noIP + 1
+            goto next_table
+        end
+
+        -- Apply random BallSkin from this table's IP pool
+        local bpool = ballByIP[ip]
+        if bpool and #bpool > 0 then
+            if not ballCycleByIP[ip] then
+                ballCycleByIP[ip] = make_cycle_state(bpool, function(v) return entry_key(v.entry) end)
+            end
             pcall(function()
-                local pick = take_from_cycle(ballCycle, nil)
+                local pick = take_from_cycle(ballCycleByIP[ip], nil)
                 if pick then
                     local ok = pcall(function()
                         tcm:Call("SetTableBallMeshOverride", tableID, pick.mesh, pick.entry)
@@ -916,10 +992,14 @@ local function scramble_table_cosmetics()
             end)
         end
 
-        -- Apply random BallTrail (pre-filtered: all have valid BallTrail object)
-        if #trailPoolValid > 0 then
+        -- Apply random BallTrail from this table's IP pool
+        local tpool = trailByIP[ip]
+        if tpool and #tpool > 0 then
+            if not trailCycleByIP[ip] then
+                trailCycleByIP[ip] = make_cycle_state(tpool, function(v) return entry_key(v.entry) end)
+            end
             pcall(function()
-                local pick = take_from_cycle(trailCycle, nil)
+                local pick = take_from_cycle(trailCycleByIP[ip], nil)
                 if pick then
                     local ok = pcall(function()
                         tcm:Call("SetTableBallTrailOverride", tableID, pick.trail, pick.entry)
@@ -931,47 +1011,86 @@ local function scramble_table_cosmetics()
             end)
         end
 
-        -- Apply random FlipperArm — pass entry DIRECTLY as armSkinData param
-        -- SetTableArmSkinOverride expects PFXTableCustomizationArmSkinData struct.
-        -- We fill it from entry.OverrideMaterials.
-        if #flipperPoolAll > 0 then
-            pcall(function()
-                local entry = take_from_cycle(flipperCycle, nil)
-                if entry then
-                    local mats = nil
-                    pcall(function() mats = entry:Get("OverrideMaterials") end)
-                    if not mats then
-                        failed = failed + 1
-                        return
-                    end
-
-                    local ok = pcall(function()
-                        tcm:Call("SetTableArmSkinOverride", tableID, { OverrideMaterials = mats }, entry)
-                    end)
-                    if ok then flipperOk = flipperOk + 1 else failed = failed + 1 end
+        -- Queue flipper arm override for staggered execution (avoid rapid-fire SIGSEGV)
+        local fpool = flipperByIP[ip]
+        if fpool and #fpool > 0 then
+            if not flipperCycleByIP[ip] then
+                flipperCycleByIP[ip] = make_cycle_state(fpool, entry_key)
+            end
+            local pick = take_from_cycle(flipperCycleByIP[ip], nil)
+            if pick then
+                local fmats = nil
+                pcall(function() fmats = pick:Get("OverrideMaterials") end)
+                if fmats and #fmats > 0 then
+                    table.insert(pendingFlipperOverrides, {
+                        tableID = tableID,
+                        pick = pick,
+                    })
+                    flipperOk = flipperOk + 1  -- count as queued
                 else
-                    failed = failed + 1
+                    flipperOk = flipperOk + 1  -- no mats, skip
                 end
-            end)
+            end
         end
+
+        ::next_table::
     end
 
     stats.table_ball = ballOk
     stats.table_trail = trailOk
     stats.table_flipper = flipperOk
     stats.table_fail = failed
-    Log(TAG .. ": Table cosmetics: " .. tableCount .. " tables"
-        .. " | ball=" .. ballOk .. "/" .. #ballPoolValid
-        .. " trail=" .. trailOk .. "/" .. #trailPoolValid
-        .. " flipper=" .. flipperOk .. "/" .. #flipperPoolAll
+    Log(TAG .. ": Table cosmetics: " .. tableCount .. " tables (noIP=" .. noIP .. ")"
+        .. " | ball=" .. ballOk
+        .. " trail=" .. trailOk
+        .. " flipper=" .. flipperOk .. "/" .. (flipperOk + flipperFail)
         .. (failed > 0 and (" FAIL=" .. failed) or ""))
-    return ballOk + trailOk + flipperOk
+    return ballOk + trailOk
+end
+
+-- Deferred flipper arm application — staggered with delays to avoid rapid SIGSEGV
+local function apply_pending_flipper_overrides()
+    if #pendingFlipperOverrides == 0 then return end
+    local tcm = find_live("BP_TableCustomizationManager_C", "PFXTableCustomizationManager")
+    if not tcm then return end
+    local total = #pendingFlipperOverrides
+    local ok_count, fail_count = 0, 0
+    local DELAY_MS = 300  -- 300ms between each call
+
+    Log(TAG .. ": Starting staggered flipper overrides: " .. total .. " calls, " .. DELAY_MS .. "ms apart")
+
+    for i, pf in ipairs(pendingFlipperOverrides) do
+        ExecuteWithDelay(DELAY_MS * (i - 1), function()
+            local name = "?"
+            pcall(function() name = pf.pick:GetName() end)
+            local mats = nil
+            pcall(function() mats = pf.pick:Get("OverrideMaterials") end)
+            if mats and #mats > 0 then
+                local ok = pcall(function()
+                    tcm:Call("SetTableArmSkinOverride", pf.tableID,
+                             { OverrideMaterials = mats }, pf.pick)
+                end)
+                Log(TAG .. ": Flipper " .. i .. "/" .. total .. " tbl=" .. pf.tableID
+                    .. " entry=" .. name .. " ok=" .. tostring(ok))
+            else
+                Log(TAG .. ": Flipper " .. i .. "/" .. total .. " tbl=" .. pf.tableID
+                    .. " entry=" .. name .. " NO MATS (skipped)")
+            end
+        end)
+    end
+
+    -- Schedule final summary after all calls complete
+    ExecuteWithDelay(DELAY_MS * total + 500, function()
+        Log(TAG .. ": Staggered flipper overrides complete (" .. total .. " scheduled)")
+    end)
+
+    pendingFlipperOverrides = {}
 end
 
 -- ============================================================================
--- INIT: Poll every 5s until RegisteredSlots >= 100
+-- INIT: Poll every 5s until RegisteredSlots >= 50
 -- ============================================================================
-local MAX_POLLS = 30
+local MAX_POLLS = 60
 local READY_STABLE_POLLS = 1
 local initDone = false
 local pollCount = 0
@@ -992,8 +1111,8 @@ LoopAsync(5000, function()
     end
 
     local slotCount = count_registered_slots()
-    if slotCount < 100 then
-        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/100")
+    if slotCount < 50 then
+        Log(TAG .. ": Poll #" .. pollCount .. " — slots " .. slotCount .. "/50")
         return false
     end
 
@@ -1040,6 +1159,15 @@ LoopAsync(5000, function()
     initDone = true
     lastMaintSlotCount = slotCount
     Log(TAG .. ": === Init complete ===")
+
+    -- Schedule deferred flipper arm overrides (15s delay for tables to fully load)
+    if #pendingFlipperOverrides > 0 then
+        Log(TAG .. ": Scheduling " .. #pendingFlipperOverrides .. " deferred flipper overrides in 15s")
+        ExecuteWithDelay(15000, function()
+            pcall(apply_pending_flipper_overrides)
+        end)
+    end
+
     return true
 end)
 
@@ -1057,6 +1185,7 @@ pcall(function()
         if not poolReady then pcall(build_entry_pool) end
         pcall(scramble_all_slots)
         pcall(scramble_table_cosmetics)
+        pcall(apply_pending_flipper_overrides)
         return TAG .. " v27: sweep #" .. stats.sweeps
             .. " ok=" .. stats.sweep_ok
             .. " empty=" .. stats.empty_filled
@@ -1110,6 +1239,8 @@ end)
 pcall(function()
     RegisterCommand("randomize_tables", function()
         local count = scramble_table_cosmetics()
+        -- Apply flipper overrides immediately (bridge is called when game is loaded)
+        pcall(apply_pending_flipper_overrides)
         return TAG .. ": Re-randomized tables — ball=" .. stats.table_ball
             .. " trail=" .. stats.table_trail
             .. " flipper=" .. stats.table_flipper
@@ -1117,5 +1248,5 @@ pcall(function()
     end)
 end)
 
-Log(TAG .. ": v27 loaded — hook=" .. tostring(hookRegistered)
-    .. " | Fixes: robust assignment fallback, rollback on failed strict replace, per-shelf Gadget/Statue unique+replace")
+Log(TAG .. ": v28 loaded — hook=" .. tostring(hookRegistered)
+    .. " | Fixes: IP-matched table cosmetics, robust assignment fallback, per-shelf Gadget/Statue unique+replace")

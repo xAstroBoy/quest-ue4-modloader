@@ -12,6 +12,7 @@
 #include "modloader/types.h"
 
 #include <cstring>
+#include <cstdlib>
 
 namespace lua_ustruct
 {
@@ -531,6 +532,192 @@ namespace lua_ustruct
             else
                 return false;
             return lua_uobject::ftext_from_string(ptr, str);
+        }
+
+        case reflection::PropType::ArrayProperty:
+        {
+            // TArray field write — accept LuaTArray userdata
+            if (value.is<lua_tarray::LuaTArray>())
+            {
+                const auto &src = value.as<const lua_tarray::LuaTArray &>();
+                if (src.array_ptr && src.is_valid())
+                {
+                    // Get destination's inner FProperty and element size
+                    ue::FProperty *dest_inner = nullptr;
+                    int32_t dest_elem_size = 0;
+                    if (fi.raw && ue::is_valid_ptr(fi.raw))
+                    {
+                        dest_inner = ue::read_field<ue::FProperty *>(fi.raw, ue::fprop::ARRAY_INNER_OFF());
+                        if (dest_inner && ue::is_mapped_ptr(dest_inner))
+                            dest_elem_size = ue::fprop_get_element_size(dest_inner);
+                        else
+                            dest_inner = nullptr;
+                    }
+
+                    int32_t src_elem_size = src.element_size;
+                    int32_t num = src.num();
+
+                    // If element sizes match or we can't determine dest size, fast path
+                    if (dest_elem_size <= 0 || src_elem_size <= 0 ||
+                        dest_elem_size == src_elem_size || num <= 0)
+                    {
+                        std::memcpy(ptr, src.array_ptr, 16);
+                        return true;
+                    }
+
+                    // Element size MISMATCH — need conversion
+                    // Common case: source TArray<UObject*> (8 bytes) → dest TArray<TSoftObjectPtr> (40 bytes)
+                    auto dest_type = dest_inner ? reflection::classify_property(
+                                                      reinterpret_cast<const ue::FField *>(dest_inner))
+                                                : reflection::PropType::Unknown;
+                    auto src_type = src.inner_prop ? reflection::classify_property(
+                                                         reinterpret_cast<const ue::FField *>(src.inner_prop))
+                                                   : reflection::PropType::Unknown;
+
+                    bool src_is_obj = (src_type == reflection::PropType::ObjectProperty ||
+                                       src_type == reflection::PropType::WeakObjectProperty);
+                    bool dest_is_soft = (dest_type == reflection::PropType::SoftObjectProperty ||
+                                         dest_type == reflection::PropType::SoftClassProperty);
+
+                    if (src_is_obj && dest_is_soft && num > 0 && num <= 256 && symbols::FName_Init)
+                    {
+                        // Convert UObject* → FSoftObjectPtr (proper FSoftObjectPath construction)
+                        // Layout of FSoftObjectPtr on ARM64 UE5:
+                        //   +0x00: FTopLevelAssetPath { FName PackageName(8), FName AssetName(8) } = 16 bytes
+                        //   +0x10: FString SubPathString { TCHAR* Data(8), int32 Num(4), int32 Max(4) } = 16 bytes
+                        //   +0x20: FWeakObjectPtr { int32 ObjectIndex(4), int32 ObjectSerialNumber(4) } = 8 bytes
+                        //   Total: 40 bytes
+                        // Note: dest_elem_size from reflection tells us the actual size on this build.
+
+                        size_t buf_size = (size_t)num * (size_t)dest_elem_size;
+                        uint8_t *new_data = static_cast<uint8_t *>(std::calloc(1, buf_size));
+                        if (!new_data)
+                        {
+                            std::memcpy(ptr, src.array_ptr, 16);
+                            return true;
+                        }
+
+                        const uint8_t *src_data = static_cast<const uint8_t *>(src.data());
+                        for (int32_t i = 0; i < num; i++)
+                        {
+                            ue::UObject *obj = *reinterpret_cast<ue::UObject *const *>(
+                                src_data + i * src_elem_size);
+                            uint8_t *elem = new_data + i * dest_elem_size;
+
+                            if (!obj || !ue::is_valid_ptr(obj))
+                                continue; // Leave element zeroed (null soft ref)
+
+                            // Build FSoftObjectPath from UObject's path
+                            // GetFullName returns "PackageName.AssetName" (outer chain)
+                            std::string full_path = reflection::get_full_name(obj);
+                            if (full_path.empty())
+                                continue;
+
+                            // Split at last '.' → package path + asset name
+                            size_t dot_pos = full_path.rfind('.');
+                            std::string pkg_path, asset_name;
+                            if (dot_pos != std::string::npos)
+                            {
+                                pkg_path = full_path.substr(0, dot_pos);
+                                asset_name = full_path.substr(dot_pos + 1);
+                            }
+                            else
+                            {
+                                pkg_path = full_path;
+                                asset_name = full_path;
+                            }
+
+                            // Convert to FNames using FName_Init
+                            ue::FName pkg_fname = {0, 0};
+                            ue::FName asset_fname = {0, 0};
+                            {
+                                std::u16string u16pkg(pkg_path.begin(), pkg_path.end());
+                                symbols::FName_Init(&pkg_fname, u16pkg.c_str(), 0);
+                            }
+                            {
+                                std::u16string u16asset(asset_name.begin(), asset_name.end());
+                                symbols::FName_Init(&asset_fname, u16asset.c_str(), 0);
+                            }
+
+                            // Write FTopLevelAssetPath at element start
+                            // PackageName FName at +0x00
+                            std::memcpy(elem + 0, &pkg_fname, 8);
+                            // AssetName FName at +0x08
+                            std::memcpy(elem + 8, &asset_fname, 8);
+                            // SubPathString (FString) at +0x10 = {nullptr, 0, 0} — already zeroed
+                            // FWeakObjectPtr at +0x20 = {0, 0} — already zeroed (will be resolved lazily)
+                        }
+
+                        // Write TArray header: {Data*, Num, Max}
+                        *reinterpret_cast<void **>(ptr) = new_data;
+                        *reinterpret_cast<int32_t *>(ptr + 8) = num;
+                        *reinterpret_cast<int32_t *>(ptr + 12) = num;
+
+                        logger::log_info("TARRAY", "Converted TArray<UObject*>(%d) → TArray<SoftObj>(%d) "
+                                                   "for field '%s': %d elems, src_sz=%d dest_sz=%d",
+                                         src_elem_size, dest_elem_size, fi.name.c_str(),
+                                         num, src_elem_size, dest_elem_size);
+                        return true;
+                    }
+
+                    // Generic element size mismatch — zero-padded conversion (best effort)
+                    if (num > 0 && num <= 256)
+                    {
+                        size_t buf_size = (size_t)num * (size_t)dest_elem_size;
+                        uint8_t *new_data = static_cast<uint8_t *>(std::calloc(1, buf_size));
+                        if (new_data)
+                        {
+                            const uint8_t *src_data = static_cast<const uint8_t *>(src.data());
+                            int32_t copy_per_elem = (src_elem_size < dest_elem_size)
+                                                        ? src_elem_size
+                                                        : dest_elem_size;
+                            for (int32_t i = 0; i < num; i++)
+                            {
+                                std::memcpy(new_data + i * dest_elem_size,
+                                            src_data + i * src_elem_size,
+                                            copy_per_elem);
+                            }
+                            *reinterpret_cast<void **>(ptr) = new_data;
+                            *reinterpret_cast<int32_t *>(ptr + 8) = num;
+                            *reinterpret_cast<int32_t *>(ptr + 12) = num;
+
+                            logger::log_warn("TARRAY", "TArray element size mismatch for '%s': "
+                                                       "src=%d dest=%d, zero-padded %d elems",
+                                             fi.name.c_str(), src_elem_size, dest_elem_size, num);
+                            return true;
+                        }
+                    }
+
+                    // Fallback: raw memcpy (original behavior)
+                    std::memcpy(ptr, src.array_ptr, 16);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        case reflection::PropType::SoftObjectProperty:
+        case reflection::PropType::SoftClassProperty:
+        {
+            // TSoftObjectPtr / TSoftClassPtr — shallow copy from another struct field
+            // These are typically FSoftObjectPath (FName + FString) — just memcpy the raw bytes
+            if (value.is<LuaUStruct>())
+            {
+                const LuaUStruct &src = value.as<const LuaUStruct &>();
+                if (src.data && src.size > 0)
+                {
+                    int32_t copy_size = (src.size < fi.element_size) ? src.size : fi.element_size;
+                    std::memcpy(ptr, src.data, copy_size);
+                    return true;
+                }
+            }
+            // Also accept nil → zero out
+            if (value == sol::nil)
+            {
+                std::memset(ptr, 0, fi.element_size);
+                return true;
+            }
+            return false;
         }
 
         default:

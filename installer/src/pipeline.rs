@@ -16,19 +16,58 @@ pub fn find_modloader_so(override_path: Option<&str>) -> Result<PathBuf> {
         if pb.exists() { return Ok(pb); }
         bail!("Specified modloader .so not found: {}", p);
     }
-    // 2. Next to installer binary
+
+    // 2. Try to rebuild from source if build script exists
+    let build_dirs: &[&str] = &[
+        "modloader",
+        "../modloader",
+    ];
+    for dir in build_dirs {
+        let build_bat = Path::new(dir).join("build.bat");
+        if build_bat.exists() {
+            log::info!("Found modloader source at {} — rebuilding...", dir);
+            let status = std::process::Command::new("cmd")
+                .args(["/C", &build_bat.to_string_lossy()])
+                .current_dir(dir)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    // Check for stripped deploy copy first, then regular build
+                    let deploy = Path::new(dir).join("build/deploy/libmodloader.so");
+                    if deploy.exists() {
+                        log::info!("✓ Modloader rebuilt — using {}", deploy.display());
+                        return Ok(deploy);
+                    }
+                    let built = Path::new(dir).join("build/libmodloader.so");
+                    if built.exists() {
+                        log::info!("✓ Modloader rebuilt — using {}", built.display());
+                        return Ok(built);
+                    }
+                    log::warn!("Build succeeded but .so not found in {}/build/", dir);
+                }
+                Ok(s) => log::warn!("Modloader build failed (exit {})", s),
+                Err(e) => log::warn!("Could not run build.bat: {}", e),
+            }
+        }
+    }
+
+    // 3. Next to installer binary
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent().unwrap_or(Path::new("."));
         let p = dir.join("libmodloader.so");
         if p.exists() { return Ok(p); }
     }
-    // 3. Current working dir
+    // 4. Current working dir
     let p = PathBuf::from("libmodloader.so");
     if p.exists() { return Ok(p); }
-    // 4. modloader/build dir
+    // 5. modloader/build dir (pre-built, no rebuild attempted)
+    let p = PathBuf::from("modloader/build/deploy/libmodloader.so");
+    if p.exists() { return Ok(p); }
     let p = PathBuf::from("modloader/build/libmodloader.so");
     if p.exists() { return Ok(p); }
-    // 5. Relative to workspace
+    // 6. Relative to workspace
+    let p = PathBuf::from("../modloader/build/deploy/libmodloader.so");
+    if p.exists() { return Ok(p); }
     let p = PathBuf::from("../modloader/build/libmodloader.so");
     if p.exists() { return Ok(p); }
 

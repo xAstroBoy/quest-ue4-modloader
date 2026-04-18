@@ -20,6 +20,8 @@
 #include <setjmp.h>
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 namespace lua_uobject
 {
@@ -31,6 +33,45 @@ namespace lua_uobject
     // This is the same pattern used by native_hooks.cpp for hook originals.
     thread_local volatile int g_in_call_ufunction = 0;
     thread_local sigjmp_buf g_call_ufunction_jmp;
+    thread_local volatile uintptr_t g_call_ufunction_fault_addr = 0;
+
+    // ═══ Crash Rate-Limiter ════════════════════════════════════════════════
+    // Tracks per-function crash counts to suppress duplicate log spam.
+    // First crash logs full details; subsequent crashes are counted silently.
+    // Summary is logged when the function name changes or on periodic intervals.
+    struct CrashStats
+    {
+        int count = 0;
+        uintptr_t last_fault = 0;
+    };
+    static std::mutex s_crash_stats_mtx;
+    static std::unordered_map<std::string, CrashStats> s_crash_stats;
+
+    // Returns true if this crash should be logged in full (first occurrence).
+    // Always increments the counter.
+    static bool crash_rate_check(const std::string &func_key, uintptr_t fault_addr)
+    {
+        std::lock_guard<std::mutex> lk(s_crash_stats_mtx);
+        auto &st = s_crash_stats[func_key];
+        st.count++;
+        st.last_fault = fault_addr;
+        return st.count == 1; // only log first
+    }
+
+    // Flush crash stats: log summary for any function that crashed >1 time, then clear.
+    static void crash_rate_flush()
+    {
+        std::lock_guard<std::mutex> lk(s_crash_stats_mtx);
+        for (auto &[key, st] : s_crash_stats)
+        {
+            if (st.count > 1)
+            {
+                logger::log_warn("CALL", "ProcessEvent crash summary: %s crashed %d times (fault_addr=0x%lx) — all recovered",
+                                 key.c_str(), st.count, (unsigned long)st.last_fault);
+            }
+        }
+        s_crash_stats.clear();
+    }
 
     // ═══ Game-thread ProcessEvent dispatch (throttled via pe_hook queue) ════
     // Instead of a background worker thread (which crashes because UE Blueprint
@@ -53,6 +94,7 @@ namespace lua_uobject
         std::shared_ptr<std::vector<char16_t *>> fstring_allocs;
         std::string class_name;
         std::string func_name;
+        std::vector<size_t> array_param_offsets; // offsets of TArray params to zero after PE
     };
 
     static std::atomic<int> s_gt_call_total{0};
@@ -205,14 +247,30 @@ namespace lua_uobject
 
         void *params_ptr = item.params ? item.params->data() : nullptr;
 
+        // Save FunctionFlags — ProcessEvent modifies them internally
+        uint32_t saved_func_flags = ue::ufunc_get_flags(item.func);
+
+        // Save DestructorLink — null it before PE to prevent DestroyValue
+        // from freeing shallow-copied TArray Data pointers in struct params.
+        void *saved_dtor_link = ue::read_field<void *>(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF());
+
         // Crash guard — if ProcessEvent crashes, recover instead of killing game
         g_in_call_ufunction = 1;
         int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
         if (pe_crash_sig != 0)
         {
-            logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
-                                        "— recovered, skipping",
-                              pe_crash_sig, item.class_name.c_str(), item.func_name.c_str(), item.obj);
+            ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+            ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            uintptr_t fault = g_call_ufunction_fault_addr;
+            std::string crash_key = item.class_name + "::" + item.func_name;
+            bool first = crash_rate_check(crash_key, fault);
+            if (first)
+            {
+                logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
+                                            "— recovered, skipping (further crashes suppressed)",
+                                  pe_crash_sig, (unsigned long)fault,
+                                  item.class_name.c_str(), item.func_name.c_str(), item.obj);
+            }
             g_in_call_ufunction = 0;
             // Still clean up allocations
             if (item.fstring_allocs)
@@ -220,7 +278,15 @@ namespace lua_uobject
                     delete[] p;
             return;
         }
+
+        // Null DestructorLink before PE to prevent DestroyValue on shallow-copied TArrays
+        ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+
         pe_fn(item.obj, item.func, params_ptr);
+
+        // Restore DestructorLink + FunctionFlags
+        ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         g_in_call_ufunction = 0;
 
         int total = s_gt_call_total.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1328,10 +1394,16 @@ namespace lua_uobject
         if (parms_size == 0)
         {
             // No params — just call (with crash guard)
+            // Save FunctionFlags — ProcessEvent modifies them internally;
+            // if we crash mid-call via siglongjmp, the flags stay corrupted
+            // and ALL subsequent calls to this UFunction will also crash.
+            uint32_t saved_flags = ue::ufunc_get_flags(func);
             g_in_call_ufunction = 1;
             int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
             if (pe_crash_sig != 0)
             {
+                // Restore FunctionFlags even on crash — prevents cascade failures
+                ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_flags);
                 logger::log_error("CALL", "ProcessEvent CRASHED (signal %d) calling %s::%s (no params) "
                                           "— recovered, returning nil",
                                   pe_crash_sig, class_name.c_str(), func_name.c_str());
@@ -1342,6 +1414,7 @@ namespace lua_uobject
             if (!pe_fn)
                 pe_fn = symbols::ProcessEvent;
             pe_fn(obj, func, nullptr);
+            ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_flags);
             g_in_call_ufunction = 0;
             return sol::nil;
         }
@@ -1583,6 +1656,12 @@ namespace lua_uobject
                         lua_ustruct::fill_from_table(param_ptr, inner_struct, arg.as<sol::table>());
                     }
                 }
+
+                // NOTE: TArray deep-copy removed — using malloc() for copies that
+                // UE's frame destructor frees via FMemory::Free() causes heap corruption
+                // (SIGABRT) when UE uses FMallocBinned2 instead of system malloc.
+                // Flipper arm overrides are deferred 15s in Lua to avoid the original
+                // frame-destructor-frees-live-data issue.
                 break;
             }
             case reflection::PropType::TextProperty:
@@ -1680,15 +1759,51 @@ namespace lua_uobject
             arg_idx++;
         }
 
-        // Call ProcessEvent — with crash guard
+        // Save FunctionFlags — ProcessEvent modifies them internally;
+        // if we crash mid-call via siglongjmp, the flags stay corrupted
+        // and ALL subsequent calls to this UFunction will also crash.
+        uint32_t saved_func_flags = ue::ufunc_get_flags(func);
+
+        // Save DestructorLink — we null it before ProcessEvent to prevent
+        // DestroyValue from freeing shallow-copied TArray Data pointers
+        // inside struct params (e.g., PFXTableCustomizationArmSkinData).
+        void *saved_dtor_link = ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF());
+
+        // sigsetjmp crash guard — catches SIGSEGV inside ProcessEvent
         g_in_call_ufunction = 1;
+        g_call_ufunction_fault_addr = 0;
         int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
         if (pe_crash_sig != 0)
         {
-            // ProcessEvent crashed! Log and return nil safely.
-            logger::log_error("CALL", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
-                                      "— recovered, returning nil",
-                              pe_crash_sig, class_name.c_str(), func_name.c_str(), obj);
+            // Restore FunctionFlags even on crash — prevents cascade failures
+            ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+            // Restore DestructorLink on crash
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            // Rate-limited crash logging — log first occurrence in detail,
+            // suppress duplicates, flush summary later.
+            uintptr_t fault = g_call_ufunction_fault_addr;
+            std::string crash_key = class_name + "::" + func_name;
+            bool first = crash_rate_check(crash_key, fault);
+            if (first)
+            {
+                logger::log_error("CALL", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
+                                          "— recovered, returning nil (further crashes suppressed)",
+                                  pe_crash_sig, (unsigned long)fault,
+                                  class_name.c_str(), func_name.c_str(), obj);
+                // Log param buffer hex dump for diagnosis (first crash only)
+                {
+                    char hex[256];
+                    int hlen = 0;
+                    size_t dump_sz = params_buf.size() < 64 ? params_buf.size() : 64;
+                    for (size_t b = 0; b < dump_sz && hlen < 240; b++)
+                    {
+                        hlen += snprintf(hex + hlen, 256 - hlen, "%02x", params_buf[b]);
+                        if ((b & 7) == 7 && b + 1 < dump_sz)
+                            hlen += snprintf(hex + hlen, 256 - hlen, " ");
+                    }
+                    logger::log_error("CALL", "  params[%zu]: %s", params_buf.size(), hex);
+                }
+            }
             g_in_call_ufunction = 0;
             for (auto *p : fstring_allocs)
                 delete[] p;
@@ -1697,7 +1812,23 @@ namespace lua_uobject
         auto pe_fn = pe_hook::get_original();
         if (!pe_fn)
             pe_fn = symbols::ProcessEvent;
+        // CRITICAL: Null DestructorLink BEFORE ProcessEvent.
+        // ProcessEvent walks UFunction::DestructorLink to call DestroyValue on params
+        // after the native function returns. For struct params containing TArrays
+        // (e.g., PFXTableCustomizationArmSkinData.OverrideMaterials), the shallow-copied
+        // TArray Data pointer points to the SOURCE UObject's live array data. DestroyValue
+        // would FMemory::Free that pointer, corrupting the source object. Nulling
+        // DestructorLink prevents ALL param destruction — safe because we manage
+        // FString/FText cleanup manually above.
+        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+
         pe_fn(obj, func, params);
+
+        // Restore DestructorLink immediately after ProcessEvent returns.
+        // This re-enables normal param destruction for other callers.
+        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+
+        ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         // NOTE: crash guard (g_in_call_ufunction) stays ON through return extraction
         // so that crashes in return value reading are also caught by siglongjmp.
 
@@ -2167,6 +2298,13 @@ namespace lua_uobject
         item.fstring_allocs = fstring_allocs;
         item.class_name = class_name;
         item.func_name = func_name;
+        // Record offsets of TArray params for post-PE zeroing
+        for (const auto &pi : rf->params)
+        {
+            if (pi.type == reflection::PropType::ArrayProperty &&
+                (pi.flags & ue::CPF_Parm) && !(pi.flags & ue::CPF_ReturnParm))
+                item.array_param_offsets.push_back(static_cast<size_t>(pi.offset));
+        }
         enqueue_gt_call(std::move(item));
 
         return true;
@@ -2300,21 +2438,40 @@ namespace lua_uobject
         std::memcpy(params_buf.data(), raw_params,
                     std::min(static_cast<size_t>(params_len), alloc_size));
 
+        // Save FunctionFlags — ProcessEvent modifies them internally
+        uint32_t saved_func_flags = ue::ufunc_get_flags(func);
+        // Save DestructorLink — null it to prevent DestroyValue on our params
+        void *saved_dtor_link = ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF());
+
         // Crash guard — if ProcessEvent crashes, recover instead of killing game
         g_in_call_ufunction = 1;
         int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
         if (pe_crash_sig != 0)
         {
-            logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d) calling %s::%s on %p "
-                                         "— recovered, returning false",
-                              pe_crash_sig, class_name.c_str(), func_name.c_str(), obj);
+            ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            uintptr_t fault = g_call_ufunction_fault_addr;
+            std::string crash_key = class_name + "::" + func_name;
+            bool first = crash_rate_check(crash_key, fault);
+            if (first)
+            {
+                logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
+                                             "— recovered, returning false (further crashes suppressed)",
+                                  pe_crash_sig, (unsigned long)fault,
+                                  class_name.c_str(), func_name.c_str(), obj);
+            }
             g_in_call_ufunction = 0;
             return false;
         }
         auto pe_fn = pe_hook::get_original();
         if (!pe_fn)
             pe_fn = symbols::ProcessEvent;
+
+        // Null DestructorLink to prevent DestroyValue on shallow-copied params
+        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
         pe_fn(obj, func, params_buf.data());
+        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         g_in_call_ufunction = 0;
         return true;
     }
