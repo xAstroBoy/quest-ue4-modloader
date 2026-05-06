@@ -9,6 +9,8 @@
 --   3. Wrist-menu stub — hooks BP_WristMenu_C:Open to inject cheat entries
 -- ============================================================================
 local TAG = "PFX_Cheats"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 Log(TAG .. ": Loading v1...")
 
 -- ============================================================================
@@ -61,25 +63,30 @@ local function get_play_table()
 end
 
 local function cheats_set_ballsave(enable)
+    V("cheats_set_ballsave enable=%s", tostring(enable))
     cheats.infinite_ball_save = not not enable
     Log(TAG .. ": infinite_ball_save = " .. tostring(cheats.infinite_ball_save))
     return cheats.infinite_ball_save
 end
 
 local function cheats_toggle_ballsave()
+    V("cheats_toggle_ballsave")
     return cheats_set_ballsave(not cheats.infinite_ball_save)
 end
 
 local function cheats_set_logstates(enable)
+    V("cheats_set_logstates enable=%s", tostring(enable))
     cheats.log_game_states = not not enable
     return cheats.log_game_states
 end
 
 local function cheats_toggle_logstates()
+    V("cheats_toggle_logstates")
     return cheats_set_logstates(not cheats.log_game_states)
 end
 
 local function cheats_saveball()
+    V("cheats_saveball")
     local pt = get_play_table()
     if not pt then return false, "not in game" end
     local ok = pcall(function() pt:Call("SkipPrepareGameEnd") end)
@@ -91,6 +98,7 @@ local function cheats_saveball()
 end
 
 local function cheats_restartball()
+    V("cheats_restartball")
     local pt = get_play_table()
     if not pt then return false, "not in game" end
     local ok = pcall(function() pt:Call("RestartGame") end)
@@ -98,6 +106,7 @@ local function cheats_restartball()
 end
 
 local function cheats_pause_resume()
+    V("cheats_pause_resume")
     local pt = get_play_table()
     if not pt then return false, "not in game" end
     local paused = false
@@ -137,6 +146,7 @@ end
 -- Pre-hook: intercept state change BEFORE the BP graph handles it
 pcall(function()
     RegisterHook("PFXGameflowObject_PlayTable:OnGameStateChanged", function(ctx, state_raw)
+        V("OnGameStateChanged hook fired")
         local newState = 0
         pcall(function() newState = ReadU8(state_raw) end)
         stats.state_changes = stats.state_changes + 1
@@ -167,6 +177,7 @@ end)
 -- (catches cases where drain slipped through state hook)
 pcall(function()
     RegisterHook("PFXGameflowObject_PlayTable:OnGameEnd", function(ctx)
+        V("OnGameEnd hook fired, ballsave=%s", tostring(cheats.infinite_ball_save))
         if not cheats.infinite_ball_save then return end
         local pt = nil
         pcall(function() pt = ctx end)
@@ -187,6 +198,7 @@ end)
 -- ============================================================================
 pcall(function()
     RegisterHook("BP_WristMenu_C:Open", function(ctx)
+        V("BP_WristMenu_C:Open hook fired")
         Log(TAG .. ": [WristMenu] Opened — cheats available via bridge commands")
         -- Future: inject cheat entries into the wrist menu entries array
         -- For now just log so we can probe the menu structure

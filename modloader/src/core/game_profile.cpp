@@ -236,100 +236,332 @@ namespace game_profile
         // FUObjectItem is 0x14 (20 bytes) — no padding, no RefCount in this build
         p.offsets.FUObjectItem_size = 0x14;
 
-        // ── Fallback offsets (v1.7 addresses from IDA/Binja analysis) ──
-        // These are fallbacks ONLY — the pattern scanner should find them dynamically.
-        // GNames and GUObjectArray are UNCHANGED between v1.6 and v1.7.
-        // Only function offsets changed in v1.7.
-        // Offsets verified via Rust bindump tool (tools/bindump) cross-referencing
-        // IDA + BINJA decompilation of the stripped libUnreal.so binary.
+        // ── Stable global offsets — CONFIRMED on new binary (Pinball FX New Dump, May 2026) ──
+        // Always applied regardless of disallow_hardcoded_fallbacks(). Used as Priority 4
+        // fallback after dlsym / ELF / pattern / auto-discovery all fail.
+        // Data globals (GNames, GUObjectArray, GEngine) are NOT here — they are runtime VAs
+        // not derivable from file offsets; handled by auto_offsets::find_g*() scanners.
+        // Offsets verified via: aob-port old=pfx_old_offsets_confirmed_v2.txt new=Pinball FX New Dump
+        p.stable_global_offsets = {
+            // Core UE engine functions
+            {"ProcessEvent", 0x16854DC},
+            {"StaticConstructObject_Internal", 0x169DFDC},
+            {"StaticFindObject", 0x14F6004},
+            {"StaticLoadObject", 0x169A630},
+            {"FName::Init", 0x14A41F0},
+            {"GetTransientPackage", 0x16151A0},
+            // PFX store / achievements
+            {"PFXStoreManager::IsTableOwned", 0x4EF048C},
+            {"PFXAchievementsManager::IsAchievementUnlocked", 0x4E7CC74},
+            {"PFXAchievementsManager::IsHologram", 0x4E7C87C},
+            {"PFXAchievementsManager::GetTrophy", 0x4E7CBC4},
+            {"PFXAchievementsManager::SetTrophyBeenSeen", 0x4E7CA14},
+            // PFX collectibles
+            {"PFXCollectiblesManager::UnlockEntry", 0x4E981FC},
+            {"PFXCollectibleEntry::SetUnlocked", 0x4E91C24},
+            // YUP component system
+            {"YUP_AddPropertyToComponent", 0x478FBB0},
+            {"YUP_RegisterPropertyBinding", 0x47A20EC},
+            {"YUP_RegisterActionBinding", 0x47A2248},
+            {"YUP_ResetComponent", 0x478F120},
+            {"YUP_PendulumBall_Detach", 0x48A39CC},
+            {"YUP_BallInformator_GetSingleton", 0x48BA280},
+            {"YUP_BallInformator_GetSpeed", 0x48BA5F8},
+            // YUP table debug
+            {"YUP_TableDebug_SetPause", 0x49315A8},
+            {"YUP_TableDebug_SetGodMode", 0x49315B8},
+            {"YUP_TableDebug_PauseToggle", 0x49315C8},
+            {"YUP_TableDebug_ToggleGodMode", 0x49315EC},
+            {"YUP_TableDebug_SetSpeed", 0x4931600},
+            {"YUP_TableDebug_DumpAction", 0x4931538},
+            {"YUP_TableDebug_DebugLoad", 0x4931628},
+            // PFX save / award system
+            {"PFX_SaveManager_SetSingleton", 0x4EEDAD0},
+            {"PFX_SaveManager_ClearSingleton", 0x4EEDAE0},
+            {"PFX_SaveManager_MutexLock", 0x4F72544},
+            {"PFX_SaveManager_MutexUnlock", 0x4F72550},
+            {"PFX_CheatManager_GetSingleton", 0x4C6164C},
+            {"PFX_AwardUnlockTable", 0x4F6BD0C},
+            {"PFX_AwardLockTable", 0x4F6C0BC},
+            {"PFX_AwardUnlockAll", 0x4F5D4A0},
+            {"PFX_AwardLockAll", 0x4F5D574},
+            {"PFX_UnLockAllTables", 0x4F5DAAC},
+            {"PFX_SaveManager_HashLookup", 0x4F6E0D8},
+            // AES / PAK
+            {"AES_set_decrypt_key", 0x6273DC0},
+            {"AES_set_encrypt_key", 0x6273BA0},
+            {"FAES_DecryptData", 0x1402EE4},
+        };
+
+        // ── Fallback offsets ──
+        // Dynamic-only policy for Pinball FX VR:
+        // keep all symbol names here for runtime updates, but ship NO hardcoded
+        // offsets in source. Resolution must come from dlsym/ELF/pattern/auto-discovery.
         p.fallback_offsets = {
-            // Core engine symbols (same in v1.6 and v1.7)
-            {"GNames", 0x071D5600},
-            {"GUObjectArray", 0x0721CC38},
-            {"ProcessEvent", 0x016774DC},                   // unchanged between versions
-            {"StaticConstructObject_Internal", 0x01696FDC}, // unchanged between versions
+            // Core engine symbols
+            {"GNames", 0},
+            {"GUObjectArray", 0},
+            {"ProcessEvent", 0},
+            {"StaticConstructObject_Internal", 0},
+            {"StaticFindObject", 0},
+            {"StaticLoadObject", 0},
+            {"FName::Init", 0},
+            {"GetTransientPackage", 0},
+            {"GEngine", 0},
 
-            // Additional core symbols resolved via Binja analysis
-            {"StaticFindObject", 0x014EF004},    // sub_18ef004 — used by FindObject reflection
-            {"StaticLoadObject", 0x01693630},    // sub_1a93630 — used by LoadObject
-            {"FName::Init", 0x0149D1F0},         // sub_189d1f0 — FName::Init (string → FName)
-            {"GetTransientPackage", 0x0160E1A0}, // sub_1a0e1a0 — GetTransientPackage()
+            // Pinball FX VR specific
+            {"PFXStoreManager::IsTableOwned", 0},
+            {"PFXAchievementsManager::IsAchievementUnlocked", 0},
+            {"PFXAchievementsManager::IsHologram", 0},
+            {"PFXAchievementsManager::GetTrophy", 0},
+            {"PFXAchievementsManager::SetTrophyBeenSeen", 0},
+            {"PFXCollectiblesManager::GetAllEntries", 0},
+            {"PFXCollectiblesManager::UnlockEntry", 0},
+            {"PFXCollectibleEntry::IsUnlocked", 0},
+            {"PFXCollectibleEntry::SetUnlocked", 0},
 
-            // Global pointers found via bindump string xref analysis:
-            // GEngine: "Create GEngine" string at 0x4BF2C3 → xref at text:0x3FFF8B8
-            //   → sub_3FFF768 writes new engine object to qword_73CF2A0 via off_715D0A8
-            //   → STR X20, [X22] at 0x3FFF9D8. Confirmed: 2318 xrefs to qword_73CF2A0.
-            {"GEngine", 0x073CF2A0},
-
-            // GWorld: resolved at runtime from GUObjectArray UObject walk.
-            // Not a simple global in UE5 (it's UWorldProxy). The modloader's
-            // process_event_hook.cpp already finds it dynamically — no offset needed.
-
-            // Pinball FX VR specific — entitlement/unlock exec thunks
-            {"PFXStoreManager::IsTableOwned", 0x04ED5FB8},                 // v1.7 exec thunk, returns bool
-            {"PFXAchievementsManager::IsAchievementUnlocked", 0x04E62E30}, // v1.7 exec thunk
-            {"PFXAchievementsManager::IsHologram", 0x04E62A38},            // same in v1.6 and v1.7
-            {"PFXAchievementsManager::GetTrophy", 0x04E62D80},             // v1.7
-            {"PFXAchievementsManager::SetTrophyBeenSeen", 0x04E62BD0},     // v1.7
-            {"PFXCollectiblesManager::GetAllEntries", 0x04E7E124},         // v1.7
-            {"PFXCollectiblesManager::UnlockEntry", 0x04E7E3A4},           // v1.7
-            {"PFXCollectibleEntry::IsUnlocked", 0x04E77F50},               // v1.7
-            {"PFXCollectibleEntry::SetUnlocked", 0x04E77DEC},              // v1.7
-
-            // FText symbols — NOT needed for Pinball FX VR.
-            // The modloader uses Kismet Conv_TextToString / Conv_StringToText
-            // via ProcessEvent for all FText read/write operations. The raw
-            // FText_ToString/FromString/Ctor/Dtor symbols are never called.
-            // These are stripped from the binary (no .symtab, only .dynsym
-            // with JNI exports). Keeping them at 0 is correct behavior.
+            // FText raw symbols not needed on PFX (Kismet conversion path used)
             {"_ZNK5FText8ToStringEv", 0},           // not needed — Kismet path used
             {"_ZN5FText10FromStringEO7FString", 0}, // not needed — Kismet path used
             {"_ZN5FTextD2Ev", 0},                   // not needed — Kismet path used
             {"_ZN5FTextC1Ev", 0},                   // not needed — Kismet path used
 
-            // ── AES key extraction hooks (v1.7 libUnreal.so, IDA zero-based offsets) ──
-            // sub_6258DC0 = AES_set_decrypt_key(const uint8* userKey, int bits, AES_KEY* out)
-            // sub_6258BA0 = AES_set_encrypt_key(const uint8* userKey, int bits, AES_KEY* out)
-            // Both are called when setting up AES key schedules.
-            // For PAK decryption, UE5 calls one of these with the raw 32-byte key.
-            // Hooking both guarantees capture regardless of encrypt vs decrypt path.
-            // X0 = raw key bytes, W1 = key bits (256 for AES-256), X2 = schedule output.
-            {"AES_set_decrypt_key", 0x6258DC0},
-            {"AES_set_encrypt_key", 0x6258BA0},
+            // YUP physics engine
+            {"YUP_MakePropertyName", 0},
+            {"YUP_AddPropertyToComponent", 0},
+            {"YUP_AddActionToComponent", 0},
+            {"YUP_RegisterPropertyBinding", 0},
+            {"YUP_RegisterActionBinding", 0},
+            {"YUP_FinalizeComponent", 0},
+            {"YUP_ResetComponent", 0},
+            {"YUP_TableDebugInterface_Init", 0},
+            {"YUP_TableDebug_SetPause", 0},
+            {"YUP_TableDebug_SetGodMode", 0},
+            {"YUP_TableDebug_PauseToggle", 0},
+            {"YUP_TableDebug_ToggleGodMode", 0},
+            {"YUP_TableDebug_SetSpeed", 0},
+            {"YUP_TableDebug_DumpAction", 0},
+            {"YUP_TableDebug_DebugLoad", 0},
+            {"YUP_InitPhysPropertyBindings", 0},
+            {"YUP_PendulumBall_Attach", 0},
+            {"YUP_PendulumBall_Detach", 0},
+            {"YUP_PendulumBall_Reset", 0},
+            {"YUP_BallInformator_GetSingleton", 0},
+            {"YUP_BallInformator_Init", 0},
+            {"YUP_BallInformator_GetSpeed", 0},
 
-            // ── UE T-table AES (the REAL PAK decryption path) ──
-            // sub_13FBEE4 = FAES::DecryptData(void* data, int64_t size, uint8_t* key32)
-            //   Standalone T-table AES-256 decryption. Called by FPakFile::DecryptData
-            //   (sub_228F334) for all PAK index/content decryption. arg3 = raw 32-byte key.
-            //   This does NOT use OpenSSL — completely separate implementation.
-            {"FAES_DecryptData", 0x13FBEE4},
-            // sub_228E614 = GetPakEncryptionKey(uint8_t* outKey32, FGuid* encryptionKeyGuid)
-            //   Resolves encryption key GUID → 32-byte key buffer. Called before FAES_DecryptData.
-            {"GetPakEncryptionKey", 0x228E614},
+            // PFX table/award system
+            {"PFX_SaveManager_SetSingleton", 0},
+            {"PFX_SaveManager_ClearSingleton", 0},
+            {"PFX_SaveManager_MutexLock", 0},
+            {"PFX_SaveManager_MutexUnlock", 0},
+            {"PFX_CheatManager_GetSingleton", 0},
+            {"PFX_GameSubsystem_GetSingleton", 0},
+            {"PFX_AwardUnlockTable", 0},
+            {"PFX_AwardLockTable", 0},
+            {"PFX_AwardUnlockAll", 0},
+            {"PFX_AwardLockAll", 0},
+            {"PFX_UnLockAllTables", 0},
+            {"PFX_SaveManager_HashLookup", 0},
+
+            // AES/PAK decrypt path
+            {"AES_set_decrypt_key", 0},
+            {"AES_set_encrypt_key", 0},
+            {"FAES_DecryptData", 0},
+            {"GetPakEncryptionKey", 0},
         };
 
         // ── Pattern signatures for dynamic scanning ──
-        // These survive game updates by matching instruction sequences instead
-        // of hardcoded offsets. Each pattern finds a key function or global.
+        // Generated by bindump aob-port: verified UNIQUE in both old and new Pinball FX VR binaries.
+        // These survive game updates by matching instruction sequences regardless of address changes.
         //
-        // ProcessEvent: UObject::ProcessEvent(UFunction*, void*)
-        // Signature: function prologue + ObjectFlags check + FunctionFlags read
-        // Pattern is from the first ~20 bytes of sub_16774DC
+        // Format: {"SymbolName", "AA BB ?? CC", -1, 0}
+        // ?? = wildcard byte (masked ARM64 PC-relative immediates: ADRP, B/BL, ADD, LDR lit, CBZ/CBNZ, TBZ/TBNZ)
         p.pattern_signatures = {
-            // ProcessEvent prologue — SUB SP, SP, #frame; STP X28,X27
-            // Stable across versions because it's the ProcessEvent calling convention
-            {
-                "ProcessEvent",
-                "FF 03 04 D1 FC 6F 11 A9 FA 67 12 A9 F8 5F 13 A9 F6 57 14 A9 F4 4F 15 A9",
-                -1, 0},
+            // ══ Core UE engine functions ═══════════════════════════════════════
+            {"ProcessEvent",
+             "FF 03 01 D1 FD 7B 01 A9 FD 43 00 91 F6 57 02 A9 F4 4F 03 A9 55 D0 3B D5 F3 03 02 AA A8 16 40 F9 E2 03 00 91 E8 07 00 F9 20 A0 41 A9 09 25 00 91 14 01 40 F9 FF 03 00 F9",
+             -1, 0},
+            {"StaticConstructObject_Internal",
+             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? F8 03 14 AA 1F 03 00 F1 62 06 40 F9",
+             -1, 0},
+            {"StaticFindObject",
+             "09 0D 40 B9 4B 25 40 B9 7F 01 09 6B 6D 01 00 54 2B FD 4D D3 4A 09 40 F9 6B 3D 7D 92 29 3D 00 12 4A 69 6B F8 8B 02 80 52 29 29 AB 9B 29 09 40 B9 ?? ?? ?? ?? ?? ?? ?? ?? E9 03 1F AA 29 09 40 B9 ?? ?? ?? ?? 14 89 40 F9 ?? ?? ?? ?? ?? ?? ?? ??",
+             -1, 0},
+            {"StaticLoadObject",
+             "1F 04 00 71 E1 01 00 54 F4 03 13 AA E0 03 13 AA 88 C6 40 F8 08 01 40 F9 00 01 3F D6 00 00 80 12 E1 03 14 AA ?? ?? ?? ?? 1F 04 00 71 A1 00 00 54 68 02 40 F9 E0 03 13 AA 08 09 40 F9 00 01 3F D6 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 13 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? F5 3B 40 B9",
+             -1, 0},
+            {"FName::Init",
+             "E9 03 1F 2A 4B 01 40 79 6B C1 00 51 7F 29 00 71 A2 00 00 54 29 05 00 11 ?? ?? ?? ?? 5F 01 14 EB",
+             -1, 0},
+            {"GetTransientPackage",
+             "08 BD 40 F9 00 01 3F D6 ?? ?? ?? ?? 08 01 40 B9 28 00 00 B9 08 04 40 F9 09 01 40 F9 ?? ?? ?? ?? 09 01 00 F9 ?? ?? ?? ?? ?? ?? ?? ?? 88 02 40 F9 ?? ?? ?? ?? 00 05 40 F9 09 04 40 F9 28 25 40 A9 ?? ?? ?? ?? 5F 01 09 EB 69 01 00 54 08 A8 40 39",
+             -1, 0},
 
-            // GNames — ADRP+ADD pattern loading FNamePool address
-            // Find via string xref "FNamePool.DuplicateHardcodedName"
-            // The ADRP instruction loads the page, ADD adds the offset
-            // We scan for the FNamePool init function's characteristic pattern
+            // ══ PFX Store / Achievements ═══════════════════════════════════════
+            {"PFXStoreManager::IsTableOwned",
+             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 74 86 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? 74 7E 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? 60 76 40 F9",
+             -1, 0},
+            {"PFXAchievementsManager::IsAchievementUnlocked",
+             "88 46 00 F9 ?? ?? ?? ?? E8 07 40 B9 E0 03 13 AA 89 12 40 F9 1F 01 00 71 E1 07 9F 1A 3F 01 00 F1 28 05 89 9A 88 12 00 F9 68 02 40 F9 08 11 40 F9",
+             -1, 0},
+            // Alias — some mods use _Real suffix
+            {"PFXAchievementsManager::IsAchievementUnlocked_Real",
+             "88 46 00 F9 ?? ?? ?? ?? E8 07 40 B9 E0 03 13 AA 89 12 40 F9 1F 01 00 71 E1 07 9F 1A 3F 01 00 F1 28 05 89 9A 88 12 00 F9 68 02 40 F9 08 11 40 F9",
+             -1, 0},
+            {"PFXAchievementsManager::IsHologram",
+             "A8 16 40 F9 F3 03 00 AA E8 07 00 F9 FF 07 00 B9 ?? ?? ?? ?? 88 12 40 F9 ?? ?? ?? ?? 81 0E 40 F9 ?? ?? ?? ?? E0 03 14 AA ?? ?? ?? ?? ?? ?? ?? ?? 82 46 40 F9 ?? ?? ?? ?? E0 03 14 AA 48 0C 40 F9 88 46 00 F9 ?? ?? ?? ?? E8 07 40 B9 E0 03 13 AA 89 12 40 F9 1F 01 00 71 E1 07 9F 1A 3F 01 00 F1 28 05 89 9A 88 12 00 F9 68 02 40 F9 08 01 40 F9",
+             -1, 0},
+            {"PFXAchievementsManager::GetTrophy",
+             "E8 07 40 B9 E0 03 13 AA 89 12 40 F9 1F 01 00 71 E1 07 9F 1A 3F 01 00 F1 28 05 89 9A 88 12 00 F9 68 02 40 F9 08 0D 40 F9",
+             -1, 0},
+            {"PFXAchievementsManager::SetTrophyBeenSeen",
+             "88 12 00 F9 68 02 40 F9 08 09 40 F9 00 01 3F D6 E0 3F 40 F9 ?? ?? ?? ??",
+             -1, 0},
 
-            // GUObjectArray — find via string "UObjectArray.cpp"
-            // The init function references &GUObjectArray as first arg
+            // ══ PFX Collectibles ═══════════════════════════════════════════════
+            {"PFXCollectiblesManager::UnlockEntry",
+             "?? ?? ?? ?? ?? ?? ?? ?? EA 27 02 A9 ?? ?? ?? ?? A8 03 1F F8 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 26 00 88 52 E7 03 1F AA ?? ?? ?? ?? E9 23 01 A9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E2 03 14 AA 04 05 80 52 05 01 80 52 06 00 A2 72 ?? ?? ?? ?? E8 2B 00 A9 ?? ?? ?? ?? 81 02 40 F9 E0 03 13 AA ?? ?? ?? ?? ?? ?? ?? ?? 08 00 40 F9 08 0D 40 F9 00 01 3F D6 A0 83 1E F8",
+             -1, 0},
+            {"PFXCollectibleEntry::IsUnlocked",
+             "?? ?? ?? ?? ?? ?? ?? ?? 08 51 43 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? EA 27 02 A9 ?? ?? ?? ??",
+             -1, 0},
+            {"PFXCollectibleEntry::SetUnlocked",
+             "E1 13 40 39 1F 01 00 F1 08 05 88 9A 88 12 00 F9 ?? ?? ?? ?? 60 02 00 F9 C8 16 40 F9 E9 07 40 F9 1F 01 09 EB C1 00 00 54 F4 4F 43 A9 F6 57 42 A9 FD 7B 41 A9 ?? ?? ?? ?? C0 03 5F D6 ?? ?? ?? ?? ?? ?? ?? ?? FD 7B 04 A9 ?? ?? ?? ?? F4 4F 05 A9",
+             -1, 0},
+
+            // ══ YUP Component System ═══════════════════════════════════════════            // ── PFX Collectibles GetAllEntries (added — was missing from pattern_signatures) ──
+            {"PFXCollectiblesManager::GetAllEntries",
+             "08 51 43 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? EA 27 02 A9 ?? ?? ?? ?? A8 03 1F F8 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_AddPropertyToComponent",
+             "E9 20 04 29 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? FD 7B BF A9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_RegisterPropertyBinding",
+             "?? ?? ?? ?? E1 03 1F 2A 02 05 00 51 ?? ?? ?? ?? 95 02 40 F9 FF 83 00 39",
+             -1, 0},
+            {"YUP_RegisterActionBinding",
+             "FF 23 00 F9 FF FF 06 A9 FF 33 00 F9 F8 7F 09 A9",
+             -1, 0},
+            {"YUP_FinalizeComponent",
+             "00 5D 41 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 1F 7D 00 A9",
+             -1, 0},
+            {"YUP_ResetComponent",
+             "?? ?? ?? ?? 9F 0A 00 F9 9F 62 00 39 88 02 00 F9",
+             -1, 0},
+
+            // ══ YUP Table Debug ════════════════════════════════════════════════
+            {"YUP_TableDebugInterface_Init",
+             "80 0F 01 AD ?? ?? ?? ?? E8 23 40 F9 E9 07 40 F9",
+             -1, 0},
+            {"YUP_TableDebug_SetPause",
+             "?? ?? ?? ?? ?? ?? ?? ?? E1 03 16 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E1 03 1B 2A FF 23 08 A9 ?? ?? ?? ?? ?? ?? ?? ?? E3 03 14 2A E7 03 1A AA FF 4B 00 F9 F4 33 01 79 FF 23 06 A9 08 00 80 12 FF 3B 00 F9 F4 F3 00 79 E8 13 00 B9 48 00 80 52 FF 0B 00 B9 E8 03 00 B9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_TableDebug_SetGodMode",
+             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E1 03 1B 2A FF 23 08 A9 ?? ?? ?? ?? ?? ?? ?? ?? E3 03 14 2A E7 03 1A AA FF 4B 00 F9 F4 33 01 79 FF 23 06 A9 08 00 80 12 FF 3B 00 F9 F4 F3 00 79 E8 13 00 B9 48 00 80 52 FF 0B 00 B9 E8 03 00 B9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_TableDebug_PauseToggle",
+             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E1 03 1B 2A FF 23 08 A9 ?? ?? ?? ?? ?? ?? ?? ?? E3 03 14 2A E7 03 1A AA FF 4B 00 F9 F4 33 01 79 FF 23 06 A9 08 00 80 12 FF 3B 00 F9 F4 F3 00 79 E8 13 00 B9 48 00 80 52 FF 0B 00 B9 E8 03 00 B9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_TableDebug_ToggleGodMode",
+             "FF 4B 00 F9 F4 33 01 79 FF 23 06 A9 08 00 80 12 FF 3B 00 F9 F4 F3 00 79 E8 13 00 B9 48 00 80 52",
+             -1, 0},
+            {"YUP_TableDebug_SetSpeed",
+             "F4 F3 00 79 E8 13 00 B9 48 00 80 52 FF 0B 00 B9",
+             -1, 0},
+            {"YUP_TableDebug_DumpAction",
+             "88 02 08 AA 49 00 C0 F2 E9 A3 16 A9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_TableDebug_DebugLoad",
+             "?? ?? ?? ?? E0 03 18 AA ?? ?? ?? ?? E0 03 1C AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 9F 2A 00 F1 01 F5 FF 54",
+             -1, 0},
+
+            // ══ YUP Physics ════════════════════════════════════════════════════
+            {"YUP_InitPhysPropertyBindings",
+             "D5 0A 01 39 ?? ?? ?? ?? 15 85 03 39 C0 4E 40 F9",
+             -1, 0},
+            {"YUP_PendulumBall_Attach",
+             "00 E6 07 2F ?? ?? ?? ?? 29 91 40 F9 7F 42 01 39",
+             -1, 0},
+            {"YUP_PendulumBall_Detach",
+             "?? ?? ?? ?? E0 03 17 AA 76 A2 40 B9 ?? ?? ?? ?? ?? ?? ?? ?? E0 03 17 AA ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E1 03 16 2A E8 53 01 F9 ?? ?? ?? ?? ?? ?? ?? ?? 03 00 80 12 E7 03 15 AA FF 4F 01 F9 FF 57 01 F9 ?? ?? ?? ?? FB 63 05 79 FF 3F 01 F9 E8 43 01 F9 FF 47 01 F9 FB 23 05 79 F8 13 00 B9 FF 0B 00 B9 FA 03 00 B9 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_PendulumBall_Reset",
+             "F5 13 40 F9 ?? ?? ?? ?? C0 03 5F D6 88 42 80 B9",
+             -1, 0},
+            {"YUP_BallInformator_GetSingleton",
+             "08 00 40 F9 E9 13 00 39 08 71 40 F9 00 01 3F D6",
+             -1, 0},
+            {"YUP_MakePropertyName",
+             "?? ?? ?? ?? E0 07 00 F9 ?? ?? ?? ?? E0 03 08 AA ?? ?? ?? ?? E8 03 00 2A E0 07 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 1F 01 00 F9 1F 09 00 B9 ?? ?? ?? ?? E0 07 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? FD 7B 02 A9 ?? ?? ?? ?? F4 4F 03 A9 53 D0 3B D5 68 16 40 F9 A8 83 1F F8 ?? ?? ?? ?? ?? ?? ?? ?? 08 FD DF 08 ?? ?? ?? ?? ?? ?? ?? ?? 08 91 72 39 ?? ?? ?? ??",
+             -1, 0},
+            {"YUP_BallInformator_GetSpeed",
+             "?? ?? ?? ?? ?? ?? ?? ?? 03 00 80 12 E7 03 15 AA FF C7 01 F9 FF CF 01 F9 ?? ?? ?? ?? E8 BB 01 F9",
+             -1, 0},
+
+            // ══ PFX Save / Award System ════════════════════════════════════════
+            {"PFX_SaveManager_SetSingleton",
+             "?? ?? ?? ?? F6 57 02 A9 F4 4F 03 A9 ?? ?? ?? ?? F3 03 03 2A F4 03 02 AA F5 03 01 AA F6 03 1F AA 97 02 16 8B B8 02 16 8B ?? ?? ?? ?? ?? ?? ?? ?? E8 0A 40 B9 08 0B 00 B9 E8 1A 40 B9 08 1B 00 B9",
+             -1, 0},
+            {"PFX_SaveManager_ClearSingleton",
+             "F3 03 03 2A F4 03 02 AA F5 03 01 AA F6 03 1F AA 97 02 16 8B B8 02 16 8B ?? ?? ?? ?? ?? ?? ?? ?? E8 0A 40 B9 08 0B 00 B9",
+             -1, 0},
+            {"PFX_SaveManager_MutexLock",
+             "B4 83 5E B8 B3 03 5E F8 F6 0B 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA ?? ?? ?? ?? C8 16 40 F9",
+             -1, 0},
+            {"PFX_SaveManager_MutexUnlock",
+             "?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA ?? ?? ?? ?? C8 16 40 F9 A9 03 5F F8 1F 01 09 EB 61 02 00 54",
+             -1, 0},
+            {"PFX_CheatManager_GetSingleton",
+             "?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA ?? ?? ?? ?? 60 02 40 F9 F3 0B 40 F9 FD 7B C2 A8 C0 03 5F D6 FD 7B BE A9 F3 0B 00 F9 ?? ?? ?? ?? ?? ?? ?? ?? 00 E5 43 F9 ?? ?? ?? ?? F3 0B 40 F9 FD 7B C2 A8 C0 03 5F D6 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? E0 03 13 AA ?? ?? ?? ?? 60 02 40 F9 F3 0B 40 F9 FD 7B C2 A8 C0 03 5F D6 FD 7B BE A9 F3 0B 00 F9 ?? ?? ?? ?? 13 00 40 F9",
+             -1, 0},
+            {"PFX_GameSubsystem_GetSingleton",
+             "?? ?? ?? ?? 42 00 80 52 ?? ?? ?? ?? ?? ?? ?? ?? 88 16 40 F9 A9 83 5F F8 1F 01 09 EB A1 00 00 54 F4 4F 45 A9 FD 7B 44 A9 ?? ?? ?? ?? C0 03 5F D6 ?? ?? ?? ?? FD 7B BE A9 F3 0B 00 F9 ?? ?? ?? ?? ?? ?? ?? ?? 00 45 46 F9 ?? ?? ?? ?? F3 0B 40 F9 FD 7B C2 A8 C0 03 5F D6 ?? ?? ?? ?? ?? ?? ?? ??",
+             -1, 0},
+            {"PFX_AwardUnlockTable",
+             "F3 03 00 AA 1F AC 02 F9 08 00 00 F9 ?? ?? ?? ??",
+             -1, 0},
+            {"PFX_AwardLockTable",
+             "FF 5B 00 B9 F8 23 00 F9 E8 2B 00 F9 B4 6B 3E A9 ?? ?? ?? ?? E8 5B 40 B9 ?? ?? ?? ?? A8 02 00 B9 ?? ?? ?? ?? E8 7B 8C B9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 08 7D 1B 9B E9 1B 00 F9 3F 6B 28 B8",
+             -1, 0},
+            {"PFX_AwardUnlockAll",
+             "FD 7B C1 A8 C0 03 5F D6 ?? ?? ?? ?? FD 7B 05 A9 ?? ?? ?? ?? F4 4F 06 A9 54 D0 3B D5 F3 03 00 AA 88 16 40 F9 A8 83 1F F8 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 08 FD DF 08 ?? ?? ?? ?? ?? ?? ?? ?? 24 01 40 F9",
+             -1, 0},
+            {"PFX_AwardLockAll",
+             "E8 03 00 2A ?? ?? ?? ?? E0 03 40 F9 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? 22 00 80 52 00 05 40 AD 02 09 C0 3D E0 87 00 AD 08 61 40 79 E2 0F 80 3D E8 83 00 79 ?? ?? ?? ??",
+             -1, 0},
+            {"PFX_UnLockAllTables",
+             "?? ?? ?? ?? 1F 04 00 71 A1 00 00 54 E8 02 40 F9 E0 03 17 AA 08 09 40 F9 00 01 3F D6 57 83 5A F8",
+             -1, 0},
+            {"PFX_SaveManager_HashLookup",
+             "?? ?? ?? ?? 22 00 80 52 68 02 00 F9 ?? ?? ?? ?? 69 26 00 F9 60 82 85 3C",
+             -1, 0},
+
+            // ══ AES / PAK ══════════════════════════════════════════════════════
+            {"AES_set_decrypt_key",
+             "00 1C 21 6E 08 1D 29 6E 84 03 02 4E 8C 03 0A 4E",
+             -1, 0},
+            {"AES_set_encrypt_key",
+             "41 7D 40 4C E0 02 03 4E E8 02 0B 4E 84 1C 30 6E",
+             -1, 0},
+            {"FAES_DecryptData",
+             "1F 01 09 6B 4D 05 00 54 ?? ?? ?? ?? 0C 0C 40 92",
+             -1, 0},
+            {"GetPakEncryptionKey",
+             "F7 03 00 AA 16 00 00 F9 ?? ?? ?? ?? E1 02 40 F9",
+             -1, 0},
+        };
+
+        // ── Relative offset fallbacks for functions without unique AOB patterns ──
+        // These resolve via a known working function + a fixed offset.
+        // Verified on both old (Pinball FX VR launch) and new (latest update) binaries.
+        // The offset must be in the SAME compilation unit (.o file) for stability.
+        //
+        // Format: {"TargetSymbol", "AnchorSymbol", delta_bytes}
+        // Resolved as: Target = resolve(AnchorSymbol) + delta_bytes
+        p.relative_offsets = {
+            // BallInformator_Init = GetSingleton + 0xE4 (confirmed same .o file)
+            {"YUP_BallInformator_Init", "YUP_BallInformator_GetSingleton", 0xE4},
         };
 
         return p;

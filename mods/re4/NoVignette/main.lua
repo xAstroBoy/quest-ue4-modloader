@@ -15,7 +15,7 @@
 -- v3.0: Full UE4SS API with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoVignette"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {

@@ -112,7 +112,7 @@ local function Err(msg)
 end
 
 local TAG = "[DebugMenuAPI]"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then print(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)

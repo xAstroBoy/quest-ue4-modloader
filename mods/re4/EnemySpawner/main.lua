@@ -29,7 +29,7 @@
 -- v8.0 — Direct EmSetEvent() spawning (replaces broken ESL-write approach)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "EnemySpawner"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── HP presets (LE uint16 → {lo, hi}) ───────────────────────────────

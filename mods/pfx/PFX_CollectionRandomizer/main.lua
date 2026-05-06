@@ -25,6 +25,8 @@
 --     the new randomized entry (replace even when slot already occupied).
 --
 local TAG = "PFX_Randomizer"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 Log(TAG .. ": Loading v40...")
 
 -- ============================================================================
@@ -1542,6 +1544,7 @@ end)
 -- ============================================================================
 pcall(function()
     RegisterCommand("randomize", function()
+        V("randomize command fired")
         if not poolReady then pcall(build_entry_pool) end
         pcall(scramble_all_slots)
         pcall(scramble_table_cosmetics)
@@ -1557,6 +1560,7 @@ end)
 
 pcall(function()
     RegisterCommand("randomize_status", function()
+        V("randomize_status command fired")
         local slotCount = count_registered_slots()
         local msg = TAG .. " v34: pool=" .. stats.pool_size
             .. " slots=" .. slotCount

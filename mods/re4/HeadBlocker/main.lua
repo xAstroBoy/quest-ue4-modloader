@@ -4,7 +4,7 @@
 -- via NotifyOnNewObject + K2_DestroyActor.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "HeadBlocker"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -91,6 +91,7 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("headblocker", function()
+    V("headblocker command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("HeadBlocker", state)
     Log(TAG .. ": " .. (state.enabled and "OFF" or "ON"))

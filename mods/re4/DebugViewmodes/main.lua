@@ -4,7 +4,7 @@
 -- GameInstance config moved to Patches mod.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "DebugViewmodes"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
@@ -57,6 +57,7 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("debugview", function()
+    V("debugview command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("DebugViewmodes", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))

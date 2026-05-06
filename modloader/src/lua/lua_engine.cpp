@@ -14,6 +14,7 @@
 #include "modloader/lua_enum_ext.h"
 #include "modloader/lua_console.h"
 #include "modloader/lua_cast.h"
+#include "modloader/lua_yup.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
 
@@ -177,6 +178,9 @@ namespace lua_engine
 
         // Register Cast layer, CastParms, SpawnActor, NewObject, introspection API
         lua_cast::register_all(*s_lua);
+
+        // Register YUP physics engine compat layer (Pinball FX VR only — no-op on other games)
+        lua_yup::register_all(*s_lua);
 
         // Initialize SharedAPI as a bare Lua global table.
         // The modloader is GENERIC — it only provides the empty SharedAPI namespace.

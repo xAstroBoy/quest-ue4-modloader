@@ -35,42 +35,110 @@ namespace lua_uobject
     thread_local sigjmp_buf g_call_ufunction_jmp;
     thread_local volatile uintptr_t g_call_ufunction_fault_addr = 0;
 
-    // ═══ Crash Rate-Limiter ════════════════════════════════════════════════
-    // Tracks per-function crash counts to suppress duplicate log spam.
-    // First crash logs full details; subsequent crashes are counted silently.
-    // Summary is logged when the function name changes or on periodic intervals.
-    struct CrashStats
-    {
-        int count = 0;
-        uintptr_t last_fault = 0;
-    };
-    static std::mutex s_crash_stats_mtx;
-    static std::unordered_map<std::string, CrashStats> s_crash_stats;
+    // GUObjectArray round-trip validation.
+    // Reads InternalIndex via an UNTAGGED (MTE tag=0) pointer — ARM MTE excludes
+    // tag-0 accesses from hardware tag checking, so this is safe even when the
+    // Lua-held pointer has a stale or mismatched MTE tag in its top byte.
+    // Returns false if the GUObjectArray slot no longer holds this exact object
+    // (i.e., object was GC'd, freed, or reallocated since the pointer was captured).
+    // EObjectFlags that indicate an object is NOT safe to call native methods on.
+    // These cover objects that are: CDOs, archetypes, still loading (PrimaryDataAsset async),
+    // not yet initialized, or in the process of being GC'd.
+    // CRASH PATTERN: fault_addr=0x0/0x44/0xd4/0x118 etc. are NULL+field_offset derefs
+    // caused by calling SetBrandNewUnlock on PFXCollectibleCategoryData objects that
+    // extend PrimaryDataAsset and have RF_NeedPostLoad set — their C++ fields are garbage.
+    static constexpr int32_t UNSAFE_OBJECT_FLAGS =
+        ue::RF_ClassDefaultObject       |  // 0x0010 CDO — never has real data
+        ue::RF_ArchetypeObject          |  // 0x0020 archetype — template, not instance
+        ue::RF_NeedInitialization       |  // 0x0200 constructor not run yet
+        ue::RF_NeedLoad                 |  // 0x0400 still being deserialized
+        ue::RF_NeedPostLoad             |  // 0x1000 PostLoad() not called yet
+        ue::RF_NeedPostLoadSubobjects   |  // 0x2000 sub-object post-load pending
+        ue::RF_BeginDestroyed           |  // 0x8000 ConditionalBeginDestroy() called
+        ue::RF_FinishDestroyed;            // 0x10000 FinishDestroy() called
 
-    // Returns true if this crash should be logged in full (first occurrence).
-    // Always increments the counter.
-    static bool crash_rate_check(const std::string &func_key, uintptr_t fault_addr)
+    static bool is_live_in_guobjectarray(ue::UObject *obj)
     {
-        std::lock_guard<std::mutex> lk(s_crash_stats_mtx);
-        auto &st = s_crash_stats[func_key];
-        st.count++;
-        st.last_fault = fault_addr;
-        return st.count == 1; // only log first
+        if (!obj)
+            return false;
+        // Strip top byte → untagged pointer (tag=0 bypasses MTE check on ARM64)
+        uintptr_t raw = reinterpret_cast<uintptr_t>(obj) & 0x00FFFFFFFFFFFFFFULL;
+        if (raw < 0x10000)
+            return false;
+        // Sanity: page must still be mapped before we read anything from it
+        if (!ue::is_mapped_ptr(reinterpret_cast<const void *>(raw)))
+            return false;
+        // Check EObjectFlags — reject objects in unsafe states (uninitialized,
+        // still loading, CDO, archetype, or being destroyed). These objects exist
+        // in GUObjectArray but their C++ fields are not ready for native function calls.
+        int32_t obj_flags = 0;
+        __builtin_memcpy(&obj_flags, reinterpret_cast<const void *>(raw + ue::uobj::OBJECT_FLAGS), sizeof(obj_flags));
+        if (obj_flags & UNSAFE_OBJECT_FLAGS)
+            return false;
+        // Read InternalIndex at offset 0x0C via the untagged address
+        int32_t idx = 0;
+        __builtin_memcpy(&idx, reinterpret_cast<const void *>(raw + ue::uobj::INTERNAL_INDEX), sizeof(idx));
+        // Sanity bound: valid indices are [0, NumElements).
+        // Use a safe upper cap to avoid reading past the chunk pointer array.
+        int32_t live_count = reflection::get_live_object_count();
+        if (idx < 0 || live_count <= 0 || idx >= live_count)
+            return false;
+        // Look up the GUObjectArray slot — get_object_by_index is safe for validated idx
+        ue::UObject *slot_obj = reflection::get_object_by_index(idx);
+        if (!slot_obj)
+            return false; // slot is empty (object was freed)
+        // Compare raw addresses — strip tags for comparison so a freshly reallocated
+        // object at the same VA but different MTE tag is detected as different
+        uintptr_t slot_raw = reinterpret_cast<uintptr_t>(slot_obj) & 0x00FFFFFFFFFFFFFFULL;
+        return slot_raw == raw;
     }
 
-    // Flush crash stats: log summary for any function that crashed >1 time, then clear.
-    static void crash_rate_flush()
+    // Diagnostic version: logs WHY the check failed (called from ObjectProperty reader)
+    static bool is_live_in_guobjectarray_diag(ue::UObject *obj, const char *prop_name)
     {
-        std::lock_guard<std::mutex> lk(s_crash_stats_mtx);
-        for (auto &[key, st] : s_crash_stats)
+        if (!obj)
+            return false;
+        uintptr_t raw = reinterpret_cast<uintptr_t>(obj) & 0x00FFFFFFFFFFFFFFULL;
+        if (raw < 0x10000)
         {
-            if (st.count > 1)
-            {
-                logger::log_warn("CALL", "ProcessEvent crash summary: %s crashed %d times (fault_addr=0x%lx) — all recovered",
-                                 key.c_str(), st.count, (unsigned long)st.last_fault);
-            }
+            logger::log_warn("GUOA", "'%s' 0x%llx: raw<0x10000", prop_name, (unsigned long long)raw);
+            return false;
         }
-        s_crash_stats.clear();
+        if (!ue::is_mapped_ptr(reinterpret_cast<const void *>(raw)))
+        {
+            logger::log_warn("GUOA", "'%s' 0x%llx: not mapped", prop_name, (unsigned long long)raw);
+            return false;
+        }
+        // Check EObjectFlags — object must be fully initialized and not being destroyed
+        int32_t obj_flags = 0;
+        __builtin_memcpy(&obj_flags, reinterpret_cast<const void *>(raw + ue::uobj::OBJECT_FLAGS), sizeof(obj_flags));
+        if (obj_flags & UNSAFE_OBJECT_FLAGS)
+        {
+            logger::log_warn("GUOA", "'%s' 0x%llx: unsafe EObjectFlags=0x%x (loading/uninit/destroyed)",
+                             prop_name, (unsigned long long)raw, (unsigned)obj_flags);
+            return false;
+        }
+        int32_t idx = 0;
+        __builtin_memcpy(&idx, reinterpret_cast<const void *>(raw + ue::uobj::INTERNAL_INDEX), sizeof(idx));
+        int32_t live_count = reflection::get_live_object_count();
+        if (idx < 0 || live_count <= 0 || idx >= live_count)
+        {
+            logger::log_warn("GUOA", "'%s' 0x%llx: idx=%d out of [0,%d)", prop_name, (unsigned long long)raw, idx, live_count);
+            return false;
+        }
+        ue::UObject *slot_obj = reflection::get_object_by_index(idx);
+        if (!slot_obj)
+        {
+            logger::log_warn("GUOA", "'%s' 0x%llx: idx=%d slot is null (freed)", prop_name, (unsigned long long)raw, idx);
+            return false;
+        }
+        uintptr_t slot_raw = reinterpret_cast<uintptr_t>(slot_obj) & 0x00FFFFFFFFFFFFFFULL;
+        if (slot_raw != raw)
+        {
+            logger::log_warn("GUOA", "'%s' 0x%llx: idx=%d slot=0x%llx MISMATCH", prop_name, (unsigned long long)raw, idx, (unsigned long long)slot_raw);
+            return false;
+        }
+        return true;
     }
 
     // ═══ Game-thread ProcessEvent dispatch (throttled via pe_hook queue) ════
@@ -226,9 +294,9 @@ namespace lua_uobject
 
         // Defensive validation — queued calls may execute later when object/function
         // is already destroyed or GC'd.
-        if (!item.obj || !ue::is_mapped_ptr(item.obj) || !ue::is_valid_ptr(item.obj) || !ue::is_valid_uobject(item.obj))
+        if (!item.obj || !ue::is_mapped_ptr(item.obj) || !ue::is_valid_ptr(item.obj) || !ue::is_valid_uobject(item.obj) || !is_live_in_guobjectarray(item.obj))
         {
-            logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid object %p",
+            logger::log_warn("CALLBG", "[GT] Dropping call %s::%s — invalid/stale object %p",
                              item.class_name.c_str(), item.func_name.c_str(), item.obj);
             if (item.fstring_allocs)
                 for (auto *p : *item.fstring_allocs)
@@ -254,23 +322,23 @@ namespace lua_uobject
         // from freeing shallow-copied TArray Data pointers in struct params.
         void *saved_dtor_link = ue::read_field<void *>(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF());
 
+        // Null DestructorLink only for non-native Blueprint functions (same race guard as Call()).
+        static constexpr uint32_t FUNC_Native_GT = 0x00000400;
+        const bool is_native_gt = (saved_func_flags & FUNC_Native_GT) != 0;
+
         // Crash guard — if ProcessEvent crashes, recover instead of killing game
         g_in_call_ufunction = 1;
         int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
         if (pe_crash_sig != 0)
         {
             ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
-            ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+            // Only restore DestructorLink if we mutated it (non-native functions only)
+            if (!is_native_gt)
+                ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
             uintptr_t fault = g_call_ufunction_fault_addr;
-            std::string crash_key = item.class_name + "::" + item.func_name;
-            bool first = crash_rate_check(crash_key, fault);
-            if (first)
-            {
-                logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
-                                            "— recovered, skipping (further crashes suppressed)",
-                                  pe_crash_sig, (unsigned long)fault,
-                                  item.class_name.c_str(), item.func_name.c_str(), item.obj);
-            }
+            logger::log_error("CALLBG", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p — recovered, skipping",
+                              pe_crash_sig, (unsigned long)fault,
+                              item.class_name.c_str(), item.func_name.c_str(), item.obj);
             g_in_call_ufunction = 0;
             // Still clean up allocations
             if (item.fstring_allocs)
@@ -281,13 +349,19 @@ namespace lua_uobject
             return;
         }
 
-        // Null DestructorLink before PE to prevent DestroyValue on shallow-copied TArrays
-        ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+        // Null DestructorLink only for non-native Blueprint functions (race guard applied above)
+        if (!is_native_gt)
+        {
+            ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+        }
 
         pe_fn(item.obj, item.func, params_ptr);
 
-        // Restore DestructorLink + FunctionFlags
-        ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        // Restore DestructorLink + FunctionFlags (only if we mutated them)
+        if (!is_native_gt)
+        {
+            ue::write_field(item.func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        }
         ue::write_field(item.func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
         g_in_call_ufunction = 0;
 
@@ -786,7 +860,22 @@ namespace lua_uobject
         case reflection::PropType::InterfaceProperty:
         {
             ue::UObject *ptr = *reinterpret_cast<ue::UObject *const *>(base + prop.offset);
-            if (!ptr || !ue::is_valid_ptr(ptr))
+            // is_valid_ptr: range check (strips MTE top byte)
+            // is_mapped_ptr: msync to confirm the page is actually mapped
+            // is_live_in_guobjectarray: validates through GUObjectArray so that MTE-tagged
+            //   garbage pointers (e.g. UnlockData=0x8000000b300044) are rejected.
+            //   is_mapped_ptr alone is insufficient — the Linux kernel strips the MTE top
+            //   byte in syscalls (TBI), so msync(0x8000000b300000) succeeds if the untagged
+            //   address is mapped. The GUObjectArray lookup strips tags before comparing,
+            //   so a stale/garbage tagged pointer will fail the InternalIndex→slot check.
+            if (!ptr)
+                return sol::nil;
+            if (!ue::is_valid_ptr(ptr))
+            {
+                logger::log_warn("OBJPROP", "'%s' raw=0x%llx failed is_valid_ptr", prop.name.c_str(), (unsigned long long)(uintptr_t)ptr);
+                return sol::nil;
+            }
+            if (!is_live_in_guobjectarray_diag(ptr, prop.name.c_str()))
                 return sol::nil;
             // Wrap as LuaUObject
             LuaUObject wrapped;
@@ -1161,6 +1250,32 @@ namespace lua_uobject
             if (value.is<LuaUObject>())
             {
                 LuaUObject &wrapped = value.as<LuaUObject &>();
+                // Guard: validate that the object is still alive before writing.
+                // Writing a pointer to a GC-pending or destroyed object corrupts the
+                // UE5 GC graph and causes infinite recursion in the destructor walker
+                // → SIGSEGV on GameThread. Use the same validity check as Get().
+                if (wrapped.ptr)
+                {
+                    if (!ue::is_mapped_ptr(wrapped.ptr) || !ue::is_valid_uobject(wrapped.ptr))
+                    {
+                        logger::log_warn("UOBJ", "Set('%s'): refusing to write invalid/GC-pending UObject %p — would corrupt GC graph",
+                                         prop.name.c_str(), (void *)wrapped.ptr);
+                        return false;
+                    }
+                    // Also check RF_BeginDestroyed / RF_FinishDestroyed flags.
+                    // When GC marks an object for destruction it sets these flags before
+                    // calling BeginDestroy(). Any reference written after this point
+                    // will point to a dead object in the next GC sweep.
+                    int32_t flags = ue::uobj_get_flags(wrapped.ptr);
+                    constexpr int32_t RF_BeginDestroyed = 0x00008000;
+                    constexpr int32_t RF_FinishDestroyed = 0x00010000;
+                    if (flags & (RF_BeginDestroyed | RF_FinishDestroyed))
+                    {
+                        logger::log_warn("UOBJ", "Set('%s'): refusing to write RF_BeginDestroyed/RF_FinishDestroyed UObject %p (flags=0x%X) — GC is destroying it",
+                                         prop.name.c_str(), (void *)wrapped.ptr, (unsigned)flags);
+                        return false;
+                    }
+                }
                 *reinterpret_cast<ue::UObject **>(base + prop.offset) = wrapped.ptr;
                 return true;
             }
@@ -1860,41 +1975,42 @@ namespace lua_uobject
         // inside struct params (e.g., PFXTableCustomizationArmSkinData).
         void *saved_dtor_link = ue::read_field<void *>(func, ue::ustruct::DESTRUCTOR_LINK_OFF());
 
+        // GUObjectArray round-trip: skip if object was freed/reallocated since captured.
+        // Uses untagged (MTE-excluded) pointer read to detect stale MTE-tagged ptrs.
+        if (!is_live_in_guobjectarray(obj))
+        {
+            logger::log_warn("CALL", "Skipping %s::%s on %p — not in GUObjectArray (stale/freed)",
+                             class_name.c_str(), func_name.c_str(), obj);
+            for (auto *p : fstring_allocs)
+                delete[] p;
+            conv_scope.cleanup();
+            return sol::nil;
+        }
+
         // sigsetjmp crash guard — catches SIGSEGV inside ProcessEvent
         g_in_call_ufunction = 1;
         g_call_ufunction_fault_addr = 0;
         int pe_crash_sig = sigsetjmp(g_call_ufunction_jmp, 1);
         if (pe_crash_sig != 0)
         {
-            // Restore FunctionFlags even on crash — prevents cascade failures
+            // Restore FunctionFlags — ProcessEvent modifies them internally;
+            // if left corrupted all future calls to this UFunction will also crash.
             ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
-            // Restore DestructorLink on crash
+            // Restore DestructorLink
             ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
-            // Rate-limited crash logging — log first occurrence in detail,
-            // suppress duplicates, flush summary later.
+            // Log crash details — every occurrence, no suppression, no state tracking
             uintptr_t fault = g_call_ufunction_fault_addr;
-            std::string crash_key = class_name + "::" + func_name;
-            bool first = crash_rate_check(crash_key, fault);
-            if (first)
-            {
-                logger::log_error("CALL", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
-                                          "— recovered, returning nil (further crashes suppressed)",
-                                  pe_crash_sig, (unsigned long)fault,
-                                  class_name.c_str(), func_name.c_str(), obj);
-                // Log param buffer hex dump for diagnosis (first crash only)
-                {
-                    char hex[256];
-                    int hlen = 0;
-                    size_t dump_sz = params_buf.size() < 64 ? params_buf.size() : 64;
-                    for (size_t b = 0; b < dump_sz && hlen < 240; b++)
-                    {
-                        hlen += snprintf(hex + hlen, 256 - hlen, "%02x", params_buf[b]);
-                        if ((b & 7) == 7 && b + 1 < dump_sz)
-                            hlen += snprintf(hex + hlen, 256 - hlen, " ");
-                    }
-                    logger::log_error("CALL", "  params[%zu]: %s", params_buf.size(), hex);
-                }
-            }
+            uintptr_t obj_raw = reinterpret_cast<uintptr_t>(obj) & 0x00FFFFFFFFFFFFFFULL;
+            intptr_t fault_offset = static_cast<intptr_t>(fault) - static_cast<intptr_t>(obj_raw);
+            logger::log_error("CALL", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on obj=%p — recovered, returning nil",
+                              pe_crash_sig, (unsigned long)fault,
+                              class_name.c_str(), func_name.c_str(), obj);
+            if (fault_offset >= 0 && fault_offset < 0x10000)
+                logger::log_error("CALL", "  FAULT at obj+0x%lx — bad field inside UObject at that offset",
+                                  (unsigned long)fault_offset);
+            else
+                logger::log_error("CALL", "  FAULT at 0x%lx — dangling sub-object ptr (obj_raw=0x%lx)",
+                                  (unsigned long)fault, (unsigned long)obj_raw);
             g_in_call_ufunction = 0;
             for (auto *p : fstring_allocs)
                 delete[] p;
@@ -1904,15 +2020,23 @@ namespace lua_uobject
         auto pe_fn = pe_hook::get_original();
         if (!pe_fn)
             pe_fn = symbols::ProcessEvent;
-        // CRITICAL: Null DestructorLink BEFORE ProcessEvent.
-        // ProcessEvent walks UFunction::DestructorLink to call DestroyValue on params
-        // after the native function returns. For struct params containing TArrays
-        // (e.g., PFXTableCustomizationArmSkinData.OverrideMaterials), the shallow-copied
-        // TArray Data pointer points to the SOURCE UObject's live array data. DestroyValue
-        // would FMemory::Free that pointer, corrupting the source object. Nulling
-        // DestructorLink prevents ALL param destruction — safe because we manage
-        // FString/FText cleanup manually above.
-        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+        // Null DestructorLink ONLY for Blueprint (non-native) functions.
+        // Native functions handle their own param cleanup in their Func pointer body;
+        // ProcessEvent does not walk DestructorLink for them after the call returns.
+        // For Blueprint functions, DestructorLink IS walked by ProcessEvent to call
+        // DestroyValue on any constructed params. We null it to prevent UE's allocator
+        // from freeing shallow-copied TArray Data pointers from our source objects.
+        //
+        // CRITICAL: Do NOT null DestructorLink for native functions — it is a shared
+        // field on the UFunction object. The game thread can call the same UFunction
+        // concurrently; writing a null here creates a race that causes param destruction
+        // to silently skip for the game's own calls.
+        static constexpr uint32_t FUNC_Native = 0x00000400;
+        const bool is_native_func = (saved_func_flags & FUNC_Native) != 0;
+        if (!is_native_func)
+        {
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), static_cast<void *>(nullptr));
+        }
 
         // DIAGNOSTIC: hex-dump params for Override functions to verify FSoftObjectPath encoding
         if (func_name.find("Override") != std::string::npos && parms_size >= 16)
@@ -1932,9 +2056,11 @@ namespace lua_uobject
 
         pe_fn(obj, func, params);
 
-        // Restore DestructorLink immediately after ProcessEvent returns.
-        // This re-enables normal param destruction for other callers.
-        ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        // Restore DestructorLink only if we nulled it (non-native functions only).
+        if (!is_native_func)
+        {
+            ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
+        }
 
         ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
 
@@ -2655,15 +2781,9 @@ namespace lua_uobject
             ue::write_field(func, ue::ufunc::FUNCTION_FLAGS_OFF(), saved_func_flags);
             ue::write_field(func, ue::ustruct::DESTRUCTOR_LINK_OFF(), saved_dtor_link);
             uintptr_t fault = g_call_ufunction_fault_addr;
-            std::string crash_key = class_name + "::" + func_name;
-            bool first = crash_rate_check(crash_key, fault);
-            if (first)
-            {
-                logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p "
-                                             "— recovered, returning false (further crashes suppressed)",
-                                  pe_crash_sig, (unsigned long)fault,
-                                  class_name.c_str(), func_name.c_str(), obj);
-            }
+            logger::log_error("CALLRAW", "ProcessEvent CRASHED (signal %d, fault_addr=0x%lx) calling %s::%s on %p — recovered, returning false",
+                              pe_crash_sig, (unsigned long)fault,
+                              class_name.c_str(), func_name.c_str(), obj);
             g_in_call_ufunction = 0;
             // No ConvBufScope needed — call_ufunction_bg uses raw params, no Lua conversion
             return false;
@@ -2686,6 +2806,29 @@ namespace lua_uobject
     void register_types(sol::state &lua)
     {
         lua.new_usertype<LuaUObject>("UObject", sol::no_constructor,
+
+                                     // ── __tostring: print(obj) shows ClassName(Name @0xADDR) ──
+                                     sol::meta_function::to_string, [](const LuaUObject &self) -> std::string
+                                     {
+            if (!self.ptr) return "UObject(nil)";
+            if (!ue::is_valid_ptr(self.ptr)) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "UObject(dead @0x%lX)", (unsigned long)(uintptr_t)self.ptr);
+                return std::string(buf);
+            }
+            std::string name = reflection::get_short_name(self.ptr);
+            std::string cls_name;
+            ue::UClass* cls = ue::uobj_get_class(self.ptr);
+            if (cls && ue::is_valid_ptr(cls)) {
+                cls_name = reflection::get_short_name(reinterpret_cast<const ue::UObject*>(cls));
+            }
+            char buf[128];
+            if (cls_name.empty()) {
+                snprintf(buf, sizeof(buf), "UObject(%s @0x%lX)", name.c_str(), (unsigned long)(uintptr_t)self.ptr);
+            } else {
+                snprintf(buf, sizeof(buf), "%s(%s @0x%lX)", cls_name.c_str(), name.c_str(), (unsigned long)(uintptr_t)self.ptr);
+            }
+            return std::string(buf); },
 
                                      // ── Core methods ──
                                      "IsValid", [](const LuaUObject &self) -> bool

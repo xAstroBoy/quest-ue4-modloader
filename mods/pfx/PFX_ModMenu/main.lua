@@ -11,6 +11,8 @@
 --   * rename_legal_button_all() still runs in Construct for early label update
 -- ============================================================================
 local TAG = "PFX_ModMenu"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 Log(TAG .. ": Loading v4...")
 
 -- ============================================================================
@@ -352,6 +354,7 @@ end
 -- RENAME the "Legal" nav button across ALL settings instances
 -- ============================================================================
 local function rename_legal_button_all()
+    V("rename_legal_button_all")
     local all = nil
     pcall(function() all = FindAllOf("WBP_WristMenuSettings_C") end)
     if not all then return end
@@ -451,6 +454,7 @@ local function find_big_settings()
 end
 
 local function build_mod_panel(target_settings)
+    V("build_mod_panel target_settings=%s", tostring(target_settings))
     local big = target_settings
     if not is_live(big) then
         big = find_big_settings()
@@ -528,6 +532,7 @@ end
 -- ============================================================================
 pcall(function()
     RegisterHook("WBP_WristMenuSettings_C:Construct", function(_ctx)
+        V("WBP_WristMenuSettings_C:Construct hook fired")
         panel_built    = false
         last_settings  = nil
         action_buttons = {}
@@ -543,6 +548,7 @@ end)
 -- ============================================================================
 pcall(function()
     local function handle_click(source, raw_ctx)
+        V("handle_click source=%s", source)
         local self_obj = extract_click_object(raw_ctx)
         if not is_live(self_obj) then
             click_stats.ctx_extract_miss = click_stats.ctx_extract_miss + 1
@@ -655,6 +661,7 @@ end)
 -- ============================================================================
 pcall(function()
     RegisterCommand("modmenu_status", function()
+        V("modmenu_status command fired")
         local lines = { TAG .. " v4 | " .. #ACTIONS .. " actions | panel=" .. tostring(panel_built) }
         lines[#lines + 1] = "clicks: default=" .. tostring(click_stats.default_hook_hits)
             .. " base=" .. tostring(click_stats.base_hook_hits)
@@ -673,6 +680,7 @@ end)
 
 pcall(function()
     RegisterCommand("modmenu_exec", function(args)
+        V("modmenu_exec args=%s", tostring(args))
         local idx = tonumber(args)
         if idx and ACTIONS[idx] then
             local result = "?"
@@ -688,6 +696,7 @@ end)
 
 pcall(function()
     RegisterCommand("modmenu_rebuild", function()
+        V("modmenu_rebuild command fired")
         panel_built    = false
         last_settings  = nil
         action_buttons = {}
@@ -699,6 +708,7 @@ end)
 
 pcall(function()
     RegisterCommand("modmenu_rename", function()
+        V("modmenu_rename command fired")
         pcall(rename_legal_button_all)
         return TAG .. ": rename attempted on all instances"
     end)

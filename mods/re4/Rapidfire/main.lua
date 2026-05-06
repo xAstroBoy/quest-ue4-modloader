@@ -19,7 +19,7 @@
 --   PRIMARY mechanism: aggressive reflection tuning (30+ properties)
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Rapidfire"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)

@@ -14,7 +14,7 @@
 -- v1.0: Original with native hooks
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoRecoil"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

@@ -149,11 +149,26 @@ namespace rebuilder
 
     std::vector<ue::UObject *> RebuiltClass::get_all_instances()
     {
+        // Flags that indicate the object's C++ fields are not yet populated or are being freed.
+        static constexpr int32_t UNSAFE_FLAGS =
+            ue::RF_ClassDefaultObject |
+            ue::RF_ArchetypeObject |
+            ue::RF_NeedInitialization |
+            ue::RF_NeedLoad |
+            ue::RF_NeedPostLoad |
+            ue::RF_NeedPostLoadSubobjects |
+            ue::RF_BeginDestroyed |
+            ue::RF_FinishDestroyed;
+
         std::lock_guard<std::mutex> lock(instances_mutex);
         std::vector<ue::UObject *> result;
         for (auto *obj : live_instances)
         {
             if (!ue::is_valid_uobject(obj))
+                continue;
+            // Reject objects in unsafe lifecycle states
+            int32_t obj_flags = ue::uobj_get_flags(obj);
+            if (obj_flags & UNSAFE_FLAGS)
                 continue;
             std::string name = reflection::get_short_name(obj);
             if (ue::is_default_object(name.c_str()))

@@ -1910,19 +1910,31 @@ namespace lua_bindings
         lua.set_function("WriteU8", [](void *addr, int val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
-        *reinterpret_cast<uint8_t*>(addr) = static_cast<uint8_t>(val); });
+        void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
+        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+        *reinterpret_cast<uint8_t*>(addr) = static_cast<uint8_t>(val);
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(addr),
+            reinterpret_cast<char*>(addr) + 1
+        ); });
 
         lua.set_function("WriteU16", [](void *addr, int val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
-        *reinterpret_cast<uint16_t*>(addr) = static_cast<uint16_t>(val); });
+        void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
+        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+        *reinterpret_cast<uint16_t*>(addr) = static_cast<uint16_t>(val);
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(addr),
+            reinterpret_cast<char*>(addr) + 2
+        ); });
 
         lua.set_function("WriteU32", [](void *addr, uint32_t val)
                          {
         if (!ue::is_mapped_ptr(addr)) return;
         // Need to make memory writable for code patches
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
-        mprotect(page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<uint32_t*>(addr) = val;
         // Flush icache for ARM64
         __builtin___clear_cache(
@@ -1934,7 +1946,7 @@ namespace lua_bindings
                          {
         if (!ue::is_mapped_ptr(addr)) return;
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
-        mprotect(page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
         *reinterpret_cast<uint64_t*>(addr) = static_cast<uint64_t>(val);
         __builtin___clear_cache(
             reinterpret_cast<char*>(addr),
@@ -1955,8 +1967,12 @@ namespace lua_bindings
                          {
         if (!ue::is_mapped_ptr(addr)) return;
         void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & ~0xFFFULL);
-        mprotect(page, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
-        *reinterpret_cast<void**>(addr) = val; });
+        mprotect(page, 4096 * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+        *reinterpret_cast<void**>(addr) = val;
+        __builtin___clear_cache(
+            reinterpret_cast<char*>(addr),
+            reinterpret_cast<char*>(addr) + 8
+        ); });
 
         // ── Address helpers ─────────────────────────────────────────────────
         lua.set_function("GetLibBase", []() -> sol::lightuserdata_value

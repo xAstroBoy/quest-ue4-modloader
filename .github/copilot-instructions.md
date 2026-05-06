@@ -7,6 +7,38 @@
 
 ## ⛔ ABSOLUTE RULES — NEVER VIOLATE
 
+### 0. ALWAYS HOT-RELOAD — NEVER RESTART THE GAME TO TEST LUA CHANGES
+
+**MANDATORY: For ALL Lua mod changes, use hot-reload via the bridge. NEVER force-stop or restart the game just to test a Lua change.**
+
+#### Hot-reload workflow (use this EVERY time):
+```bash
+# Push + reload at runtime — NO restart:
+python tools\ue_tool.py --game pfxvr mods --hot
+python tools\ue_tool.py --game pfxvr mods ModName --hot
+
+# Or test live via bridge console first (before even deploying):
+python tools\ue_tool.py --game pfxvr console
+> exec_lua <your lua snippet>
+> reload_mod PFX_ModMenu
+```
+
+#### Rules:
+- ❌ **FORBIDDEN**: `python tools\ue_tool.py --game pfxvr mods` followed by `launch` or `restart` for Lua-only changes
+- ❌ **FORBIDDEN**: Saying "deploy and restart to test" for Lua changes
+- ✅ **REQUIRED**: `mods --hot` for all Lua mod updates
+- ✅ **REQUIRED**: Bridge `exec_lua` to test API calls BEFORE writing mod code
+- ✅ **REQUIRED**: Bridge `reload_mod <name>` to hot-reload a single mod after push
+
+#### When a restart IS actually required (rare):
+- C++ modloader changes (`libmodloader.so`) — these require `all` + restart
+- The game is NOT running at all — then `launch` first, then `mods --hot`
+- A hook registration is broken and the mod is in a crash loop
+
+**If you are about to write `launch` or `restart` after a Lua change — STOP. Use `--hot` instead.**
+
+---
+
 ### 1. NO RAW MEMORY OFFSETS FOR GAME OBJECTS
 **NEVER use `ReadU32`, `WriteU32`, `ReadPtr`, `WriteU8`, `ReadU8`, `Offset()`, `GetAddress()` to read/write UObject properties.**
 
@@ -331,50 +363,100 @@ cd c:\Users\xAstroBoy\Desktop\re4\modloader
 ```
 
 ### Deploy Commands (tools/ue_tool.py — ALL-IN-ONE)
-```bash
-# RE4 VR (default game):
-python tools\ue_tool.py mods              # Push all Lua mods
-python tools\ue_tool.py modloader         # Push libmodloader.so
-python tools\ue_tool.py all               # Push modloader + all mods
-python tools\ue_tool.py log               # Pull UEModLoader.log (FULL, with timestamp)
-python tools\ue_tool.py crashlog          # Pull modloader_crash.log (FULL, with timestamp)
-python tools\ue_tool.py tombstones        # Pull & purge crash tombstones (FULL content)
-python tools\ue_tool.py diagnose          # ← USE THIS FOR CRASH INVESTIGATION
-python tools\ue_tool.py launch            # Kill + relaunch game
-python tools\ue_tool.py monitor           # Live session monitor (logcat + tombstones)
-python tools\ue_tool.py console           # Interactive bridge console
 
-# Pinball FX VR (use --game pfxvr):
-python tools\ue_tool.py --game pfxvr mods
-python tools\ue_tool.py --game pfxvr diagnose
-python tools\ue_tool.py --game pfxvr monitor
+**Game selection:** Default is RE4 VR. Use `--game pfxvr` (or `-g pfxvr`) for Pinball FX VR.
+
+#### Deploy Commands
+```bash
+# ✅ HOT-RELOAD (preferred for Lua changes — NO restart needed):
+python tools\ue_tool.py mods --hot              # Push all Lua mods + reload via bridge
+python tools\ue_tool.py mods ModName --hot      # Push one mod + reload via bridge
+
+# Standard (requires restart — only for C++ changes or first deploy):
+python tools\ue_tool.py modloader               # Push libmodloader.so only
+python tools\ue_tool.py mods                    # Push all Lua mods only (then restart)
+python tools\ue_tool.py mods ModName            # Push a specific mod only (then restart)
+python tools\ue_tool.py all                     # Push modloader + all mods
+python tools\ue_tool.py all --no-restart        # Push everything but don't force-stop the game
+python tools\ue_tool.py all --hot               # Push modloader + hot-reload all mods
 ```
 
-### Common Workflow
+#### Game Lifecycle Commands
 ```bash
-# Mod-only change:
-python tools\ue_tool.py mods
-python tools\ue_tool.py launch
+python tools\ue_tool.py launch            # Kill + relaunch game + ADB forward bridge
+python tools\ue_tool.py restart           # Force-stop game (no relaunch)
+python tools\ue_tool.py ensure            # Restart only if not already running
+python tools\ue_tool.py status            # Show loaded mod versions from device log
+python tools\ue_tool.py forward           # Set up ADB port forward for bridge (tcp:19420)
+```
 
-# After C++ modloader changes:
+#### Log Commands
+⚠️ **CRITICAL: `log`, `crashlog`, and `pe_trace` all DELETE the file from device after pulling.**
+They archive a timestamped copy to `logs/sessions/` so no data is lost, but the device file is gone.
+**If you need to read the log without deleting it, use `livelog` or read from the archived copy.**
+
+```bash
+python tools\ue_tool.py log               # Pull + print + DELETE UEModLoader.log
+python tools\ue_tool.py livelog           # Live tail UEModLoader.log (SSH, Ctrl+C to stop) — DOES NOT DELETE
+python tools\ue_tool.py crashlog          # Pull + print + DELETE modloader_crash.log
+python tools\ue_tool.py pe_trace          # Pull + print + DELETE pe_trace.log
+python tools\ue_tool.py tombstones        # Pull + print + PURGE all tombstones from device
+python tools\ue_tool.py sdk               # Pull SDK dump from device to Current Modloader SDK/
+```
+
+#### Diagnosis Commands
+```bash
+python tools\ue_tool.py diagnose          # Pull tombstones + crashlog + log (all at once)
+                                           # Shows timestamps, full content, PID status
+                                           # ⚠ ALSO DELETES logs after pulling (archives them)
+                                           # ← USE THIS FOR CRASH INVESTIGATION
+
+python tools\ue_tool.py monitor           # Live session monitor: logcat + tombstone watch
+python tools\ue_tool.py monitor --once    # Monitor one session then exit
+python tools\ue_tool.py monitor --pid-only # Only capture current game PID logs
+python tools\ue_tool.py monitor --tag TAG  # Add extra logcat tag filter (repeatable)
+python tools\ue_tool.py monitor --no-logcat # Tombstone watch only, skip logcat
+```
+
+#### Bridge Console (Live Testing)
+```bash
+python tools\ue_tool.py console           # Interactive bridge console (TCP 19420)
+> ping
+> exec_lua local dm = FindFirstOf("DebugMenu_C"); return dm:GetName()
+> list_mods
+```
+
+### Common Workflows
+```bash
+# ✅ Lua mod change (NO restart — use this EVERY time):
+python tools\ue_tool.py --game pfxvr mods --hot
+python tools\ue_tool.py --game pfxvr mods PFX_ModMenu --hot
+
+# ✅ Test a snippet live before deploying:
+python tools\ue_tool.py --game pfxvr console
+> exec_lua local dm = FindFirstOf("DebugMenu_C"); return dm:GetName()
+> reload_mod PFX_ModMenu
+
+# After C++ modloader changes (restart IS required):
 cd modloader && .\build.bat
 python tools\ue_tool.py all
 python tools\ue_tool.py launch
 
 # Investigating a crash (MANDATORY SEQUENCE):
-python tools\ue_tool.py diagnose          # pulls + timestamps + FULL content
+python tools\ue_tool.py diagnose          # pulls + timestamps + FULL content (deletes after)
 # Read ALL output. Check timestamps. Find the actual error.
 
 # Watch live for next crash:
 python tools\ue_tool.py monitor
-```
 
-### Bridge Console (Live Testing)
-```bash
-python tools\ue_tool.py console
-> ping
-> exec_lua local dm = FindFirstOf("DebugMenu_C"); return dm:GetName()
-> list_mods
+# Read log WITHOUT deleting (for repeated checks during a session):
+python tools\ue_tool.py livelog           # live tail via SSH
+
+# Pinball FX VR examples:
+python tools\ue_tool.py --game pfxvr all
+python tools\ue_tool.py --game pfxvr launch
+python tools\ue_tool.py --game pfxvr diagnose
+python tools\ue_tool.py --game pfxvr monitor --once
 ```
 
 ---
@@ -413,6 +495,53 @@ widget:Set("DrawSize", {X=500, Y=2000})
 local ds = widget:Get("DrawSize")
 ds.X; ds.Y; ds.X = 500
 ```
+---
+
+## Pinball FX VR — Collectible Slot Swap (PE-Trace-Verified)
+
+### Slot Swap Flow (captured via PE trace on live device)
+When the user changes a collectible (statue, gadget, poster) in the hub:
+
+1. **Data write**: `slot:Set("m_slotEntry", newEntry)` — sets the entry on `PFXCollectibleSlotComponent`
+2. **AC notification**: `AC_CollectibleSlot_C:OnSlotEntryChanged(newEntry)` — fires on the **ActorComponent** (NOT `PFXCollectibleSlotComponent`)
+3. **Actor reinit**: `BP_Collectible_SM_Base_C:OnCollectibleActorReinitFromPool()` — reinitializes the visual mesh actor
+4. **Entry data**: `BP_Collectible_SM_Base_C:OnEntryDataSet()` (for gadgets/statues) or `BP_Collectible_Poster_Base_C:OnEntryDataSet()` (for posters)
+5. **Snap**: `AC_CollectibleSlot_C:InterpSnapToPosition()` — animates into position
+6. **Save**: `PFXSaveLoadObserverInterface:OnSaveProfileStarted/Finished` — saves to profile
+
+### ⚠️ CRITICAL: `ChangeSlotEntry()` is a NO-OP
+PE trace confirmed: `ChangeSlotEntry` does NOT appear in the trace at all.
+`Set("m_slotEntry", newEntry)` is the ONLY way to change slot data — confirmed via bridge.
+
+### Key Classes Involved
+| Class | Role | PE Trace Count |
+|---|---|---|
+| `AC_CollectibleSlot_C` | Actor component on slot — fires `OnSlotEntryChanged` | 12 |
+| `BP_Collectible_SM_Base_C` | Static mesh collectible actor (statue/gadget) | 27 (`ReinitFromPool`) |
+| `BP_Collectible_Poster_Base_C` | Poster collectible actor | 2 (`OnEntryDataSet`) |
+| `PFXMetricEventHolder` | Metrics tracking | 12 |
+| `PFXAchievementsManager` | Achievement tracking | 12 |
+
+### Correct Swap Code Pattern
+```lua
+-- 1. Write the entry data
+slot:Set("m_slotEntry", newEntry)
+
+-- 2. Find AC_CollectibleSlot_C on the owner actor
+local owner = slot:GetOuter()
+local comps = owner:Call("K2_GetComponentsByClass", FindClass("AC_CollectibleSlot_C"))
+for i = 1, #comps do
+    comps[i]:Call("OnSlotEntryChanged", newEntry)
+end
+
+-- 3. Reinit the collectible actor
+local actor = slot:Get("m_collectibleActor")
+if actor then
+    actor:Call("OnCollectibleActorReinitFromPool")
+    actor:Call("OnEntryDataSet")
+end
+```
+
 ### 17. DO NOT CREATE OR USE PYTHON VIRTUAL ENVIRONMENTS
 
 **NEVER create, suggest, or require a Python virtual environment (`venv`, `virtualenv`, `pipenv`, `poetry`, etc.).**

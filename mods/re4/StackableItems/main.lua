@@ -17,7 +17,7 @@
 --   +0x4  uint16_t  maxCapacity ← WE OVERRIDE THIS
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "StackableItems"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)

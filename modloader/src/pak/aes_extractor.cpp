@@ -11,6 +11,7 @@
 #include "modloader/pattern_scanner.h"
 #include "modloader/game_profile.h"
 #include "modloader/paths.h"
+#include "modloader/safe_call.h"
 
 #include <dobby.h>
 #include <dlfcn.h>
@@ -341,17 +342,20 @@ namespace aes_extractor
         uint8_t null_guid[16] = {};
         uint8_t key_buf[32] = {};
 
-        // Wrap in signal-safe try — the function may crash if PAKs aren't encrypted
-        // or if the key manager isn't initialized
+        // Wrap in signal-safe guard — this function may SIGSEGV if the key manager
+        // isn't initialized yet on some builds. C++ try/catch does NOT catch signals.
         bool success = false;
-        try
+        auto probe_result = safe_call::execute([&]()
+                                               { fn(key_buf, null_guid); },
+                                               "aes_extractor::probe_encryption_key_direct");
+        if (probe_result.ok)
         {
-            fn(key_buf, null_guid);
             success = true;
         }
-        catch (...)
+        else
         {
-            logger::log_warn("AES", "GetPakEncryptionKey threw exception — PAKs may not be encrypted");
+            logger::log_warn("AES", "GetPakEncryptionKey direct probe failed safely: %s",
+                             probe_result.error_msg.c_str());
         }
 
         if (success && !is_key_all_zeros(key_buf))
@@ -601,10 +605,11 @@ namespace aes_extractor
 
         s_initialized.store(true);
 
-        // ── DIRECT PROBE: Call GetPakEncryptionKey to extract key post-init ──
-        // Hooks fire too late (PAK decrypt happens during dlopen before we hook).
-        // So we call the key resolver directly to grab the cached key.
-        probe_encryption_key_direct();
+        // ── DIRECT PROBE: DISABLED (stability) ──────────────────────────────
+        // Calling GetPakEncryptionKey directly during early boot is unsafe on
+        // some builds and can terminate the process before mods initialize.
+        // We rely on hook-based capture + deferred fallback scan instead.
+        logger::log_warn("AES", "Direct GetPakEncryptionKey probe disabled for stability");
 
         logger::log_info("AES", "AES extractor initialized: %d hook(s) active", hooks_installed);
         if (hooks_installed == 0)

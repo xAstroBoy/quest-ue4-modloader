@@ -13,7 +13,7 @@
 --   by the modloader's C++ crash guard — no Lua patches needed.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "Patches"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }

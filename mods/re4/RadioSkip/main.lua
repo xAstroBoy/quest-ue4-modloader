@@ -5,7 +5,7 @@
 -- No blocking — lets the game flow naturally, just auto-dismisses.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "RadioSkip"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = {
@@ -103,6 +103,7 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("radioskip", function()
+    V("radioskip command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("RadioSkip", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))

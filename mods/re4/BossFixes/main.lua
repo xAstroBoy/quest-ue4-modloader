@@ -11,7 +11,7 @@
 --   Native hooks on cEmWrap::setHp for death trigger
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "BossFixes"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -122,6 +122,7 @@ end)
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("bossfixes_status", function()
+    V("bossfixes_status command fired")
     local info = TAG .. ": Boss kills:"
     local total = 0
     for name, count in pairs(bossKills) do

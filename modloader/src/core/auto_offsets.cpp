@@ -18,10 +18,15 @@
 #include "modloader/safe_call.h"
 #include "modloader/game_profile.h"
 #include "modloader/logger.h"
+#include "modloader/symbols.h"
 #include "modloader/types.h"
 #include <cstring>
 #include <cstdarg>
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <limits>
+#include <unordered_map>
 #include <vector>
 #include <cstdio>
 #include <dlfcn.h>
@@ -110,6 +115,78 @@ namespace auto_offsets
     // Get register from ADD/LDR Rn field
     static int get_rn(uint32_t instr) { return (instr >> 5) & 0x1F; }
 
+    static int count_valid_uobject_slots(uintptr_t chunk0, uint32_t stride, int count)
+    {
+        int valid = 0;
+        for (int i = 0; i < count; i++)
+        {
+            uintptr_t item_addr = chunk0 + static_cast<uintptr_t>(i) * stride;
+            if (!safe_call::probe_read(reinterpret_cast<void *>(item_addr), 8))
+                break;
+
+            uintptr_t obj_ptr = *reinterpret_cast<uintptr_t *>(item_addr);
+            if (obj_ptr == 0)
+                continue; // null slots are expected
+
+            if (!safe_call::probe_read(reinterpret_cast<void *>(obj_ptr), 0x28))
+                continue;
+
+            uintptr_t class_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x10);
+            uintptr_t outer_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x20);
+            if (!safe_call::probe_read(reinterpret_cast<void *>(class_ptr), 0x28))
+                continue;
+
+            // Outer may be null for packages/singletons, but if present it should also be readable.
+            if (outer_ptr != 0 && !safe_call::probe_read(reinterpret_cast<void *>(outer_ptr), 0x28))
+                continue;
+
+            valid++;
+        }
+        return valid;
+    }
+
+    static int score_guobjectarray_candidate(uintptr_t guobjectarray)
+    {
+        if (guobjectarray == 0 ||
+            !safe_call::probe_read(reinterpret_cast<void *>(guobjectarray), 0x40))
+            return 0;
+
+        std::array<uint32_t, 6> embedded_offsets = {
+            ue::GUOBJECTARRAY_TO_OBJECTS, 0x0, 0x8, 0x10, 0x18, 0x20};
+
+        int best_score = 0;
+        for (uint32_t embedded_off : embedded_offsets)
+        {
+            uintptr_t embedded = guobjectarray + embedded_off;
+            if (!safe_call::probe_read(reinterpret_cast<void *>(embedded), 0x18))
+                continue;
+
+            uintptr_t objects_ptr = *reinterpret_cast<uintptr_t *>(embedded);
+            if (!safe_call::probe_read(reinterpret_cast<void *>(objects_ptr), 8))
+                continue;
+
+            uintptr_t chunk0 = *reinterpret_cast<uintptr_t *>(objects_ptr);
+            if (!safe_call::probe_read(reinterpret_cast<void *>(chunk0), 0x80))
+                continue;
+
+            uint32_t num_elements = *reinterpret_cast<uint32_t *>(embedded + 8);
+            uint32_t max_elements = *reinterpret_cast<uint32_t *>(embedded + 12);
+
+            int valid_14 = count_valid_uobject_slots(chunk0, 0x14, 64);
+            int valid_18 = count_valid_uobject_slots(chunk0, 0x18, 64);
+            int score = std::max(valid_14, valid_18) * 10;
+
+            if (num_elements > 0 && num_elements < 100000000)
+                score += 15;
+            if (max_elements >= num_elements && max_elements < 100000000)
+                score += 10;
+
+            best_score = std::max(best_score, score);
+        }
+
+        return best_score;
+    }
+
     // ═══ Public ARM64 helpers ═══════════════════════════════════════════════
 
     uintptr_t decode_adrp_add(uintptr_t addr)
@@ -170,21 +247,28 @@ namespace auto_offsets
             if (page != target_page)
                 continue;
 
-            // Check if followed by ADD or LDR that gives exact address
-            if (i + 1 < count)
+            // Check the next few instructions for ADD/LDR that materializes the full address.
+            // Compilers often schedule one or two instructions between ADRP and its consumer.
+            for (size_t lookahead = 1; lookahead <= 4 && i + lookahead < count; lookahead++)
             {
-                uint32_t next = code[i + 1];
+                uint32_t next = code[i + lookahead];
                 if (is_add_imm64(next) && get_rn(next) == get_rd(instr))
                 {
                     uintptr_t full = page + decode_add_imm(next);
                     if (full == target_addr)
+                    {
                         results.push_back(pc);
+                        break;
+                    }
                 }
                 else if (is_ldr_imm64(next) && get_rn(next) == get_rd(instr))
                 {
                     uintptr_t full = page + decode_ldr_offset(next);
                     if (full == target_addr)
+                    {
                         results.push_back(pc);
+                        break;
+                    }
                 }
             }
         }
@@ -230,20 +314,60 @@ namespace auto_offsets
 
     // ═══ INTERNAL HELPERS ═══════════════════════════════════════════════════
 
-    // Find a global pointer near a string reference.
-    // Strategy: find ADRP+ADD that creates the string address,
-    // then scan nearby code for ADRP+LDR or ADRP+ADD to a .bss/.data address.
-    static uintptr_t find_global_near_string(const char *needle, const char *name,
-                                             std::vector<std::string> &log)
+    struct GlobalCandidate
     {
-        // Find the string in .rodata
+        uintptr_t address = 0;
+        uintptr_t ref_pc = 0;
+        uintptr_t instr_pc = 0;
+        int pattern_score = 0;
+        int hits = 0;
+        std::string source;
+    };
+
+    static bool is_data_address(uintptr_t addr)
+    {
+        uintptr_t data_s = pattern::data_start();
+        uintptr_t data_e = pattern::data_end();
+        return addr >= data_s && addr < data_e;
+    }
+
+    static void add_global_candidate(std::unordered_map<uintptr_t, GlobalCandidate> &candidates,
+                                     uintptr_t candidate_addr,
+                                     uintptr_t ref_pc,
+                                     uintptr_t instr_pc,
+                                     int base_score,
+                                     const char *source)
+    {
+        if (candidate_addr == 0 || !is_data_address(candidate_addr))
+            return;
+        if (!safe_call::probe_read(reinterpret_cast<void *>(candidate_addr), 8))
+            return;
+
+        auto &cand = candidates[candidate_addr];
+        cand.address = candidate_addr;
+        cand.ref_pc = cand.ref_pc ? cand.ref_pc : ref_pc;
+        cand.instr_pc = cand.instr_pc ? cand.instr_pc : instr_pc;
+        cand.hits += 1;
+        cand.pattern_score += base_score;
+        if (cand.source.empty())
+            cand.source = source;
+
+        uint64_t qword0 = *reinterpret_cast<uint64_t *>(candidate_addr);
+        if (qword0 != 0)
+            cand.pattern_score += 3;
+    }
+
+    static std::vector<GlobalCandidate> collect_global_candidates_near_string(const char *needle,
+                                                                              const char *name,
+                                                                              std::vector<std::string> &log)
+    {
         void *str_addr = pattern::find_string(needle);
         if (!str_addr)
         {
             char msg[256];
             snprintf(msg, sizeof(msg), "%s: string '%s' not found in binary", name, needle);
             log.push_back(msg);
-            return 0;
+            return {};
         }
 
         uintptr_t str_ptr = reinterpret_cast<uintptr_t>(str_addr);
@@ -258,56 +382,333 @@ namespace auto_offsets
         {
             snprintf(msg, sizeof(msg), "%s: no ADRP xrefs to string", name);
             log.push_back(msg);
-            return 0;
+            return {};
         }
 
         snprintf(msg, sizeof(msg), "%s: found %zu code xrefs to string", name, refs.size());
         log.push_back(msg);
 
-        // For each xref, scan nearby instructions for ADRP+LDR to a .bss/.data pointer
-        uintptr_t data_s = pattern::data_start();
-        uintptr_t data_e = pattern::data_end();
+        std::unordered_map<uintptr_t, GlobalCandidate> candidate_map;
 
         for (uintptr_t ref : refs)
         {
-            // Scan a window of instructions around the string reference
-            // The global variable is usually loaded within 20 instructions of the string ref
             uintptr_t scan_start = (ref >= 80) ? ref - 80 : ref;
-            uintptr_t scan_end = ref + 120;
+            uintptr_t scan_end = ref + 160;
+
+            std::array<bool, 32> have_page{};
+            std::array<uintptr_t, 32> page_by_reg{};
+            std::array<bool, 32> have_full_addr{};
+            std::array<uintptr_t, 32> full_addr_by_reg{};
 
             for (uintptr_t pc = scan_start; pc < scan_end; pc += 4)
             {
-                if (!safe_call::probe_read(reinterpret_cast<void *>(pc), 8))
+                if (!safe_call::probe_read(reinterpret_cast<void *>(pc), 4))
                     continue;
 
                 uint32_t instr0 = *reinterpret_cast<uint32_t *>(pc);
-                uint32_t instr1 = *reinterpret_cast<uint32_t *>(pc + 4);
 
-                // Look for ADRP+LDR pattern (loading a pointer from .bss)
-                if (is_adrp(instr0) && is_ldr_imm64(instr1))
+                if (is_adrp(instr0))
                 {
-                    if (get_rd(instr0) == get_rn(instr1))
-                    {
-                        uintptr_t page = decode_adrp_page(instr0, pc);
-                        uint32_t offset = decode_ldr_offset(instr1);
-                        uintptr_t target = page + offset;
+                    int rd = get_rd(instr0);
+                    have_page[rd] = true;
+                    page_by_reg[rd] = decode_adrp_page(instr0, pc);
+                    have_full_addr[rd] = false;
+                    continue;
+                }
 
-                        // Must be in .data/.bss range, not in .text
-                        if (target >= data_s && target < data_e)
-                        {
-                            snprintf(msg, sizeof(msg),
-                                     "%s: candidate global at 0x%lX (from code at 0x%lX)",
-                                     name, static_cast<unsigned long>(target),
-                                     static_cast<unsigned long>(pc));
-                            log.push_back(msg);
-                            return target;
-                        }
+                if (is_add_imm64(instr0))
+                {
+                    int rn = get_rn(instr0);
+                    int rd = get_rd(instr0);
+                    uintptr_t full = 0;
+                    if (have_page[rn])
+                        full = page_by_reg[rn] + decode_add_imm(instr0);
+                    else if (have_full_addr[rn])
+                        full = full_addr_by_reg[rn] + decode_add_imm(instr0);
+
+                    if (full != 0)
+                    {
+                        have_full_addr[rd] = true;
+                        full_addr_by_reg[rd] = full;
+
+                        if (full != str_ptr)
+                            add_global_candidate(candidate_map, full, ref, pc, 12,
+                                                 "ADRP+ADD(.data)");
                     }
+                    continue;
+                }
+
+                if (is_ldr_imm64(instr0))
+                {
+                    int rn = get_rn(instr0);
+                    uintptr_t target = 0;
+                    if (have_page[rn])
+                        target = page_by_reg[rn] + decode_ldr_offset(instr0);
+                    else if (have_full_addr[rn])
+                        target = full_addr_by_reg[rn] + decode_ldr_offset(instr0);
+
+                    if (target != 0)
+                        add_global_candidate(candidate_map, target, ref, pc, 20,
+                                             have_page[rn] ? "ADRP+LDR(.data)" : "ADDR+LDR(.data)");
                 }
             }
         }
 
-        snprintf(msg, sizeof(msg), "%s: no .bss/.data references found near string xrefs", name);
+        std::vector<GlobalCandidate> candidates;
+        candidates.reserve(candidate_map.size());
+        for (auto &entry : candidate_map)
+            candidates.push_back(entry.second);
+
+        std::sort(candidates.begin(), candidates.end(), [](const GlobalCandidate &a, const GlobalCandidate &b)
+                  {
+                      if (a.pattern_score != b.pattern_score)
+                          return a.pattern_score > b.pattern_score;
+                      if (a.hits != b.hits)
+                          return a.hits > b.hits;
+                      return a.address < b.address; });
+
+        if (candidates.empty())
+        {
+            snprintf(msg, sizeof(msg), "%s: no .bss/.data references found near string xrefs", name);
+            log.push_back(msg);
+            return {};
+        }
+
+        snprintf(msg, sizeof(msg), "%s: collected %zu global candidate(s)", name, candidates.size());
+        log.push_back(msg);
+        return candidates;
+    }
+
+    static uintptr_t find_pfx_guobjectarray_via_chunk_access(std::vector<std::string> &log)
+    {
+        if (!game_profile::is_pinball_fx())
+            return 0;
+
+        // Verified against both old and new Pinball FX VR dumps:
+        // this sequence computes FUObjectItem* from GUObjectArray's chunk pointer table.
+        // The 8 bytes immediately before the match are ADRP+ADD that materialize the
+        // GUObjectArray base, and the body uses +0x10 (chunk table) and +0x24 (count).
+        static constexpr const char *kPattern =
+            "88 0E 40 B9 2A 25 40 B9 5F 01 08 6B ?? ?? ?? 54 "
+            "0A FD 4D D3 29 09 40 F9 4A 3D 7D 92 08 3D 00 12 "
+            "29 69 6A F8 8A 02 80 52 17 25 AA 9B";
+
+        auto matches = pattern::scan_all(kPattern);
+
+        char msg[320];
+        snprintf(msg, sizeof(msg), "GUObjectArray(PFXChunkAccess): %zu pattern match(es)", matches.size());
+        log.push_back(msg);
+
+        uintptr_t best_addr = 0;
+        int best_score = std::numeric_limits<int>::min();
+
+        for (size_t i = 0; i < matches.size(); i++)
+        {
+            uintptr_t seq_pc = reinterpret_cast<uintptr_t>(matches[i]);
+            if (seq_pc < 8 || !safe_call::probe_read(reinterpret_cast<void *>(seq_pc - 8), 8))
+                continue;
+
+            uintptr_t candidate = decode_adrp_add(seq_pc - 8);
+            // Don't filter by is_data_address — GUObjectArray resides in .bss
+            // which may be in an anonymous mapping outside the tracked .data range.
+            // safe_call::probe_read below already validates readability.
+            if (candidate == 0)
+                continue;
+
+            int structural_score = 0;
+            if (safe_call::probe_read(reinterpret_cast<void *>(candidate), 0x28))
+                structural_score += 25;
+            if (safe_call::probe_read(reinterpret_cast<void *>(candidate + 0x10), 8))
+                structural_score += 15;
+            if (safe_call::probe_read(reinterpret_cast<void *>(candidate + 0x24), 4))
+                structural_score += 15;
+
+            int live_score = score_guobjectarray_candidate(candidate);
+            int total_score = structural_score + live_score;
+
+            snprintf(msg, sizeof(msg),
+                     "GUObjectArray(PFXChunkAccess): candidate #%zu 0x%lX (structural=%d live=%d total=%d)",
+                     i + 1,
+                     static_cast<unsigned long>(candidate),
+                     structural_score,
+                     live_score,
+                     total_score);
+            log.push_back(msg);
+
+            if (total_score > best_score)
+            {
+                best_score = total_score;
+                best_addr = candidate;
+            }
+        }
+
+        return best_addr;
+    }
+
+    // Find a global pointer near a string reference.
+    // Strategy: collect all plausible ADRP+ADD/LDR data references near string xrefs,
+    // then rank/validate them instead of returning the first one.
+    static uintptr_t find_global_near_string(const char *needle, const char *name,
+                                             std::vector<std::string> &log,
+                                             const std::function<int(uintptr_t)> &validator = {},
+                                             bool require_validation = false)
+    {
+        auto candidates = collect_global_candidates_near_string(needle, name, log);
+        if (candidates.empty())
+            return 0;
+
+        uintptr_t best_addr = 0;
+        int best_score = std::numeric_limits<int>::min();
+        int best_validation = 0;
+
+        size_t to_log = std::min<size_t>(candidates.size(), 6);
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            int validation_score = validator ? validator(candidates[i].address) : 0;
+            int total_score = candidates[i].pattern_score + validation_score;
+            if (total_score > best_score && (!require_validation || validation_score > 0))
+            {
+                best_score = total_score;
+                best_addr = candidates[i].address;
+                best_validation = validation_score;
+            }
+
+            if (i < to_log)
+            {
+                char msg[320];
+                snprintf(msg, sizeof(msg),
+                         "%s: candidate #%zu 0x%lX via %s (pattern=%d hits=%d validation=%d total=%d)",
+                         name, i + 1,
+                         static_cast<unsigned long>(candidates[i].address),
+                         candidates[i].source.c_str(),
+                         candidates[i].pattern_score,
+                         candidates[i].hits,
+                         validation_score,
+                         total_score);
+                log.push_back(msg);
+            }
+        }
+
+        if (best_addr != 0)
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: selected 0x%lX (validation=%d total=%d)",
+                     name, static_cast<unsigned long>(best_addr), best_validation, best_score);
+            log.push_back(msg);
+            return best_addr;
+        }
+
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s: candidates found but none passed validation", name);
+        log.push_back(msg);
+        return 0;
+    }
+
+    struct StringAnchor
+    {
+        const char *needle;
+        const char *name;
+    };
+
+    static uintptr_t find_global_from_anchor_set(const std::vector<StringAnchor> &anchors,
+                                                 const char *group_name,
+                                                 std::vector<std::string> &log,
+                                                 const std::function<int(uintptr_t)> &validator = {},
+                                                 bool require_validation = false)
+    {
+        std::unordered_map<uintptr_t, GlobalCandidate> merged;
+
+        for (const auto &anchor : anchors)
+        {
+            auto local = collect_global_candidates_near_string(anchor.needle, anchor.name, log);
+            for (const auto &cand : local)
+            {
+                auto &dst = merged[cand.address];
+                if (dst.address == 0)
+                {
+                    dst = cand;
+                }
+                else
+                {
+                    dst.pattern_score += cand.pattern_score;
+                    dst.hits += cand.hits;
+                    if (dst.source.find(anchor.name) == std::string::npos)
+                    {
+                        if (!dst.source.empty())
+                            dst.source += ", ";
+                        dst.source += anchor.name;
+                    }
+                }
+
+                // Surviving multiple anchors is a strong signal that this is the real global.
+                dst.pattern_score += 25;
+            }
+        }
+
+        std::vector<GlobalCandidate> candidates;
+        candidates.reserve(merged.size());
+        for (auto &entry : merged)
+            candidates.push_back(entry.second);
+
+        if (candidates.empty())
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: no candidates collected across anchor set", group_name);
+            log.push_back(msg);
+            return 0;
+        }
+
+        std::sort(candidates.begin(), candidates.end(), [](const GlobalCandidate &a, const GlobalCandidate &b)
+                  {
+                      if (a.pattern_score != b.pattern_score)
+                          return a.pattern_score > b.pattern_score;
+                      if (a.hits != b.hits)
+                          return a.hits > b.hits;
+                      return a.address < b.address; });
+
+        uintptr_t best_addr = 0;
+        int best_validation = 0;
+        int best_total = std::numeric_limits<int>::min();
+
+        size_t to_log = std::min<size_t>(candidates.size(), 8);
+        for (size_t i = 0; i < candidates.size(); i++)
+        {
+            int validation_score = validator ? validator(candidates[i].address) : 0;
+            int total_score = candidates[i].pattern_score + validation_score;
+            if (total_score > best_total && (!require_validation || validation_score > 0))
+            {
+                best_total = total_score;
+                best_addr = candidates[i].address;
+                best_validation = validation_score;
+            }
+
+            if (i < to_log)
+            {
+                char msg[384];
+                snprintf(msg, sizeof(msg),
+                         "%s: merged candidate #%zu 0x%lX (pattern=%d hits=%d validation=%d total=%d sources=%s)",
+                         group_name, i + 1,
+                         static_cast<unsigned long>(candidates[i].address),
+                         candidates[i].pattern_score,
+                         candidates[i].hits,
+                         validation_score,
+                         total_score,
+                         candidates[i].source.c_str());
+                log.push_back(msg);
+            }
+        }
+
+        if (best_addr != 0)
+        {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "%s: selected merged winner 0x%lX (validation=%d total=%d)",
+                     group_name, static_cast<unsigned long>(best_addr), best_validation, best_total);
+            log.push_back(msg);
+            return best_addr;
+        }
+
+        char msg[256];
+        snprintf(msg, sizeof(msg), "%s: merged candidates found but none passed validation", group_name);
         log.push_back(msg);
         return 0;
     }
@@ -518,28 +919,48 @@ namespace auto_offsets
         std::vector<std::string> log;
         uintptr_t result = 0;
 
-        // Strategy 1: "MaxObjectsNotConsideredByGC" — used in GUObjectArray init
-        result = find_global_near_string("MaxObjectsNotConsideredByGC", "GUObjectArray(MaxObj)", log);
+        // Pinball FX VR: prefer the chunk-access sequence first.
+        // It survived the update even when string-xref strategies produced nothing.
+        result = find_pfx_guobjectarray_via_chunk_access(log);
         if (result)
             goto done;
 
-        // Strategy 2: "OpenForDisregardForGC" — another GUObjectArray init string
-        result = find_global_near_string("OpenForDisregardForGC", "GUObjectArray(OpenGC)", log);
+        // Resistant PFX/UE strategy: collect candidates from all known anchors,
+        // then pick the address that repeatedly appears AND validates as a live object array.
+        result = find_global_from_anchor_set({
+                                                 {"MaxObjectsNotConsideredByGC", "GUObjectArray(MaxObj)"},
+                                                 {"OpenForDisregardForGC", "GUObjectArray(OpenGC)"},
+                                                 {"SizeOfPermanentObjectPool", "GUObjectArray(PermPool)"},
+                                                 {"NumElementsPerChunk", "GUObjectArray(ChunkedArr)"},
+                                                 {"GUObjectArray", "GUObjectArray(literal)"},
+                                             },
+                                             "GUObjectArray(merged)", log, score_guobjectarray_candidate, true);
         if (result)
             goto done;
 
-        // Strategy 3: "SizeOfPermanentObjectPool" — UE4 GUObjectArray config
-        result = find_global_near_string("SizeOfPermanentObjectPool", "GUObjectArray(PermPool)", log);
+        // Fallback to individual strategies if the merged pass somehow finds nothing.
+        result = find_global_near_string("MaxObjectsNotConsideredByGC", "GUObjectArray(MaxObj)", log,
+                                         score_guobjectarray_candidate, true);
         if (result)
             goto done;
 
-        // Strategy 4: "NumElementsPerChunk" — TChunkedArray config
-        result = find_global_near_string("NumElementsPerChunk", "GUObjectArray(ChunkedArr)", log);
+        result = find_global_near_string("OpenForDisregardForGC", "GUObjectArray(OpenGC)", log,
+                                         score_guobjectarray_candidate, true);
         if (result)
             goto done;
 
-        // Strategy 5: "GUObjectArray" literal
-        result = find_global_near_string("GUObjectArray", "GUObjectArray(literal)", log);
+        result = find_global_near_string("SizeOfPermanentObjectPool", "GUObjectArray(PermPool)", log,
+                                         score_guobjectarray_candidate, true);
+        if (result)
+            goto done;
+
+        result = find_global_near_string("NumElementsPerChunk", "GUObjectArray(ChunkedArr)", log,
+                                         score_guobjectarray_candidate, true);
+        if (result)
+            goto done;
+
+        result = find_global_near_string("GUObjectArray", "GUObjectArray(literal)", log,
+                                         score_guobjectarray_candidate, true);
         if (result)
             goto done;
 
@@ -776,33 +1197,8 @@ namespace auto_offsets
         }
 
         // Try both strides and count valid UObject pointers
-        auto count_valid = [](uintptr_t base, uint32_t stride, int count) -> int
-        {
-            int valid = 0;
-            for (int i = 0; i < count; i++)
-            {
-                uintptr_t item_addr = base + i * stride;
-                if (!safe_call::probe_read(reinterpret_cast<void *>(item_addr), 8))
-                    break;
-
-                uintptr_t obj_ptr = *reinterpret_cast<uintptr_t *>(item_addr);
-                if (obj_ptr == 0)
-                    continue; // null slots are expected
-
-                // Validate: a UObject pointer should be in a reasonable range
-                // and should have a valid class pointer at offset 0x10
-                if (!safe_call::probe_read(reinterpret_cast<void *>(obj_ptr), 0x28))
-                    continue;
-
-                uintptr_t class_ptr = *reinterpret_cast<uintptr_t *>(obj_ptr + 0x10);
-                if (safe_call::probe_read(reinterpret_cast<void *>(class_ptr), 0x28))
-                    valid++;
-            }
-            return valid;
-        };
-
-        int valid_14 = count_valid(chunk0, 0x14, 50);
-        int valid_18 = count_valid(chunk0, 0x18, 50);
+        int valid_14 = count_valid_uobject_slots(chunk0, 0x14, 50);
+        int valid_18 = count_valid_uobject_slots(chunk0, 0x18, 50);
 
         logger::log_info("AUTOOFF", "FUObjectItem size probe: stride 0x14 → %d valid, stride 0x18 → %d valid",
                          valid_14, valid_18);
@@ -1007,16 +1403,13 @@ namespace auto_offsets
             logger::log_info("AUTOOFF", "Rebuilt type offsets for detected engine version");
         }
 
-        // Apply discovered global pointers as fallback offsets
-        uintptr_t lib_base = 0;
-        void *handle = dlopen(game_profile::engine_lib_name().c_str(), RTLD_NOLOAD | RTLD_NOW);
-        if (handle)
+        // Apply discovered pointers as offsets relative to the already-resolved
+        // engine library base. This must use symbols::lib_base() (not dladdr on
+        // a dlopen handle), otherwise base resolution can silently fail.
+        uintptr_t lib_base = symbols::lib_base();
+        if (lib_base == 0)
         {
-            // Get base address for computing offsets
-            Dl_info info;
-            if (dladdr(handle, &info))
-                lib_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
-            dlclose(handle);
+            logger::log_warn("AUTOOFF", "Engine lib base unavailable — skipping offset registration this pass");
         }
 
         auto register_offset = [&](const char *name, uintptr_t addr)
@@ -1025,16 +1418,40 @@ namespace auto_offsets
                 return;
             uintptr_t offset = addr - lib_base;
 
-            // Check if already registered — don't override existing profile entries
-            for (const auto &fo : profile.fallback_offsets)
+            bool updated_existing = false;
+            for (auto &fo : profile.fallback_offsets)
             {
                 if (fo.symbol_name == name)
-                    return; // already set by game profile
+                {
+                    fo.offset = offset;
+                    updated_existing = true;
+                    break;
+                }
             }
 
-            profile.fallback_offsets.push_back({name, offset});
-            logger::log_info("AUTOOFF", "Registered fallback: %s = 0x%lX (offset 0x%lX)",
-                             name, static_cast<unsigned long>(addr),
+            if (!updated_existing)
+            {
+                profile.fallback_offsets.push_back({name, offset});
+            }
+
+            // Keep stable-global table in sync if an entry exists there.
+            for (auto &sg : profile.stable_global_offsets)
+            {
+                if (sg.symbol_name == name)
+                {
+                    sg.offset = offset;
+                    break;
+                }
+            }
+
+            // Also register directly into the live symbol resolver map so
+            // resolve_core_symbols() can consume dynamic discoveries in this boot.
+            symbols::register_fallback(name, offset);
+
+            logger::log_info("AUTOOFF", "%s fallback: %s = 0x%lX (offset 0x%lX)",
+                             updated_existing ? "Updated" : "Registered",
+                             name,
+                             static_cast<unsigned long>(addr),
                              static_cast<unsigned long>(offset));
         };
 
@@ -1049,7 +1466,7 @@ namespace auto_offsets
         if (result.process_event)
             register_offset("ProcessEvent", result.process_event);
         if (result.fname_init)
-            register_offset("FName_Init", result.fname_init);
+            register_offset("FName::Init", result.fname_init);
         if (result.static_find_object)
             register_offset("StaticFindObject", result.static_find_object);
         if (result.static_construct_object)

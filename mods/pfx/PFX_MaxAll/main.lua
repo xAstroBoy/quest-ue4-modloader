@@ -23,6 +23,8 @@
 -- v22: Binary patch MOV W0,#0; RET on IsHologram at 0x4F631A0.
 -- ============================================================================
 local TAG = "PFX_MaxAll"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 Log(TAG .. ": Loading v26...")
 
@@ -296,6 +298,7 @@ end
 --   4. Call ShowSlot on each BP_TrophyCollectibleSlot_C to ensure visibility
 -- ============================================================================
 local function fix_all_trophies()
+    V("fix_all_trophies")
     -- Step 1: Build trophy map if not already built
     if not trophyMapReady then
         build_trophy_map()
@@ -481,44 +484,50 @@ pcall(function()
 end)
 
 -- PATCH 1b: BINARY PATCH IsHologram real impl → always return false
--- Overwrite the first two instructions of sub_4F631A0 with:
---   MOV W0, #0    (0x52800000)  — return false
---   RET            (0xD65F03C0)  — return immediately
--- All callers (native C++, Blueprint, exec thunk) hit the patched code.
+-- Overwrite the first two instructions with MOV W0,#0; RET so ALL callers
+-- (native C++, Blueprint, exec thunk) see IsHologram=false.
 pcall(function()
+    local base = GetLibBase()
     local addr = Resolve("PFXAchievementsManager::IsHologram", 0x04F631A0)
+    Log(TAG .. ": DIAG IsHologram: base=" .. tostring(base) .. " resolved=" .. tostring(addr))
     if not addr then
-        Log(TAG .. ": WARN: Failed to resolve IsHologram real impl address")
+        Log(TAG .. ": WARN: IsHologram Resolve returned nil — trying offset fallback")
+        if base then addr = Offset(base, 0x04F631A0) end
+    end
+    if not addr or addr == 0 then
+        Log(TAG .. ": ERROR: IsHologram — cannot resolve address")
         return
     end
-    WriteU32(addr, 0x52800000)           -- ARM64: MOVZ W0, #0
-    WriteU32(Offset(addr, 4), 0xD65F03C0) -- ARM64: RET
+    if base and addr < base then
+        addr = Offset(base, addr) -- relative offset → absolute
+    end
+    Log(TAG .. ": PATCH IsHologram: final addr=" .. tostring(addr))
+    WriteU32(addr, 0x52800000)
+    WriteU32(Offset(addr, 4), 0xD65F03C0)
     state.holo_native_hook = true
-    Log(TAG .. ": PATCH: IsHologram binary patched → return false (@ " .. tostring(addr) .. ")")
+    Log(TAG .. ": PATCH: IsHologram binary patched → return false")
 end)
 
--- PATCH 2: BINARY PATCH IsAchievementUnlocked real impl → always return true
--- ROOT CAUSE FIX (v25): exec thunk at 0x4E62E30 calls real impl sub_4F6272C.
--- sub_4F6272C walks PFXAchievementsManager's internal TMap (stride 0xA8) and
--- reads element[0x78] (bIsUnlocked byte). That TMap is separate from
--- PFXCollectibleEntry.bIsUnlocked and was never written by our unlock code.
--- So IsAchievementUnlocked kept returning false at NATIVE C++ level even
--- though unlock_all_entries() set collectible entries as unlocked.
--- This made IsHologramByCollectibleEntry call IsAchievementUnlocked (native),
--- get false, and mark everything as hologram — hiding actors on grab.
---
--- FIX: Overwrite sub_4F6272C with MOV W0,#1; RET → always unlocked.
--- This exactly mirrors the Frida script's onLeave hook on the exec thunk.
--- ARM64: MOVZ W0, #1 = 0x52800020;  RET = 0xD65F03C0
+-- PATCH 2: BINARY PATCH IsAchievementUnlocked → always return true
 pcall(function()
+    local base = GetLibBase()
     local addr = Resolve("PFXAchievementsManager::IsAchievementUnlocked_Real", 0x04F6272C)
+    Log(TAG .. ": DIAG IsAchievementUnlocked: base=" .. tostring(base) .. " resolved=" .. tostring(addr))
     if not addr then
-        Log(TAG .. ": WARN: Failed to resolve IsAchievementUnlocked real impl address")
+        Log(TAG .. ": WARN: IsAchievementUnlocked Resolve returned nil — trying offset fallback")
+        if base then addr = Offset(base, 0x04F6272C) end
+    end
+    if not addr or addr == 0 then
+        Log(TAG .. ": ERROR: IsAchievementUnlocked — cannot resolve address")
         return
     end
-    WriteU32(addr, 0x52800020)           -- ARM64: MOVZ W0, #1 (return true)
-    WriteU32(Offset(addr, 4), 0xD65F03C0) -- ARM64: RET
-    Log(TAG .. ": PATCH: IsAchievementUnlocked binary patched → return true (@ " .. tostring(addr) .. ")")
+    if base and addr < base then
+        addr = Offset(base, addr)
+    end
+    Log(TAG .. ": PATCH IsAchievementUnlocked: final addr=" .. tostring(addr))
+    WriteU32(addr, 0x52800020)
+    WriteU32(Offset(addr, 4), 0xD65F03C0)
+    Log(TAG .. ": PATCH: IsAchievementUnlocked binary patched → return true")
 end)
 
 -- HOOK 2: IsAchievementUnlocked → always true
@@ -549,6 +558,11 @@ pcall(function()
     RegisterPreHook(
         "/Script/PFXVRQuest.PFXCollectibleSlotComponent:RestoreSlotEntryFromProfile",
         function(self, funcPtr, parms)
+            -- DIAG: log first 5 calls + every 50th to detect retry storms
+            state._restore_diag = (state._restore_diag or 0) + 1
+            if state._restore_diag <= 5 or state._restore_diag % 50 == 0 then
+                Log(TAG .. ": DIAG: RestoreSlotEntryFromProfile hook #" .. state._restore_diag)
+            end
             local shouldBlock = false
             pcall(function()
                 if not is_live(self) then return end
@@ -561,6 +575,7 @@ pcall(function()
             end)
             if shouldBlock then
                 state.trophy_hook_swaps = state.trophy_hook_swaps + 1
+                V("RestoreSlotEntryFromProfile BLOCK #" .. state.trophy_hook_swaps)
                 return "BLOCK"
             end
         end
@@ -617,11 +632,20 @@ local function unlock_all_entries()
             if not entries then return end
             for _, entry in ipairs(entries) do
                 if is_live(entry) then
-                    local ok1 = pcall(function() entry:Call("SetUnlocked", true) end)
-                    if ok1 then
-                        ok_count = ok_count + 1
-                    else
+                    -- Guard: UnlockData must be non-nil — it's dereferenced immediately
+                    -- inside the native SetUnlocked/SetBrandNewUnlock code. If it’s nil
+                    -- the entry hasn’t been fully initialised yet and the call crashes.
+                    local ud = nil
+                    pcall(function() ud = entry:Get("UnlockData") end)
+                    if not ud then
                         fail_count = fail_count + 1
+                    else
+                        local ok1 = pcall(function() entry:Call("SetUnlocked", true) end)
+                        if ok1 then
+                            ok_count = ok_count + 1
+                        else
+                            fail_count = fail_count + 1
+                        end
                     end
                     -- NOTE: cm:Call("UnlockEntry") removed — Reason param is
                     -- EPFXCollectibleUnlockReasonType enum (1 byte), Call() writes int32
@@ -823,10 +847,20 @@ local function clear_brandnew()
             if entries then
                 for _, entry in ipairs(entries) do
                     if is_live(entry) then
-                        pcall(function()
-                            entry:Call("SetBrandNewUnlock", false)
-                            bn_count = bn_count + 1
-                        end)
+                        -- SetBrandNewUnlock deref's BOTH UnlockData (+0x108) AND
+                        -- CategoryData (+0x118). A null/garbage CategoryData causes
+                        -- fault at 0x10 / 0x44 / 0x145 and leaves the object in
+                        -- partial state that makes the UE5 GC recurse infinitely.
+                        local ud = nil
+                        local cd = nil
+                        pcall(function() ud = entry:Get("UnlockData") end)
+                        pcall(function() cd = entry:Get("CategoryData") end)
+                        if ud and cd then
+                            pcall(function()
+                                entry:Call("SetBrandNewUnlock", false)
+                                bn_count = bn_count + 1
+                            end)
+                        end
                     end
                 end
             end
@@ -995,6 +1029,7 @@ end
 -- MAIN: Run all phases
 -- ============================================================================
 local function run_maxall()
+    V("run_maxall")
     if state.ran then return end
     state.ran = true
     Log(TAG .. ": ========== STARTING MaxAll v24 ==========")
@@ -1002,10 +1037,17 @@ local function run_maxall()
     pcall(unlock_all_entries)
     pcall(max_perks)
     pcall(max_save_data)
-    pcall(max_benefits)
-    pcall(clear_brandnew)
+    -- max_benefits() intentionally NOT called here (Phase A).
+    -- BP_ChampionshipManager_C sub-objects (BenefitList entries' data fields) are
+    -- still loading at T≈24s. AddBenefit/GetBenefitAmount/ForceSelectBenefit all
+    -- crash with fault_addr=0xffffff80000000 (dangling sub-object ptr).
+    -- max_benefits() and sync_championship() are called in Phase B (T≈35-60s,
+    -- after slots≥100 and TrophyWall loaded) when all assets are initialized.
+    --
+    -- clear_brandnew() intentionally NOT called here either (Phase A).
+    -- PrimaryDataAsset sub-objects (CategoryData, UnlockData) are still loading.
+    -- clear_brandnew() is called in Phase B.
     pcall(mark_trophies_seen)
-    pcall(sync_championship)
     pcall(build_trophy_map)
     pcall(save_profile)
 
@@ -1038,6 +1080,7 @@ local allDone = false
 local pollCount = 0
 
 LoopAsync(5000, function()
+    Log(TAG .. ": DIAG: LoopAsync tick #" .. pollCount .. " — initDone=" .. tostring(initDone) .. " allDone=" .. tostring(allDone))
     pollCount = pollCount + 1
 
     if allDone then return true end
@@ -1090,6 +1133,7 @@ LoopAsync(5000, function()
         pcall(fix_all_trophies)
 
         if state.trophy_seen == 0 then pcall(mark_trophies_seen) end
+        pcall(max_benefits)
         pcall(sync_championship)
         pcall(clear_brandnew)
         pcall(save_profile)
@@ -1154,6 +1198,13 @@ LoopAsync(5000, function()
 
         if physCount >= 25 or trophyVerifyRetries >= 3 then
             trophyVerifyDone = true
+            -- Retry clear_brandnew here — Phase C fires ~10s after Phase B.
+            -- Any PrimaryDataAsset entries still loading during Phase B will now
+            -- be fully initialized, giving zero-crash coverage.
+            if state.brandnew_cleared < 900 then
+                pcall(clear_brandnew)
+                pcall(save_profile)
+            end
             -- Start background trophy sweep for ongoing grab/place protection
             pcall(start_trophy_sweep)
             if holoCount > 0 and physCount < 25 then
@@ -1203,6 +1254,7 @@ end)
 -- ============================================================================
 pcall(function()
     RegisterCommand("maxall_status", function()
+        V("maxall_status command fired")
         local slotCount = count_registered_slots()
         local actorCount = count_trophy_actors()
         return string.format(
@@ -1235,6 +1287,7 @@ end)
 
 pcall(function()
     RegisterCommand("maxall_run", function()
+        V("maxall_run command fired")
         state.ran = false
         pcall(run_maxall)
         return "re-ran maxall v24"

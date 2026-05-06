@@ -11,7 +11,7 @@
 --   Native hooks for collision bypass
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoInventoryCollision"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)

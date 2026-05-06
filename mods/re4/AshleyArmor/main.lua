@@ -4,7 +4,7 @@
 -- on Bio4Utils:HurtAshley.
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "AshleyArmor"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local state = { enabled = true }
@@ -32,6 +32,7 @@ Log(TAG .. ": RegisterPreHook — Bio4Utils:HurtAshley")
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("ashleyarmor", function()
+    V("ashleyarmor command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     ModConfig.Save("AshleyArmor", state)
     Log(TAG .. ": " .. (state.enabled and "ON" or "OFF"))

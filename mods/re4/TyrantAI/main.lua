@@ -17,6 +17,8 @@
 --   3 = Death
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "TyrantAI"
+local VERBOSE = true
+local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 -- ── cEm09 struct offsets ────────────────────────────────────────────
 local OFF = {
@@ -91,6 +93,7 @@ local tracker = {
 }
 
 local function trackInstance(ptr)
+    V("trackInstance ptr=0x%X", ptr)
     local key = ptr
     if not tracker.instances[key] then
         tracker.instances[key] = {
@@ -154,6 +157,7 @@ pcall(function()
             return emPtr
         end,
         function(retval, emPtr)
+            V("Em09Init post-hook emPtr=0x%X retval=0x%X", emPtr, retval)
             if emPtr ~= 0 then
                 trackInstance(emPtr)
                 Log(TAG .. ":   Em09Init complete — tracking instance")
@@ -167,6 +171,7 @@ end)
 pcall(function()
     RegisterNativeHook("cEm09_move",
         function(emPtr)
+            V("cEm09_move pre-hook emPtr=0x%X", emPtr)
             if emPtr == 0 then return emPtr end
 
             local inst = tracker.instances[emPtr]
@@ -216,6 +221,7 @@ end)
 pcall(function()
     RegisterNativeHook("cEm09_dtor",
         function(emPtr)
+            V("cEm09_dtor pre-hook emPtr=0x%X", emPtr)
             untrackInstance(emPtr)
             return emPtr
         end, nil)
@@ -227,6 +233,7 @@ pcall(function()
     RegisterNativeHook("em09_stateInit",
         nil,
         function(retval, emPtr)
+            V("em09_stateInit post-hook emPtr=0x%X retval=0x%X", emPtr, retval)
             if emPtr ~= 0 then
                 local hp = getHP(emPtr)
                 local animTbl = getAnimTable(emPtr)
@@ -244,6 +251,7 @@ pcall(function()
     RegisterNativeHook("em09_counterAttack",
         nil,
         function(retval, emPtr)
+            V("em09_counterAttack post-hook emPtr=0x%X", emPtr)
             if emPtr ~= 0 then
                 local hit = getGrabFlag(emPtr)
                 if hit ~= 0 then
@@ -273,6 +281,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════════
 
 RegisterCommand("tyrant_status", function()
+    V("tyrant_status command fired")
     forEachTyrant(function(ptr, inst)
         local packed = getPackedState(ptr)
         Log("─── Tyrant @ 0x" .. string.format("%X", ptr) .. " ───")
@@ -290,6 +299,7 @@ RegisterCommand("tyrant_status", function()
 end)
 
 RegisterCommand("tyrant_idle", function()
+    V("tyrant_idle command fired")
     forEachTyrant(function(ptr)
         setPackedState(ptr, 0x0001); setPhase(ptr, 0); setParam(ptr, 0)
         Log(TAG .. ": Forced → IDLE")
@@ -297,6 +307,7 @@ RegisterCommand("tyrant_idle", function()
 end)
 
 RegisterCommand("tyrant_chase", function()
+    V("tyrant_chase command fired")
     forEachTyrant(function(ptr)
         setPackedState(ptr, 0x0501); setPhase(ptr, 0); setParam(ptr, 0)
         Log(TAG .. ": Forced → CHASE")
@@ -304,6 +315,7 @@ RegisterCommand("tyrant_chase", function()
 end)
 
 RegisterCommand("tyrant_attack", function()
+    V("tyrant_attack command fired")
     forEachTyrant(function(ptr)
         setPackedState(ptr, 0x0801); setPhase(ptr, 0); setParam(ptr, 0)
         Log(TAG .. ": Forced → CLOSE_ATK")
@@ -311,6 +323,7 @@ RegisterCommand("tyrant_attack", function()
 end)
 
 RegisterCommand("tyrant_heal", function()
+    V("tyrant_heal command fired")
     forEachTyrant(function(ptr)
         setHP(ptr, 1000)
         if getMainState(ptr) == 3 then
@@ -323,20 +336,24 @@ RegisterCommand("tyrant_heal", function()
 end)
 
 RegisterCommand("tyrant_god", function()
+    V("tyrant_god command fired")
     forEachTyrant(function(ptr) setHP(ptr, 99999); Log(TAG .. ": God mode ON (99999 HP)") end)
 end)
 
 RegisterCommand("tyrant_mortal", function()
+    V("tyrant_mortal command fired")
     forEachTyrant(function(ptr) setHP(ptr, 1000); Log(TAG .. ": God mode OFF (1000 HP)") end)
 end)
 
 RegisterCommand("tyrant_verbose", function()
+    V("tyrant_verbose command fired")
     tracker.verbose = not tracker.verbose
     Log(TAG .. ": Verbose " .. (tracker.verbose and "ON" or "OFF"))
     Notify(TAG, "Verbose " .. (tracker.verbose and "ON" or "OFF"))
 end)
 
 RegisterCommand("tyrant_history", function()
+    V("tyrant_history command fired")
     forEachTyrant(function(ptr, inst)
         Log("─── State History (" .. #inst.stateHistory .. " transitions) ───")
         for i, t in ipairs(inst.stateHistory) do
@@ -364,6 +381,7 @@ end
 if SharedAPI and SharedAPI.DebugMenu then
     SharedAPI.DebugMenu.RegisterAction("TyrantAI", "Tyrant Status",
         function()
+            V("DebugMenu Tyrant Status fired")
             forEachTyrant(function(ptr, inst)
                 Log(TAG .. ": " .. stateName(getPackedState(ptr))
                     .. " HP=" .. getHP(ptr))

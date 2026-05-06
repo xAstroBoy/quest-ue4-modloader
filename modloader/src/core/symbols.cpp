@@ -9,6 +9,7 @@
 #include "modloader/symbols.h"
 #include "modloader/logger.h"
 #include "modloader/pattern_scanner.h"
+#include "modloader/auto_offsets.h"
 #include "modloader/game_profile.h"
 #include <dlfcn.h>
 #include <link.h>
@@ -25,15 +26,33 @@
 #include <algorithm>
 #include <cxxabi.h>
 #include <chrono>
+#include <utility>
 
 namespace symbols
 {
 
+    static bool disallow_hardcoded_fallbacks()
+    {
+        // Pinball FX VR updates frequently reshuffle stripped symbols.
+        // Hardcoded static offsets are intentionally disabled there.
+        return game_profile::is_pinball_fx();
+    }
+
     // Resolved symbol cache
     static std::unordered_map<std::string, void *> s_cache;
     static std::unordered_map<std::string, uintptr_t> s_fallbacks;
-    static std::unordered_map<std::string, std::string> s_patterns;
+    struct PatternSpec
+    {
+        std::string pattern;
+        int rip_offset = -1;
+        int instr_size = 0;
+    };
+
+    static std::unordered_map<std::string, PatternSpec> s_patterns;
     static std::recursive_mutex s_mutex;
+
+    // Relative offset cache — target_name -> (anchor_name, delta)
+    static std::unordered_map<std::string, std::pair<std::string, int64_t>> s_relative_offsets;
 
     static void *s_lib_handle = nullptr;
     static uintptr_t s_lib_base = 0;
@@ -369,7 +388,15 @@ namespace symbols
                              indexed, s_method_idx.size(), (long long)ms);
 
             // Debug: verify top-level function indexing worked
-            const char *test_names[] = {"StaticFindObject", "Et3f_init", "GetEtcModelClass", "VR4ModelInit", "getEmListNum"};
+            // Use game-appropriate test names — RE4-exclusive symbols shouldn't be checked on PFX
+            std::vector<const char *> test_names = {"StaticFindObject"};
+            if (game_profile::is_re4_vr())
+            {
+                test_names.push_back("Et3f_init");
+                test_names.push_back("GetEtcModelClass");
+                test_names.push_back("VR4ModelInit");
+                test_names.push_back("getEmListNum");
+            }
             for (auto &tn : test_names)
             {
                 auto it = s_method_idx.find(tn);
@@ -954,27 +981,125 @@ namespace symbols
         }
 
         // Register per-game fallback offsets from game profile
+        // (unless the game is configured for strict dynamic-only resolution).
         const auto &profile = game_profile::profile();
+        size_t registered_fallbacks = 0;
         for (const auto &fb : profile.fallback_offsets)
         {
-            if (fb.offset != 0)
+            if (fb.offset != 0 && !disallow_hardcoded_fallbacks())
             {
                 register_fallback(fb.symbol_name, fb.offset);
+                registered_fallbacks++;
+            }
+        }
+
+        if (disallow_hardcoded_fallbacks() && !profile.fallback_offsets.empty())
+        {
+            logger::log_warn("SYMBOL", "Hardcoded profile fallbacks are DISABLED for %s (dynamic-only mode)",
+                             profile.display_name.c_str());
+        }
+
+        // Register stable global offsets — ALWAYS applied regardless of dynamic-only mode.
+        // These are data globals (GUObjectArray, GNames, GEngine) proved stable across updates.
+        size_t registered_stable = 0;
+        for (const auto &sg : profile.stable_global_offsets)
+        {
+            if (sg.offset != 0)
+            {
+                register_fallback(sg.symbol_name, sg.offset);
+                registered_stable++;
+                logger::log_info("SYMBOL", "Stable global registered: %s @ +0x%lX",
+                                 sg.symbol_name.c_str(), sg.offset);
             }
         }
 
         // Register per-game pattern signatures
         for (const auto &sig : profile.pattern_signatures)
         {
-            register_pattern(sig.symbol_name, sig.pattern);
+            register_pattern(sig.symbol_name, sig.pattern, sig.rip_offset, sig.instr_size);
         }
 
-        logger::log_info("SYMBOL", "Registered %zu fallback offsets, %zu patterns from %s profile",
-                         profile.fallback_offsets.size(), profile.pattern_signatures.size(),
+        // Register per-game relative offsets (anchor + delta resolution)
+        for (const auto &rel : profile.relative_offsets)
+        {
+            register_relative_offset(rel.target_name, rel.anchor_name, rel.delta);
+        }
+
+        logger::log_info("SYMBOL", "Registered %zu/%zu fallback offsets, %zu stable globals, %zu patterns, %zu relative offsets from %s profile",
+                         registered_fallbacks, profile.fallback_offsets.size(),
+                         registered_stable, profile.pattern_signatures.size(),
+                         profile.relative_offsets.size(),
                          profile.display_name.c_str());
 
         // Initialize the ELF symbol cache for fast scanning
         init_elf_cache();
+    }
+
+    static void *try_runtime_discovery(const std::string &name)
+    {
+        uintptr_t discovered = 0;
+        std::string canonical = name;
+
+        if (name == "_ZN7UObject12ProcessEventEP9UFunctionPv" || name == "ProcessEvent")
+        {
+            discovered = auto_offsets::find_process_event();
+            canonical = "ProcessEvent";
+        }
+        else if (name == "GUObjectArray")
+        {
+            discovered = auto_offsets::find_guobjectarray();
+            canonical = "GUObjectArray";
+        }
+        else if (name == "GNames" || name == "_ZL6GNames" || name == "GNamePool" || name == "NamePoolData")
+        {
+            discovered = auto_offsets::find_gnames();
+            canonical = "GNames";
+        }
+        else if (name == "GEngine")
+        {
+            discovered = auto_offsets::find_gengine();
+            canonical = "GEngine";
+        }
+        else if (name == "GWorld")
+        {
+            discovered = auto_offsets::find_gworld();
+            canonical = "GWorld";
+        }
+        else if (name == "StaticFindObject")
+        {
+            discovered = auto_offsets::find_static_find_object();
+            canonical = "StaticFindObject";
+        }
+        else if (name == "StaticConstructObject_Internal")
+        {
+            discovered = auto_offsets::find_static_construct_object();
+            canonical = "StaticConstructObject_Internal";
+        }
+        else if (name == "FName::Init")
+        {
+            discovered = auto_offsets::find_fname_init();
+            canonical = "FName::Init";
+        }
+
+        if (discovered == 0)
+            return nullptr;
+
+        // Convert runtime absolute address to an offset fallback so aliases can reuse it.
+        if (s_lib_base != 0 && discovered >= s_lib_base)
+        {
+            uintptr_t offset = discovered - s_lib_base;
+            register_fallback(canonical, offset);
+            register_fallback(name, offset);
+            logger::log_info("RESOLVE", "%s: runtime-discovered %s @ 0x%lX (offset 0x%lX)",
+                             name.c_str(), canonical.c_str(), discovered, offset);
+        }
+        else
+        {
+            logger::log_info("RESOLVE", "%s: runtime-discovered absolute @ 0x%lX",
+                             name.c_str(), discovered);
+        }
+
+        return reinterpret_cast<void *>(discovered);
     }
 
     void *resolve(const std::string &name)
@@ -1018,7 +1143,15 @@ namespace symbols
         if (pat_it != s_patterns.end())
         {
             logger::log_info("RESOLVE", "%s: trying pattern scan...", name.c_str());
-            result = pattern::scan(pat_it->second);
+            const auto &spec = pat_it->second;
+            if (spec.rip_offset >= 0)
+            {
+                result = pattern::scan_rip(spec.pattern, spec.rip_offset, spec.instr_size);
+            }
+            else
+            {
+                result = pattern::scan(spec.pattern);
+            }
             if (result)
             {
                 logger::log_info("RESOLVE", "%s: resolved via pattern scan @ 0x%lX",
@@ -1029,14 +1162,52 @@ namespace symbols
             logger::log_warn("RESOLVE", "%s: pattern scan failed", name.c_str());
         }
 
-        // Priority 4: Fallback offset (UE4Dumper derived)
+        // Priority 3.25: Relative offset resolution — find via anchor + delta
+        // For functions that lack unique AOB patterns, resolve via a nearby
+        // confirmed function within the same compilation unit.
+        auto rel_it = s_relative_offsets.find(name);
+        if (rel_it != s_relative_offsets.end())
+        {
+            const auto &anchor_name = rel_it->second.first;
+            int64_t delta = rel_it->second.second;
+            logger::log_info("RESOLVE", "%s: trying relative offset from %s (delta=0x%lX)...",
+                             name.c_str(), anchor_name.c_str(), static_cast<long>(delta));
+            void *anchor = resolve(anchor_name);
+            if (anchor)
+            {
+                result = reinterpret_cast<void *>(
+                    reinterpret_cast<uintptr_t>(anchor) + delta);
+                logger::log_info("RESOLVE", "%s: resolved via relative offset from %s + 0x%lX => 0x%lX",
+                                 name.c_str(), anchor_name.c_str(),
+                                 static_cast<long>(delta),
+                                 reinterpret_cast<uintptr_t>(result));
+                s_cache[name] = result;
+                return result;
+            }
+            logger::log_warn("RESOLVE", "%s: relative offset failed (anchor %s not resolved)",
+                             name.c_str(), anchor_name.c_str());
+        }
+
+        // Priority 3.5: On-demand runtime memory discovery (auto-offset scanner)
+        // This rescans live mapped memory/string-xrefs and registers discovered
+        // offsets immediately, so stripped builds can still resolve core symbols.
+        logger::log_info("RESOLVE", "%s: trying runtime auto-discovery...", name.c_str());
+        result = try_runtime_discovery(name);
+        if (result)
+        {
+            s_cache[name] = result;
+            return result;
+        }
+        logger::log_warn("RESOLVE", "%s: runtime auto-discovery failed", name.c_str());
+
+        // Priority 4: Registered fallback offset (dynamic-discovered or profile-provided)
         auto fb_it = s_fallbacks.find(name);
         if (fb_it != s_fallbacks.end() && s_lib_base != 0 && fb_it->second != 0)
         {
             result = reinterpret_cast<void *>(s_lib_base + fb_it->second);
-            logger::log_warn("RESOLVE", "%s: all dynamic methods failed — using UE4Dumper fallback offset 0x%lX => 0x%lX",
+            logger::log_warn("RESOLVE", "%s: all dynamic methods failed — using registered fallback offset 0x%lX => 0x%lX",
                              name.c_str(), fb_it->second, reinterpret_cast<uintptr_t>(result));
-            logger::log_warn("RESOLVE", "This offset may break on APK update — file a bug");
+            logger::log_warn("RESOLVE", "Fallback offsets are less stable than direct dynamic resolution");
             s_cache[name] = result;
             return result;
         }
@@ -1048,6 +1219,12 @@ namespace symbols
 
     void *resolve_with_fallback(const std::string &name, uintptr_t fallback_offset)
     {
+        if (disallow_hardcoded_fallbacks())
+        {
+            logger::log_warn("RESOLVE", "%s: ignoring explicit hardcoded fallback in dynamic-only mode", name.c_str());
+            return resolve(name);
+        }
+
         if (fallback_offset != 0)
         {
             register_fallback(name, fallback_offset);
@@ -1061,10 +1238,25 @@ namespace symbols
         s_fallbacks[name] = offset;
     }
 
-    void register_pattern(const std::string &name, const std::string &pat)
+    void register_pattern(const std::string &name,
+                          const std::string &pat,
+                          int rip_offset,
+                          int instr_size)
     {
         std::lock_guard<std::recursive_mutex> lock(s_mutex);
-        s_patterns[name] = pat;
+        PatternSpec spec;
+        spec.pattern = pat;
+        spec.rip_offset = rip_offset;
+        spec.instr_size = instr_size;
+        s_patterns[name] = std::move(spec);
+    }
+
+    void register_relative_offset(const std::string &target_name,
+                                  const std::string &anchor_name,
+                                  int64_t delta)
+    {
+        std::lock_guard<std::recursive_mutex> lock(s_mutex);
+        s_relative_offsets[target_name] = std::make_pair(anchor_name, delta);
     }
 
     uintptr_t lib_base() { return s_lib_base; }
@@ -1088,10 +1280,11 @@ namespace symbols
     {
         logger::log_info("SYMBOL", "Resolving core symbols...");
 
-        // ProcessEvent — try mangled name first
-        void *pe = resolve("_ZN7UObject12ProcessEventEP9UFunctionPv");
+        // ProcessEvent — try simple name first (uses pattern scan which is more
+        // reliable than string-xref auto-discovery for stripped binaries)
+        void *pe = resolve("ProcessEvent");
         if (!pe)
-            pe = resolve("ProcessEvent");
+            pe = resolve("_ZN7UObject12ProcessEventEP9UFunctionPv");
         ProcessEvent = reinterpret_cast<ue::ProcessEventFn>(pe);
         if (ProcessEvent)
         {
@@ -1179,6 +1372,20 @@ namespace symbols
             GNames = resolve("GNamePool");
         if (!GNames)
             GNames = resolve("NamePoolData");
+        if (!GNames && GUObjectArray)
+        {
+            // Pinball FX VR fallback: GNames is at GUObjectArray - 0x47638
+            // Verified on both old and new PFX VR binaries.
+            // GNames is a global in .bss, not directly accessible via ADRP — it's
+            // accessed through GOT indirection, making direct AOB scanning unreliable.
+            // Instead, we compute it from the already-resolved GUObjectArray.
+            constexpr uintptr_t PFX_GNAMES_GUOA_DELTA = 0x47638;
+            GNames = reinterpret_cast<void *>(
+                reinterpret_cast<uintptr_t>(GUObjectArray) - PFX_GNAMES_GUOA_DELTA);
+            logger::log_info("SYMBOL", "GNames: resolved via GUObjectArray - 0x%lX => 0x%lX",
+                             static_cast<unsigned long>(PFX_GNAMES_GUOA_DELTA),
+                             reinterpret_cast<uintptr_t>(GNames));
+        }
         if (GNames)
         {
             logger::log_info("SYMBOL", "GNames resolved: 0x%lX", reinterpret_cast<uintptr_t>(GNames));
@@ -1196,11 +1403,18 @@ namespace symbols
         GWorld = resolve("GWorld");
         logger::log_info("SYMBOL", "GWorld: %s", GWorld ? "OK" : "NOT FOUND (non-critical)");
 
-        // Game-specific — try unmangled and class-qualified names
-        GetEtcModelClass = resolve("GetEtcModelClass");
-        if (!GetEtcModelClass)
-            GetEtcModelClass = resolve("UVR4DataSingleton::GetEtcModelClass");
-        logger::log_info("SYMBOL", "GetEtcModelClass: %s", GetEtcModelClass ? "OK" : "NOT FOUND (game-specific)");
+        // ── RE4 VR specific symbols — skip on other games ──
+        if (game_profile::is_re4_vr())
+        {
+            GetEtcModelClass = resolve("GetEtcModelClass");
+            if (!GetEtcModelClass)
+                GetEtcModelClass = resolve("UVR4DataSingleton::GetEtcModelClass");
+            logger::log_info("SYMBOL", "GetEtcModelClass: %s", GetEtcModelClass ? "OK" : "NOT FOUND (RE4-specific)");
+        }
+        else
+        {
+            logger::log_info("SYMBOL", "GetEtcModelClass: SKIPPED (RE4 VR only)");
+        }
 
         // FName::Init — used for constructing FNames from strings at runtime
         // Mangled: _ZN5FNameC1EPKcj or FName::FName(wchar_t const*, int)
@@ -1221,25 +1435,32 @@ namespace symbols
         FOutputDevice_Log = reinterpret_cast<FOutputDevice_LogFn>(fol);
         logger::log_info("SYMBOL", "FOutputDevice_Log: %s", fol ? "OK" : "NOT FOUND (non-critical)");
 
-        // FText::ToString() const — needed for reading FText properties
-        void *ftt = resolve("_ZNK5FText8ToStringEv");
-        FText_ToString = reinterpret_cast<FText_ToStringFn>(ftt);
-        logger::log_info("SYMBOL", "FText_ToString: %s", ftt ? "OK" : "NOT FOUND");
+        // ── FText raw symbols — RE4 VR only ──
+        // On Pinball FX VR (UE5 stripped), these are unavailable and unnecessary.
+        // PFX uses Kismet Conv_TextToString / Conv_StringToText via ProcessEvent.
+        if (game_profile::is_re4_vr())
+        {
+            void *ftt = resolve("_ZNK5FText8ToStringEv");
+            FText_ToString = reinterpret_cast<FText_ToStringFn>(ftt);
+            logger::log_info("SYMBOL", "FText_ToString: %s", ftt ? "OK" : "NOT FOUND");
 
-        // FText::FromString(FString&&) — needed for writing FText properties
-        void *ftf = resolve("_ZN5FText10FromStringEO7FString");
-        FText_FromString = reinterpret_cast<FText_FromStringFn>(ftf);
-        logger::log_info("SYMBOL", "FText_FromString: %s", ftf ? "OK" : "NOT FOUND");
+            void *ftf = resolve("_ZN5FText10FromStringEO7FString");
+            FText_FromString = reinterpret_cast<FText_FromStringFn>(ftf);
+            logger::log_info("SYMBOL", "FText_FromString: %s", ftf ? "OK" : "NOT FOUND");
 
-        // FText::~FText() — destructor for cleaning up old FText values
-        void *ftd = resolve("_ZN5FTextD2Ev");
-        FText_Dtor = reinterpret_cast<FText_DtorFn>(ftd);
-        logger::log_info("SYMBOL", "FText_Dtor: %s", ftd ? "OK" : "NOT FOUND");
+            void *ftd = resolve("_ZN5FTextD2Ev");
+            FText_Dtor = reinterpret_cast<FText_DtorFn>(ftd);
+            logger::log_info("SYMBOL", "FText_Dtor: %s", ftd ? "OK" : "NOT FOUND");
 
-        // FText::FText() — default constructor
-        void *ftc = resolve("_ZN5FTextC1Ev");
-        FText_Ctor = reinterpret_cast<FText_CtorFn>(ftc);
-        logger::log_info("SYMBOL", "FText_Ctor: %s", ftc ? "OK" : "NOT FOUND");
+            void *ftc = resolve("_ZN5FTextC1Ev");
+            FText_Ctor = reinterpret_cast<FText_CtorFn>(ftc);
+            logger::log_info("SYMBOL", "FText_Ctor: %s", ftc ? "OK" : "NOT FOUND");
+        }
+        else
+        {
+            logger::log_info("SYMBOL", "FText raw symbols: SKIPPED (using Kismet path on %s)",
+                             game_profile::display_name().c_str());
+        }
 
         int resolved = 0;
         int total = 17;

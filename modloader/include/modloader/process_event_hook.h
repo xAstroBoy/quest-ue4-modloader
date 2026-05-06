@@ -59,8 +59,23 @@ struct FuncStats {
 // Get per-function call statistics
 std::vector<FuncStats> get_func_stats();
 
+// Install the ProcessEvent hook using Dobby (legacy — may freeze)
+void install();
+// Install using manual ARM64 LDR+BR patch — bypasses Dobby entirely
+void install_manual();
+
 // Get the original (un-hooked) ProcessEvent function pointer
 ue::ProcessEventFn get_original();
+// Get the unhooked ProcessEvent pointer (saved before Dobby hook install).
+// This is the REAL function address, unlike get_original() which returns
+// a Dobby trampoline that may crash when called outside hook context.
+ue::ProcessEventFn get_unhooked();
+
+// Returns true if the calling thread is the game thread (the one that
+// fired the first ProcessEvent hook callback). Returns false if the
+// game thread hasn't been seen yet, or if called from any other thread.
+// Use this before calling ProcessEvent from C++ code outside hook callbacks.
+bool is_game_thread();
 
 // Queue a function to run on the game thread (drained on every ProcessEvent call)
 // This is the C++ backend for Lua's ExecuteInGameThread(fn)

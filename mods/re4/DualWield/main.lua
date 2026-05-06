@@ -11,7 +11,7 @@
 --   We just need to flip it on via the settings function library.
 -- =====================================================================
 local TAG = "DualWield"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)
@@ -188,6 +188,7 @@ Log(TAG .. ": " .. hookCount .. "/2 PostHooks registered")
 -- =====================================================================
 
 RegisterCommand("dualwield", function()
+    V("dualwield command — toggling from %s", tostring(state.enabled))
     state.enabled = not state.enabled
     if state.enabled then
         applyDualWieldSetting(true)

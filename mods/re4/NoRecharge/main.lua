@@ -9,7 +9,7 @@
 --   Native hooks on BeginReload → InstantReload redirect
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "NoRecharge"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local function isDefaultObject(obj)

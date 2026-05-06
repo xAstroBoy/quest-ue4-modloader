@@ -122,6 +122,17 @@ namespace game_profile
         int instr_size;      // used with rip_offset
     };
 
+    // ═══ Relative offset entry ═══════════════════════════════════════════════
+    // For functions without unique AOB patterns, resolve via a nearby
+    // confirmed function + a fixed offset. Only valid within the same
+    // compilation unit (.o file).
+    struct RelativeOffset
+    {
+        std::string target_name;
+        std::string anchor_name;
+        int64_t delta; // bytes from anchor to target (can be negative)
+    };
+
     // ═══ Game profile ═══════════════════════════════════════════════════════
     struct GameProfile
     {
@@ -139,6 +150,12 @@ namespace game_profile
 
         std::vector<FallbackOffset> fallback_offsets;
         std::vector<PatternSignature> pattern_signatures;
+        std::vector<RelativeOffset> relative_offsets;
+
+        // Stable global offsets — ALWAYS applied, even in dynamic-only mode.
+        // Use this for data globals (GUObjectArray, GNames, GEngine) that are
+        // proved stable across game updates. Never use for function offsets.
+        std::vector<FallbackOffset> stable_global_offsets;
     };
 
     // ═══ API ════════════════════════════════════════════════════════════════

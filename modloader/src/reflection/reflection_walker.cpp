@@ -1366,12 +1366,28 @@ namespace reflection
 
     std::vector<ue::UObject *> find_all_instances(const std::string &class_name)
     {
+        // Flags that indicate an object is not safe to use as a live instance:
+        // loading (PrimaryDataAsset async), uninitialized, CDO, archetype, or being GC'd.
+        static constexpr int32_t UNSAFE_FLAGS =
+            ue::RF_ClassDefaultObject     |
+            ue::RF_ArchetypeObject        |
+            ue::RF_NeedInitialization     |
+            ue::RF_NeedLoad               |
+            ue::RF_NeedPostLoad           |
+            ue::RF_NeedPostLoadSubobjects |
+            ue::RF_BeginDestroyed         |
+            ue::RF_FinishDestroyed;
+
         std::vector<ue::UObject *> result;
         int32_t count = get_num_elements();
         for (int32_t i = 0; i < count; i++)
         {
             ue::UObject *obj = get_object_at_index(i);
             if (!obj || !ue::is_valid_ptr(obj))
+                continue;
+            // Reject objects in unsafe lifecycle states
+            int32_t obj_flags = ue::uobj_get_flags(obj);
+            if (obj_flags & UNSAFE_FLAGS)
                 continue;
             std::string obj_name = get_short_name(obj);
             if (ue::is_default_object(obj_name.c_str()))

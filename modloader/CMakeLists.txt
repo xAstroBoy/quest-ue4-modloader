@@ -56,6 +56,7 @@ set(MOD_SOURCES
     src/core/ue_memory.cpp
     src/lua/lua_console.cpp
     src/lua/lua_cast.cpp
+    src/lua/lua_yup.cpp
 )
 
 add_library(modloader SHARED ${MOD_SOURCES})
@@ -91,28 +92,13 @@ target_link_options(modloader PRIVATE
     -Wl,--gc-sections
 )
 
-# ── Post-build: create stripped copy for deployment ─────────────────────
-# The unstripped libmodloader.so (with DWARF) stays in build/ for addr2line.
-# The stripped copy goes to build/deploy/ for pushing to the device.
-find_program(STRIP_TOOL
-    ${CMAKE_STRIP}
-    "${ANDROID_TOOLCHAIN_ROOT}/bin/llvm-strip"
-    "${ANDROID_TOOLCHAIN_ROOT}/bin/aarch64-linux-android-strip"
-)
-
+# ── Post-build: create unstripped deployment copy ───────────────────────
+# Deployment artifacts must remain unstripped for diagnostics.
 add_custom_command(TARGET modloader POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/deploy"
     COMMAND ${CMAKE_COMMAND} -E copy
         "$<TARGET_FILE:modloader>"
         "${CMAKE_BINARY_DIR}/deploy/libmodloader.so"
-    COMMAND ${CMAKE_COMMAND} -E echo "[STRIP] Creating stripped copy for deployment..."
-    COMMENT "Creating stripped deployment copy"
+    COMMAND ${CMAKE_COMMAND} -E echo "[DEPLOY] Copied unstripped libmodloader.so to build/deploy/"
+    COMMENT "Creating unstripped deployment copy"
 )
-
-if(STRIP_TOOL)
-    add_custom_command(TARGET modloader POST_BUILD
-        COMMAND ${STRIP_TOOL} --strip-debug --strip-unneeded
-            "${CMAKE_BINARY_DIR}/deploy/libmodloader.so"
-        COMMENT "Stripping debug info from deploy copy"
-    )
-endif()

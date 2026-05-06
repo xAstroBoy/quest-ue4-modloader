@@ -6,6 +6,9 @@
 //   4. Wait for GUObjectArray (120s, MIN_OBJECTS >= 5000, heavy diagnostics)
 //   5. Walk reflection → SDK → class rebuilder → Lua → mods → paks → notifications
 
+#include <thread>
+#include <chrono>
+
 #include "modloader/init.h"
 #include "modloader/logger.h"
 #include "modloader/paths.h"
@@ -38,6 +41,17 @@
 #include <cstring>
 #include <cinttypes>
 #include <fstream>
+
+namespace
+{
+    static bool starts_with(const std::string &s, const char *prefix)
+    {
+        if (!prefix)
+            return false;
+        size_t n = std::strlen(prefix);
+        return s.size() >= n && s.compare(0, n, prefix) == 0;
+    }
+}
 
 namespace init
 {
@@ -100,6 +114,62 @@ namespace init
             }
             logger::log_info("DIAG", "%s", line);
         }
+    }
+
+    // ═══ Wait for a live runtime world (not Default__) ═════════════════════
+    // This prevents Lua mods from executing too early against CDO/default objects
+    // during intro boot animation.
+    static bool wait_for_runtime_world(int timeout_ms)
+    {
+        const int poll_ms = 100;
+        int waited = 0;
+        int last_log = -2000;
+
+        while (waited < timeout_ms)
+        {
+            bool gworld_slot_ok = false;
+            bool world_ptr_ok = false;
+            bool runtime_world_ok = false;
+            std::string world_name;
+
+            if (symbols::GWorld)
+            {
+                gworld_slot_ok = true;
+                ue::UObject *world = *reinterpret_cast<ue::UObject **>(symbols::GWorld);
+                if (world && ue::is_valid_ptr(world))
+                {
+                    world_ptr_ok = true;
+                    world_name = reflection::get_short_name(world);
+                    if (!world_name.empty() && !starts_with(world_name, "Default__"))
+                    {
+                        runtime_world_ok = true;
+                    }
+                }
+            }
+
+            if (runtime_world_ok)
+            {
+                logger::log_info("DEFER", "Runtime world ready: %s (waited %dms)",
+                                 world_name.c_str(), waited);
+                return true;
+            }
+
+            if (waited - last_log >= 2000)
+            {
+                logger::log_info("DEFER", "World gate @ %dms — GWorld:%s world:%s name:%s",
+                                 waited,
+                                 gworld_slot_ok ? "set" : "null",
+                                 world_ptr_ok ? "valid" : "null/invalid",
+                                 world_name.empty() ? "<none>" : world_name.c_str());
+                last_log = waited;
+            }
+
+            usleep(poll_ms * 1000);
+            waited += poll_ms;
+        }
+
+        logger::log_warn("DEFER", "Runtime world gate timed out after %dms — loading mods anyway", timeout_ms);
+        return false;
     }
 
     // ═══ Wait for GUObjectArray to populate ═════════════════════════════════
@@ -214,20 +284,53 @@ namespace init
         // guard in dispatch_full() keeps working for the lifetime of the process.
         crash_handler::reinstall();
 
-        // Wait for GUObjectArray to populate — engine needs time to init
-        logger::log_info("DEFER", "Waiting for GUObjectArray to populate (120s timeout, min 5000 objects)...");
-        bool guoa_ok = wait_for_guobjectarray(120000);
-
-        // Walk reflection graph
-        logger::log_info("DEFER", "Walking UE4 reflection graph...");
-        if (guoa_ok)
+        // Wait for GUObjectArray to populate — engine needs time to init.
+        // If GUObjectArray is unresolved on this build, DO NOT call reflection::walk_all()
+        // (it will dereference null and crash the process).
+        bool guoa_ok = false;
+        bool reflection_ok = false;
+        if (!symbols::GUObjectArray)
         {
-            reflection::walk_all();
+            logger::log_error("DEFER", "GUObjectArray unresolved — skipping reflection walk to avoid crash");
         }
         else
         {
-            logger::log_warn("DEFER", "Attempting walk despite GUObjectArray timeout...");
-            reflection::walk_all();
+            logger::log_info("DEFER", "Waiting for GUObjectArray to populate (120s timeout, min 5000 objects)...");
+            guoa_ok = wait_for_guobjectarray(120000);
+
+            // Reinstall immediately before walk_all() — our main-thread reinstall at
+            // boot-complete already fires after Oculus's ForegroundAppHandler (~6.82s),
+            // so no additional sleep is needed. The 3s sleep was causing the game to
+            // crash at t=7.284s because our handler wasn't active during that window.
+            crash_handler::reinstall();
+            logger::log_info("DEFER", "Walking UE4 reflection graph...");
+            auto walk_res = safe_call::execute([&]()
+                                               { reflection::walk_all(); },
+                                               "deferred_init::reflection::walk_all");
+            if (walk_res.ok)
+            {
+                reflection_ok = true;
+                logger::log_info("DEFER", "Reflection walk complete");
+            }
+            else
+            {
+                logger::log_error("DEFER", "Reflection walk FAILED: %s", walk_res.error_msg.c_str());
+                reflection_ok = false;
+            }
+        }
+
+        // ── Load Lua mods ONLY after runtime world is live ─────────────────
+        // Prevents early boot execution against Default__ objects and intro-time
+        // freezes when mods mutate UI/game state before world readiness.
+        wait_for_runtime_world(90000);
+        logger::log_info("DEFER", "Loading Lua mods (world gate passed or timed out)...");
+        int mods_loaded = mod_loader::load_all();
+        int mods_failed = mod_loader::failed_count();
+        logger::log_info("DEFER", "Mods: %d loaded, %d failed", mods_loaded, mods_failed);
+
+        if (notif_ok)
+        {
+            notification::post_boot(mods_loaded, mods_failed);
         }
 
         auto &classes = reflection::get_classes();
@@ -237,7 +340,7 @@ namespace init
                          classes.size(), structs.size(), enums.size());
 
         // Generate SDK
-        if (config::auto_dump_on_boot() && (!classes.empty() || !structs.empty() || !enums.empty()))
+        if (reflection_ok && config::auto_dump_on_boot() && (!classes.empty() || !structs.empty() || !enums.empty()))
         {
             logger::log_info("DEFER", "Generating SDK...");
             sdk_gen::generate();
@@ -283,34 +386,48 @@ namespace init
                     int go_count = 0;
                     gobjects_ofs << "# GUObjectArray Dump — " << total << " total slots\n";
                     gobjects_ofs << "# Format: [Index] ClassName FullPath (Address) Flags=0xHEX\n\n";
-                    for (int32_t i = 0; i < total; i++)
-                    {
-                        ue::UObject *obj = reflection::get_object_by_index(i);
-                        if (!obj || !ue::is_valid_ptr(obj))
-                            continue;
-                        std::string obj_name = reflection::get_short_name(obj);
-                        if (obj_name.empty())
-                            continue;
-                        std::string full_name = reflection::get_full_name(obj);
-                        std::string cls_name = "???";
-                        ue::UClass *cls = ue::uobj_get_class(obj);
-                        if (cls && ue::is_valid_ptr(cls))
-                            cls_name = reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls));
-                        int32_t flags = ue::uobj_get_flags(obj);
-                        char addr_buf[32];
-                        snprintf(addr_buf, sizeof(addr_buf), "0x%lX", (unsigned long)(uintptr_t)obj);
-                        gobjects_ofs << "[" << i << "] " << cls_name << " " << full_name
-                                     << " (" << addr_buf << ") Flags=0x" << std::hex << flags << std::dec << "\n";
-                        go_count++;
-                    }
+                    auto dump_result = safe_call::execute([&]()
+                                                          {
+                        for (int32_t i = 0; i < total; i++)
+                        {
+                            ue::UObject *obj = reflection::get_object_by_index(i);
+                            if (!obj || !ue::is_valid_ptr(obj))
+                                continue;
+                            std::string obj_name = reflection::get_short_name(obj);
+                            if (obj_name.empty())
+                                continue;
+                            std::string full_name = reflection::get_full_name(obj);
+                            std::string cls_name = "???";
+                            ue::UClass *cls = ue::uobj_get_class(obj);
+                            if (cls && ue::is_valid_ptr(cls))
+                                cls_name = reflection::get_short_name(reinterpret_cast<const ue::UObject *>(cls));
+                            int32_t flags = ue::uobj_get_flags(obj);
+                            char addr_buf[32];
+                            snprintf(addr_buf, sizeof(addr_buf), "0x%lX", (unsigned long)(uintptr_t)obj);
+                            gobjects_ofs << "[" << i << "] " << cls_name << " " << full_name
+                                         << " (" << addr_buf << ") Flags=0x" << std::hex << flags << std::dec << "\n";
+                            go_count++;
+                        } }, "GObjects dump");
                     gobjects_ofs.close();
-                    logger::log_info("DEFER", "GObjects dump: %d objects → %s", go_count, gobjects_path.c_str());
+                    if (dump_result.ok)
+                    {
+                        logger::log_info("DEFER", "GObjects dump: %d objects → %s", go_count, gobjects_path.c_str());
+                    }
+                    else
+                    {
+                        logger::log_warn("DEFER", "GObjects dump: partial (%d objects before fault) → %s",
+                                         go_count, gobjects_path.c_str());
+                    }
                 }
                 else
                 {
                     logger::log_error("DEFER", "GObjects dump: cannot open %s", gobjects_path.c_str());
                 }
             }
+        }
+        else if (!reflection_ok)
+        {
+            logger::log_warn("DEFER", "Skipping SDK generation — reflection walk unavailable on this session");
         }
         else if (!config::auto_dump_on_boot())
         {
@@ -328,24 +445,16 @@ namespace init
         logger::log_info("DEFER", "PAK mounting handled by Dobby hooks (Frida-style capture)");
 
         // ── Deferred AES fallback scan ─────────────────────────────────────
-        // Some UE5 builds do not expose FAES::DecryptData symbolically. Run
-        // one delayed scan after engine startup to capture candidate keys.
-        // SKIP if we already have keys (hook or pak_key.txt captured them).
-        if (!aes_extractor::has_keys())
-        {
-            struct timespec ts = {8, 0};
-            nanosleep(&ts, nullptr);
-            int found = aes_extractor::scan_for_keys();
-            logger::log_info("DEFER", "AES fallback scan found %d candidate key(s), total=%zu",
-                             found, aes_extractor::key_count());
-
-            std::string aes_dump_path = paths::data_dir() + "/aes_keys.txt";
-            aes_extractor::dump_keys_to_file(aes_dump_path);
-        }
-        else
-        {
-            logger::log_info("DEFER", "AES key already available — skipping fallback scan");
-        }
+        // SKIPPED: scan_for_keys() touches unmapped memory and SIGSEGVs
+        // on this binary, killing the process. FAES::DecryptData not found
+        // via pattern scan, so there's nothing to scan safely.
+        // if (!aes_extractor::has_keys())
+        // {
+        //     struct timespec ts = {8, 0};
+        //     nanosleep(&ts, nullptr);
+        //     int found = aes_extractor::scan_for_keys();
+        // }
+        logger::log_info("DEFER", "AES fallback scan SKIPPED (unsafe on this binary)");
 
         // Post SDK notification
         if (notif_ok && !classes.empty())
@@ -497,10 +606,12 @@ namespace init
             }
         }
 
-        // ── Step 8: Install ProcessEvent hook EARLY ─────────────────────────
-        // Per instructions: ProcessEvent hook fires BEFORE reflection walk
+        // ── Step 8: ProcessEvent hook ────────────────────────────────────────
+        // Hooks ProcessEvent via Dobby. Enables Lua Hook()/HookPost(), game
+        // thread queue draining (ExecuteInGameThread/LoopAsync/ExecuteWithDelay),
+        // lazy hook resolution, and game thread ID capture.
         pe_hook::install();
-        logger::log_info("BOOT", "ProcessEvent hook installed via Dobby (pre-reflection)");
+        logger::log_info("BOOT", "ProcessEvent hook installed");
 
         // ── Step 9: Initialize native hook subsystem EARLY ──────────────────
         native_hooks::init();
@@ -542,20 +653,6 @@ namespace init
             return false;
         }
 
-        // ── Step 14: Load mods IMMEDIATELY (no GUObjectArray wait) ──────────
-        // Mods register hooks — they don't need GUObjectArray to load.
-        // PE hooks fire lazily when ProcessEvent is called.
-        // Native hooks resolve symbols from ELF, not from the object array.
-        int mods_loaded = mod_loader::load_all();
-        int mods_failed = mod_loader::failed_count();
-        logger::log_info("BOOT", "Mods: %d loaded, %d failed", mods_loaded, mods_failed);
-
-        // ── Step 15: Post initial boot notification ─────────────────────────
-        if (notif_ok)
-        {
-            notification::post_boot(mods_loaded, mods_failed);
-        }
-
         // ── Step 15.5: Re-install crash handler ─────────────────────────────
         // The Oculus VR runtime and/or Frida may have replaced our SIGSEGV
         // handler during mod loading or between steps. Re-assert it now
@@ -571,9 +668,9 @@ namespace init
         // intentionally let through. Now all signals are fully caught.
         crash_handler::mark_boot_complete();
 
-        logger::log_info("BOOT", "Boot complete in %lldms — %d mods, ADB on :%d",
-                         (long long)boot_ms, mods_loaded, adb_bridge::ADB_BRIDGE_PORT);
-        logger::log_info("BOOT", "Deferring GUObjectArray wait + reflection + SDK + PAK to background thread");
+        logger::log_info("BOOT", "Boot complete in %lldms — Lua ready, ADB on :%d",
+                         (long long)boot_ms, adb_bridge::ADB_BRIDGE_PORT);
+        logger::log_info("BOOT", "Deferring world-gated mod load + GUObjectArray wait + reflection + SDK + PAK to background thread");
 
         s_initialized = true;
 

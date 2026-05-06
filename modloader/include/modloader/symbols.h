@@ -30,7 +30,21 @@ namespace symbols
     void register_fallback(const std::string &name, uintptr_t offset);
 
     // Register a pattern for a symbol (for Priority 3 AOB scan)
-    void register_pattern(const std::string &name, const std::string &pattern);
+    // If rip_offset >= 0, resolution uses pattern::scan_rip() to decode
+    // ADRP/ADD/LDR style PC-relative targets (for globals in .data/.bss).
+    void register_pattern(const std::string &name,
+                          const std::string &pattern,
+                          int rip_offset = -1,
+                          int instr_size = 0);
+
+    // Register a relative offset for a symbol (for fallback resolution)
+    // When `target_name` cannot be found directly, resolve `anchor_name` first
+    // then add `delta` bytes to get the target address.
+    // Used for functions lacking unique AOB patterns, resolved via a nearby
+    // confirmed function in the same compilation unit.
+    void register_relative_offset(const std::string &target_name,
+                                  const std::string &anchor_name,
+                                  int64_t delta);
 
     // Get the base address of libUE4.so
     uintptr_t lib_base();

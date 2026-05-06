@@ -15,7 +15,7 @@
 --   /sdcard/Android/data/com.Armature.VR4/files/UE4Game/VR4/Content/Paks/
 -- ═══════════════════════════════════════════════════════════════════════
 local TAG = "SaddlerAdaFix"
-local VERBOSE = false
+local VERBOSE = true
 local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
 
 local EM3F_INDEX = 0x3F
