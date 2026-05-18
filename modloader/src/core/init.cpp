@@ -573,10 +573,20 @@ namespace init
         }
 
         // ── Step 6.5: Run dynamic offset discovery ──────────────────────────
-        // Auto-discovers GNames, GUObjectArray, ProcessEvent, FUObjectItem size,
-        // and other critical offsets for ANY UE version. Discovered values are
-        // merged into the game profile as fallbacks (game profile takes priority).
+        // HandBoi has deterministic IDA-derived offsets in profile; skip broad
+        // auto-discovery to avoid noisy string-xref guessing and boot delay.
+        if (game_profile::package_name() == "com.Capricia.HandBoi")
         {
+            logger::log_info("BOOT", "Auto-offset discovery: SKIPPED for HandBoi (using profile + IDA-derived stable offsets)");
+            logger::log_info("BOOT", "Final engine version after profile selection: %s (enum=%u)",
+                             game_profile::profile().engine_version.c_str(),
+                             static_cast<unsigned>(game_profile::engine_version_enum()));
+        }
+        else
+        {
+            // Auto-discovers GNames, GUObjectArray, ProcessEvent, FUObjectItem size,
+            // and other critical offsets for ANY UE version. Discovered values are
+            // merged into the game profile as fallbacks (game profile takes priority).
             auto_offsets::init();
             auto discovery = auto_offsets::discover_all();
             logger::log_info("BOOT", "Auto-offset discovery: %d found, %d failed, version=%s",

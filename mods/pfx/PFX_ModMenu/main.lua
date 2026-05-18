@@ -1,25 +1,28 @@
 -- ============================================================================
--- PFX_ModMenu v8 — In-Game Mod Menu via Legal Section Takeover
+-- PFX_ModMenu v10 — In-Game Mod Menu via Legal Section Takeover
 -- ============================================================================
--- v8 BEAUTIFUL LAYOUT — Native game widget types:
---   Section headers  → disabled WBP_Button_Default_C
---   Toggles          → WBP_OptionsEntry_C Type=1 (native OFF/ON carousel switcher)
---   Sliders          → WBP_OptionsEntry_C Type=2 (numeric slider)
---   Action buttons   → WBP_Button_Default_C
+-- v10 CLICK FIX:
+--   BndEvt hooks were using the wrong function name. Decompiled blueprints show
+--   "ComponentBoundEvent_0" but the actual runtime UFunction is named
+--   "K2Node_ComponentBoundEvent_0". PE trace (638k calls, 74s) confirmed this:
+--   BndEvt__..._K2Node_ComponentBoundEvent_0_OnButtonClicked appeared 16 times.
+--   BndEvt__..._ComponentBoundEvent_0 (without K2Node_) was never called.
+--   Same fix applied to the slider BndEvt (K2Node_ComponentBoundEvent_2).
+--   ExecuteUbergraph_WBP_Button_Default never appeared in PE trace — it is
+--   called via EX_LocalFinalFunction which skips ProcessEvent entirely.
 --
--- Hooks (v8):
---   + WBP_OptionsEntry_C:HandleSwitcherValueChanged   (toggle dispatch)
---   + WBP_OptionsEntry_C:BndEvt..._Slider_..._OnValueChanged  (slider)
---   + WBP_Button_Default_C:BndEvt..._ComponentBoundEvent_0_...  (action buttons)
---   - WBP_CheckboxFilterButton_C:IsCheckedChanged     (REMOVED — no longer used)
+-- v9 ROOT CAUSE FIX #2:
+--   btn_to_idx stored UObject identity as Lua table key.
+--   UE4SS creates a NEW Lua wrapper object every time you touch a UObject
+--   (ctx, ctx:get(), etc.), so identity comparison ALWAYS fails => lookup
+--   always returns nil => no action dispatches even when the hook fires.
 --
--- v7 ROOT CAUSE (preserved): BndEvt hook name had "K2Node_" prefix that
---   does NOT exist in the decompiled Blueprint. Fixed: "ComponentBoundEvent_0".
+--   FIX: name_to_idx[widget:GetName()] — string keys work correctly.
+--   FIX: always rebuild on MODS tab click (handles widget lifecycle).
+--   FIX: extensive per-step logging so failures are visible in logcat.
 -- ============================================================================
 local TAG = "PFX_ModMenu"
-local VERBOSE = true
-local function V(...) if VERBOSE then Log(TAG .. " [V] " .. string.format(...)) end end
-Log(TAG .. ": Loading v8...")
+Log(TAG .. ": Loading v10...")
 
 -- ============================================================================
 -- HELPERS
@@ -33,6 +36,32 @@ local function is_live(obj)
     return not name:match("^Default__") and not name:match("^REINST_")
 end
 
+-- Get the name of a hook ctx argument (works for both raw UObject and RemoteUnrealParam).
+local function ctx_name(obj)
+    if not obj then return "" end
+    local nm = ""
+    pcall(function() local n = obj:GetName(); if n and n ~= "" then nm = n end end)
+    if nm ~= "" then return nm end
+    pcall(function()
+        local inner = obj:get()
+        if inner then
+            local n = inner:GetName()
+            if n and n ~= "" then nm = n end
+        end
+    end)
+    return nm
+end
+
+-- Get the UObject from a hook ctx (handles both raw UObject and RemoteUnrealParam).
+local function ctx_obj(obj)
+    if not obj then return nil end
+    local ok1, v = pcall(function() return obj:IsValid() end)
+    if ok1 and v then return obj end
+    local ok2, inner = pcall(function() return obj:get() end)
+    if ok2 and is_live(inner) then return inner end
+    return nil
+end
+
 local function set_button_text(btn, text)
     if not is_live(btn) then return false end
     pcall(function() btn:Call("SetTitleText", text) end)
@@ -43,51 +72,31 @@ end
 local function clear_button_icon(btn)
     if not is_live(btn) then return end
     pcall(function() btn:Set("Icon Texture", nil) end)
-    pcall(function()
-        local nm = btn:Get("NotificationMark")
-        if nm then nm:Set("Visibility", 1) end  -- 1 = Collapsed
-    end)
 end
 
 -- ============================================================================
 -- STATE
 -- ============================================================================
-local ball_save_on    = true
-local log_states_on   = true
-local panel_built     = false
-local built_instances = {}          -- [widget_obj] = true once panel is built
-local action_buttons  = {}          -- [idx] = widget (sparse — headers have no entry)
-local btn_to_idx      = {}          -- [widget_obj] = idx  (O(1) click dispatch)
-local syncing_toggle_widgets = {}   -- [widget_obj] = true while programmatically syncing
+local ball_save_on  = true
+local log_states_on = true
 
-local click_stats = {
-    hits    = 0,
-    actions = 0,
-    misses  = 0,
-    last_id = "",
-    last_src= "",
-}
+local action_buttons = {}  -- [idx] = widget object (for syncing display)
+local name_to_idx    = {}  -- [widget:GetName() string] = idx  (O(1), string-keyed)
+local syncing_guard  = {}  -- [widget_name string] = true while programmatically syncing
+
+local click_stats = { hits=0, actions=0, misses=0, last_id="", last_src="" }
 
 -- ============================================================================
 -- ACTIONS
 -- ============================================================================
--- Fields:
---   header = true    → section divider (non-clickable, no btn_to_idx entry)
---   toggle = true    → WBP_OptionsEntry_C Type=1 (OFF/ON carousel)
---   slider = true    → WBP_OptionsEntry_C Type=2 (numeric slider)
---   (plain)          → WBP_Button_Default_C (fires once, flashes result)
---   label            → string or function()->string
--- ============================================================================
 local ACTIONS = {
 
     -- ── CHEATS ───────────────────────────────────────────────────────────────
-    { id = "hdr_cheats", header = true, label = "── CHEATS ──" },
+    { id="hdr_cheats", header=true, label="── CHEATS ──" },
 
     {
-        id     = "ball_save",
-        toggle = true,
-        label  = "Ball Save (Infinite)",
-        fn = function()
+        id="ball_save", toggle=true, label="Ball Save (Infinite)",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
             if api and api.toggle_ball_save then
                 ball_save_on = not not api.toggle_ball_save()
@@ -98,10 +107,8 @@ local ACTIONS = {
         end,
     },
     {
-        id     = "big_ball",
-        toggle = true,
-        label  = "Big Ball",
-        fn = function()
+        id="big_ball", toggle=true, label="Big Ball",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
             if api and api.toggle_big_ball then
                 local on, msg = api.toggle_big_ball()
@@ -111,10 +118,8 @@ local ACTIONS = {
         end,
     },
     {
-        id     = "large_flippers",
-        toggle = true,
-        label  = "Large Flippers",
-        fn = function()
+        id="large_flippers", toggle=true, label="Large Flippers",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
             if api and api.toggle_large_flippers then
                 local on, msg = api.toggle_large_flippers()
@@ -124,29 +129,23 @@ local ACTIONS = {
         end,
     },
     {
-        id        = "flipper_length",
-        slider    = true,
-        label     = "Flipper Length",
-        min       = 1.0,
-        max       = 5.0,
-        step      = 0.5,
-        get_value = function()
+        id="flipper_length", slider=true, label="Flipper Length",
+        min=1.0, max=5.0, step=0.5,
+        get_value=function()
             local api = rawget(_G, "PFX_Cheats")
             return (api and api.get_flipper_scale_x and api.get_flipper_scale_x()) or 1.0
         end,
-        fn = function(val)
+        fn=function(val)
             local api = rawget(_G, "PFX_Cheats")
             if api and api.set_flipper_length_x then
                 api.set_flipper_length_x(val)
-                Log(TAG .. ": [slider] flipper_length -> " .. string.format("%.2f", val))
+                Log(TAG .. ": [slider] flipper_length=" .. string.format("%.2f", val))
             end
         end,
     },
     {
-        id     = "finger_mode",
-        toggle = true,
-        label  = "Finger Mode",
-        fn = function()
+        id="finger_mode", toggle=true, label="Finger Mode",
+        fn=function()
             local api = rawget(_G, "PFX_FingerMode")
             if api and api.toggle then
                 local on = api.toggle()
@@ -156,10 +155,8 @@ local ACTIONS = {
         end,
     },
     {
-        id     = "cheat_logstates",
-        toggle = true,
-        label  = "Log Game States",
-        fn = function()
+        id="cheat_logstates", toggle=true, label="Log Game States",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
             if api and api.toggle_log_states then
                 log_states_on = not not api.toggle_log_states()
@@ -170,58 +167,42 @@ local ACTIONS = {
         end,
     },
 
-    -- ── ACTIONS ──────────────────────────────────────────────────────────────
-    { id = "hdr_actions", header = true, label = "── ACTIONS ──" },
+    -- ── ACTIONS ───────────────────────────────────────────────────────────────
+    { id="hdr_actions", header=true, label="── ACTIONS ──" },
 
     {
-        id    = "cheat_saveball",
-        label = "Save Ball NOW",
-        fn = function()
+        id="cheat_saveball", label="Save Ball NOW",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
-            if api and api.save_ball then
-                local ok, msg = api.save_ball()
-                return "SaveBall: " .. tostring(msg)
-            end
+            if api and api.save_ball then return "SaveBall: " .. tostring(select(2, api.save_ball())) end
             return "SaveBall: PFX_Cheats not loaded"
         end,
     },
     {
-        id    = "cheat_pause",
-        label = "Pause / Resume",
-        fn = function()
+        id="cheat_pause", label="Pause / Resume",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
-            if api and api.pause_resume then
-                local _, msg = api.pause_resume()
-                return "Pause: " .. tostring(msg)
-            end
+            if api and api.pause_resume then return "Pause: " .. tostring(select(2, api.pause_resume())) end
             return "Pause: PFX_Cheats not loaded"
         end,
     },
     {
-        id    = "cheat_restartball",
-        label = "Restart Ball",
-        fn = function()
+        id="cheat_restartball", label="Restart Ball",
+        fn=function()
             local api = rawget(_G, "PFX_Cheats")
-            if api and api.restart_ball then
-                local _, msg = api.restart_ball()
-                return "Restart: " .. tostring(msg)
-            end
+            if api and api.restart_ball then return "Restart: " .. tostring(select(2, api.restart_ball())) end
             return "Restart: PFX_Cheats not loaded"
         end,
     },
 
     -- ── MAX & UNLOCK ──────────────────────────────────────────────────────────
-    { id = "hdr_max", header = true, label = "── MAX & UNLOCK ──" },
+    { id="hdr_max", header=true, label="── MAX & UNLOCK ──" },
 
     {
-        id    = "max_all",
-        label = "Max All + Unlock All",
-        fn = function()
+        id="max_all", label="Max All + Unlock All",
+        fn=function()
             local api = rawget(_G, "PFX_Max")
-            if api and api.run then
-                pcall(api.run)
-                return "MaxAll: done"
-            end
+            if api and api.run then pcall(api.run); return "MaxAll: done" end
             pcall(function()
                 local cm = FindFirstOf("PFXCheatManager")
                 if is_live(cm) then
@@ -234,13 +215,11 @@ local ACTIONS = {
         end,
     },
     {
-        id    = "fix_trophies",
-        label = "Fix Trophies -> Physical",
-        fn = function()
+        id="fix_trophies", label="Fix Trophies -> Physical",
+        fn=function()
             local api = rawget(_G, "PFX_Max")
             if api and api.fix_trophies then
-                local n = 0
-                pcall(function() n = api.fix_trophies() or 0 end)
+                local n=0; pcall(function() n = api.fix_trophies() or 0 end)
                 return "Trophies: " .. n .. " swapped"
             end
             return "Trophies: PFX_Max not loaded"
@@ -248,105 +227,69 @@ local ACTIONS = {
     },
 
     -- ── RANDOMIZE ─────────────────────────────────────────────────────────────
-    { id = "hdr_rand", header = true, label = "── RANDOMIZE ──" },
+    { id="hdr_rand", header=true, label="── RANDOMIZE ──" },
 
     {
-        id    = "rand_all",
-        label = "Randomize All Hub Slots",
-        fn = function()
+        id="rand_all", label="Randomize All Hub Slots",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_all() or 0 end)
-                return "Rand all: " .. n .. " slots"
-            end
+            if api then local n=0; pcall(function() n=api.scramble_all() or 0 end); return "Rand all: "..n end
             return "Rand all: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_tables",
-        label = "Randomize Table Cosmetics",
-        fn = function()
+        id="rand_tables", label="Randomize Table Cosmetics",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
             if api then pcall(api.scramble_tables); return "Rand tables: done" end
             return "Rand tables: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_wall",
-        label = "Randomize Walls",
-        fn = function()
+        id="rand_wall", label="Randomize Walls",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_WALL) or 0 end)
-                return "Rand Wall: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_WALL) or 0 end); return "Rand Wall: "..n end
             return "Rand Wall: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_floor",
-        label = "Randomize Floors",
-        fn = function()
+        id="rand_floor", label="Randomize Floors",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_FLOOR) or 0 end)
-                return "Rand Floor: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_FLOOR) or 0 end); return "Rand Floor: "..n end
             return "Rand Floor: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_poster",
-        label = "Randomize Posters",
-        fn = function()
+        id="rand_poster", label="Randomize Posters",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_POSTER) or 0 end)
-                return "Rand Poster: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_POSTER) or 0 end); return "Rand Poster: "..n end
             return "Rand Poster: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_statue",
-        label = "Randomize Statues",
-        fn = function()
+        id="rand_statue", label="Randomize Statues",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_STATUE) or 0 end)
-                return "Rand Statue: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_STATUE) or 0 end); return "Rand Statue: "..n end
             return "Rand Statue: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_gadget",
-        label = "Randomize Gadgets",
-        fn = function()
+        id="rand_gadget", label="Randomize Gadgets",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_GADGET) or 0 end)
-                return "Rand Gadget: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_GADGET) or 0 end); return "Rand Gadget: "..n end
             return "Rand Gadget: PFX_Rand not loaded"
         end,
     },
     {
-        id    = "rand_hub",
-        label = "Randomize Hub Interior",
-        fn = function()
+        id="rand_hub", label="Randomize Hub Interior",
+        fn=function()
             local api = rawget(_G, "PFX_Rand")
-            if api then
-                local n = 0
-                pcall(function() n = api.scramble_cat(api.CAT_HUB) or 0 end)
-                return "Rand Hub: " .. n
-            end
+            if api then local n=0; pcall(function() n=api.scramble_cat(api.CAT_HUB) or 0 end); return "Rand Hub: "..n end
             return "Rand Hub: PFX_Rand not loaded"
         end,
     },
@@ -362,15 +305,13 @@ local function get_action_label(idx)
     return tostring(a.label)
 end
 
--- Returns the actual current toggle state by querying the relevant API.
 local function action_toggle_state(idx)
     local a = ACTIONS[idx]
     if not a or not a.toggle then return false end
-    local id  = a.id
+    local id = a.id
     local api = rawget(_G, "PFX_Cheats")
     if id == "ball_save" then
-        if api and api.cheats then return not not api.cheats.infinite_ball_save end
-        return not not ball_save_on
+        return (api and api.cheats and not not api.cheats.infinite_ball_save) or ball_save_on
     elseif id == "big_ball" then
         return (api and api.cheats and not not api.cheats.big_ball) or false
     elseif id == "large_flippers" then
@@ -378,42 +319,39 @@ local function action_toggle_state(idx)
     elseif id == "finger_mode" then
         local fapi = rawget(_G, "PFX_FingerMode")
         if fapi then
-            if fapi.is_enabled then
-                local ok, v = pcall(function() return fapi.is_enabled() end)
-                if ok then return not not v end
-            end
+            if fapi.is_enabled then local ok,v = pcall(fapi.is_enabled); if ok then return not not v end end
             if fapi.enabled ~= nil then return not not fapi.enabled end
         end
         return false
     elseif id == "cheat_logstates" then
-        if api and api.cheats then return not not api.cheats.log_game_states end
-        return not not log_states_on
+        return (api and api.cheats and not not api.cheats.log_game_states) or log_states_on
     end
     return false
 end
 
--- Programmatically sync the OptionsEntry Type=1 switcher widget to actual toggle state.
--- Uses syncing guard so HandleSwitcherValueChanged ignores our own updates.
+-- Sync the OptionsEntry Type=1 carousel to the actual toggle state.
+-- Uses syncing_guard (string-keyed) to prevent the hook from re-firing.
 local function sync_switcher_widget(idx)
     local btn = action_buttons[idx]
     if not is_live(btn) then return end
     local on = action_toggle_state(idx)
-    local target_idx = on and 1 or 0
-    syncing_toggle_widgets[btn] = true
+    local target = on and 1 or 0
+    local nm = ""
+    pcall(function() nm = btn:GetName() end)
+    if nm ~= "" then syncing_guard[nm] = true end
     pcall(function()
-        local os_widget = btn:Get("OptionSwitcher")
-        if is_live(os_widget) then
-            pcall(function() os_widget:Call("SetSelectedIndex", target_idx) end)
-            pcall(function() os_widget:Set("SelectedIndex", target_idx) end)
+        local os = btn:Get("OptionSwitcher")
+        if is_live(os) then
+            pcall(function() os:Call("SetSelectedIndex", target) end)
+            pcall(function() os:Set("SelectedIndex", target) end)
         end
-        pcall(function() btn:Set("SelectedOptionIndex", target_idx) end)
+        pcall(function() btn:Set("SelectedOptionIndex", target) end)
         pcall(function() btn:Call("UpdateSelection") end)
     end)
-    syncing_toggle_widgets[btn] = nil
+    if nm ~= "" then syncing_guard[nm] = nil end
 end
 
--- Core dispatcher — called for plain action buttons and bridge commands.
--- For toggles, called only from bridge_exec (HandleSwitcherValueChanged handles UI).
+-- Core dispatcher: logs result, updates button display.
 local function dispatch_action(idx, source)
     local a = ACTIONS[idx]
     if not a or a.header or a.slider then return end
@@ -423,17 +361,15 @@ local function dispatch_action(idx, source)
     click_stats.last_src = source
 
     local result = "?"
-    local ok_fn  = pcall(function() result = tostring(a.fn() or get_action_label(idx)) end)
-    if not ok_fn then result = "ERROR" end
+    local ok = pcall(function() result = tostring(a.fn() or get_action_label(idx)) end)
+    if not ok then result = "ERROR" end
 
     Log(TAG .. ": [" .. source .. "] [" .. a.id .. "] -> " .. result)
 
     local btn = action_buttons[idx]
     if a.toggle then
-        -- Sync the OptionsEntry carousel to reflect the new state
         if is_live(btn) then sync_switcher_widget(idx) end
     else
-        -- Flash result text on the button, restore label after 2 s
         if is_live(btn) then set_button_text(btn, result) end
         pcall(function()
             ExecuteWithDelay(2000, function()
@@ -445,7 +381,7 @@ local function dispatch_action(idx, source)
 end
 
 -- ============================================================================
--- SETTINGS WIDGET PROPERTY ACCESS
+-- SETTINGS WIDGET ACCESS
 -- ============================================================================
 local function get_legal_button(w)
     local lb = nil
@@ -477,20 +413,34 @@ local function rename_legal_button_all()
 end
 
 -- ============================================================================
--- BUILD MOD PANEL (v8)
--- Populates LegalLineContainer using native game widget types.
+-- BUILD MOD PANEL (v9)
+-- Always clears and rebuilds — handles widget lifecycle correctly.
+-- Uses name_to_idx (string-keyed) for reliable dispatch.
 -- ============================================================================
 local function build_mod_panel_on(w)
-    if not is_live(w) then return false end
-    if built_instances[w] then return true end
+    if not is_live(w) then
+        Log(TAG .. ": build: settings widget not live")
+        return false
+    end
+
+    local wname = ""
+    pcall(function() wname = w:GetName() end)
+    Log(TAG .. ": build: starting on " .. wname)
 
     -- Rename nav button
-    local lb = get_legal_button(w)
-    if is_live(lb) then set_button_text(lb, "MODS") end
+    pcall(function()
+        local lb = get_legal_button(w)
+        if is_live(lb) then
+            set_button_text(lb, "MODS")
+            clear_button_icon(lb)
+            pcall(function() lb:Call("SetHasNotificationMark", true) end)
+        end
+    end)
 
-    -- Get LegalLineContainer — may need switcher nudge to activate it
+    -- Get LegalLineContainer
     local llc = get_llc(w)
     if not is_live(llc) then
+        -- Nudge the switcher to make it accessible
         pcall(function()
             local ss = w:Get("SubmenuSwitcher")
             if is_live(ss) then
@@ -500,30 +450,56 @@ local function build_mod_panel_on(w)
         end)
         llc = get_llc(w)
     end
-    if not is_live(llc) then return false end
+    if not is_live(llc) then
+        Log(TAG .. ": build: LegalLineContainer not found on " .. wname)
+        return false
+    end
+
+    -- Clear old state BEFORE creating new widgets
+    for k in pairs(name_to_idx)    do name_to_idx[k]    = nil end
+    for k in pairs(action_buttons) do action_buttons[k] = nil end
+    for k in pairs(syncing_guard)  do syncing_guard[k]  = nil end
 
     pcall(function() llc:Call("ClearChildren") end)
 
     local pc = nil
     pcall(function() pc = FindFirstOf("BP_PlayerController_C") end)
-    if not pc then return false end
-
-    -- ── Title banner ─────────────────────────────────────────────────────────
-    local title_btn = nil
-    pcall(function() title_btn = CreateWidget("WBP_Button_Default_C", pc) end)
-    if is_live(title_btn) then
-        pcall(function() llc:Call("AddChild", title_btn) end)
-        set_button_text(title_btn, "PFX MOD MENU  v8")
-        clear_button_icon(title_btn)
-        pcall(function() title_btn:Set("IsEnabled", false) end)
+    if not pc then
+        Log(TAG .. ": build: no player controller found")
+        return false
     end
 
-    -- ── Build all action rows ─────────────────────────────────────────────────
+    local registered = 0
+
+    local function reg_widget(widget, idx)
+        if not is_live(widget) then return end
+        local nm = ""
+        pcall(function() nm = widget:GetName() end)
+        if nm == "" then
+            Log(TAG .. ": build: widget for idx=" .. idx .. " has no name — will not dispatch")
+            return
+        end
+        name_to_idx[nm] = idx
+        action_buttons[idx] = widget
+        registered = registered + 1
+        Log(TAG .. ": build: idx=" .. idx .. " id=" .. ACTIONS[idx].id .. " name=" .. nm)
+    end
+
+    -- Title banner
+    local title = nil
+    pcall(function() title = CreateWidget("WBP_Button_Default_C", pc) end)
+    if is_live(title) then
+        pcall(function() llc:Call("AddChild", title) end)
+        set_button_text(title, "PFX MOD MENU  v10")
+        clear_button_icon(title)
+        pcall(function() title:Set("IsEnabled", false) end)
+    end
+
+    -- Action rows
     for idx = 1, #ACTIONS do
         local a = ACTIONS[idx]
         if not a then goto continue end
 
-        -- ── Section header ────────────────────────────────────────────────────
         if a.header then
             local sep = nil
             pcall(function() sep = CreateWidget("WBP_Button_Default_C", pc) end)
@@ -534,36 +510,34 @@ local function build_mod_panel_on(w)
                 pcall(function() sep:Set("IsEnabled", false) end)
             end
 
-        -- ── Toggle → WBP_OptionsEntry_C Type=1 (native OFF/ON carousel) ──────
         elseif a.toggle then
+            -- WBP_OptionsEntry_C Type=1 — native OFF/ON carousel
             local entry = nil
             pcall(function() entry = CreateWidget("WBP_OptionsEntry_C", pc) end)
             if is_live(entry) then
                 pcall(function() llc:Call("AddChild", entry) end)
-                -- Configure as Type=1 (carousel/switcher)
                 pcall(function() entry:Set("Type", 1) end)
-                pcall(function() entry:Set("Title", get_action_label(idx)) end)
-                -- Set up the OptionSwitcher child with OFF/ON options
+                pcall(function() entry:Set("Title", a.label) end)
                 local init_idx = action_toggle_state(idx) and 1 or 0
                 pcall(function()
-                    local os_widget = entry:Get("OptionSwitcher")
-                    if is_live(os_widget) then
-                        -- SetOptions with OFF/ON labels (UE4SS marshals Lua table -> TArray<FText>)
-                        pcall(function() os_widget:Call("SetOptions", {"OFF", "ON"}) end)
-                        pcall(function() os_widget:Call("SetSelectedIndex", init_idx) end)
-                        pcall(function() os_widget:Set("SelectedIndex", init_idx) end)
+                    local os = entry:Get("OptionSwitcher")
+                    if is_live(os) then
+                        pcall(function() os:Call("SetOptions", {"OFF", "ON"}) end)
+                        pcall(function() os:Call("SetSelectedIndex", init_idx) end)
+                        pcall(function() os:Set("SelectedIndex", init_idx) end)
                     end
                 end)
                 pcall(function() entry:Set("SelectedOptionIndex", init_idx) end)
                 pcall(function() entry:Call("SetupEntry") end)
                 pcall(function() entry:Call("PreInitButtons") end)
                 pcall(function() entry:Call("UpdateSelection") end)
-                action_buttons[idx] = entry
-                btn_to_idx[entry]   = idx
+                reg_widget(entry, idx)
+            else
+                Log(TAG .. ": build: CreateWidget WBP_OptionsEntry_C failed for " .. a.id)
             end
 
-        -- ── Slider → WBP_OptionsEntry_C Type=2 (numeric slider) ──────────────
         elseif a.slider then
+            -- WBP_OptionsEntry_C Type=2 — numeric slider
             local entry = nil
             pcall(function() entry = CreateWidget("WBP_OptionsEntry_C", pc) end)
             if is_live(entry) then
@@ -578,182 +552,131 @@ local function build_mod_panel_on(w)
                 pcall(function() entry:Set("SelectedSliderValue", cv) end)
                 pcall(function() entry:Call("SetupEntry") end)
                 pcall(function() entry:Call("RefreshValue") end)
-                action_buttons[idx] = entry
-                btn_to_idx[entry]   = idx
+                reg_widget(entry, idx)
+            else
+                Log(TAG .. ": build: CreateWidget WBP_OptionsEntry_C (slider) failed for " .. a.id)
             end
 
-        -- ── Plain action → WBP_Button_Default_C ──────────────────────────────
         else
+            -- WBP_Button_Default_C — plain action button
             local btn = nil
             pcall(function() btn = CreateWidget("WBP_Button_Default_C", pc) end)
             if is_live(btn) then
                 pcall(function() llc:Call("AddChild", btn) end)
                 set_button_text(btn, get_action_label(idx))
                 clear_button_icon(btn)
-                action_buttons[idx] = btn
-                btn_to_idx[btn]     = idx
+                reg_widget(btn, idx)
+            else
+                Log(TAG .. ": build: CreateWidget WBP_Button_Default_C failed for " .. a.id)
             end
         end
 
         ::continue::
     end
 
-    built_instances[w] = true
-    panel_built = true
-
     local final = 0
     pcall(function() final = llc:Call("GetChildrenCount") end)
-    local nm = ""
-    pcall(function() nm = w:GetName() end)
-    Log(TAG .. ": Panel built on " .. nm .. " — " .. final .. " items")
+    Log(TAG .. ": build: done on " .. wname .. " — " .. final .. " children, " .. registered .. " registered")
 
-    -- Post-build: scroll to top, re-confirm MODS label + notification mark
     pcall(function() w:Call("ResetScroll") end)
-    pcall(function()
-        local lb2 = get_legal_button(w)
-        if is_live(lb2) then
-            set_button_text(lb2, "MODS")
-            clear_button_icon(lb2)
-            lb2:Call("SetHasNotificationMark", true)
-        end
-    end)
-    return true
-end
-
-local function build_mod_panel()
-    V("build_mod_panel")
-    local all = nil
-    pcall(function() all = FindAllOf("WBP_WristMenuSettings_C") end)
-    if not all then all = {} end
-
-    local built_count = 0
-    for _, w in ipairs(all) do
-        if not is_live(w) then goto cont end
-        local llc = get_llc(w)
-        if is_live(llc) then
-            if build_mod_panel_on(w) then built_count = built_count + 1 end
-        end
-        ::cont::
-    end
-    return built_count
+    return registered > 0
 end
 
 -- ============================================================================
 -- HOOKS
+-- All wrapped in pcall; errors are logged, not swallowed silently.
 -- ============================================================================
 
--- Construct: reset per-instance build flag, rename Legal→MODS
-pcall(function()
+-- Construct: rename Legal→MODS
+local ok, err = pcall(function()
     RegisterHook("WBP_WristMenuSettings_C:Construct", function(ctx)
-        V("Construct fired")
-        local self_obj = nil
-        pcall(function() if is_live(ctx) then self_obj = ctx end end)
-        if self_obj then built_instances[self_obj] = nil end
         pcall(rename_legal_button_all)
     end)
-    Log(TAG .. ": WBP_WristMenuSettings_C:Construct hook registered")
 end)
+Log(TAG .. ": Construct hook: " .. (ok and "OK" or ("FAILED: " .. tostring(err))))
 
 -- OnSubmenuButtonClicked: fires when any nav tab is tapped.
--- Build our panel here so content is ready before the switcher reveals it.
-pcall(function()
-    RegisterHook("WBP_WristMenuSettings_C:OnSubmenuButtonClicked", function(ctx)
-        V("OnSubmenuButtonClicked fired")
-        local self_obj = nil
-        pcall(function() if is_live(ctx) then self_obj = ctx end end)
-        if not is_live(self_obj) then return end
-        pcall(function() build_mod_panel_on(self_obj) end)
-        pcall(function() self_obj:Call("ResetScroll") end)
-    end)
-    Log(TAG .. ": WBP_WristMenuSettings_C:OnSubmenuButtonClicked hook registered")
-end)
+-- Check which widget was clicked; rebuild our panel regardless
+-- (always-rebuild ensures name_to_idx stays fresh after widget lifecycle events).
+local ok2, err2 = pcall(function()
+    RegisterHook("WBP_WristMenuSettings_C:OnSubmenuButtonClicked", function(ctx, widget_param)
+        local settings = ctx_obj(ctx)
+        if not is_live(settings) then return end
 
--- SelectStartingCategory: fires when settings open with a pre-selected tab.
-pcall(function()
-    RegisterHook("WBP_WristMenuSettings_C:SelectStartingCategory", function(ctx)
-        V("SelectStartingCategory fired")
-        local self_obj = nil
-        pcall(function() if is_live(ctx) then self_obj = ctx end end)
-        if is_live(self_obj) then pcall(function() build_mod_panel_on(self_obj) end) end
+        -- Log which tab was clicked
+        local clicked = ctx_name(widget_param)
+        Log(TAG .. ": NAV_CLICK clicked=" .. clicked)
+
+        -- Always rebuild: handles widget lifecycle (destroy/recreate on tab switch)
+        pcall(function() build_mod_panel_on(settings) end)
+
+        pcall(function() settings:Call("ResetScroll") end)
     end)
-    Log(TAG .. ": WBP_WristMenuSettings_C:SelectStartingCategory hook registered")
 end)
+Log(TAG .. ": OnSubmenuButtonClicked hook: " .. (ok2 and "OK" or ("FAILED: " .. tostring(err2))))
+
+-- SelectStartingCategory
+local ok3, err3 = pcall(function()
+    RegisterHook("WBP_WristMenuSettings_C:SelectStartingCategory", function(ctx)
+        local settings = ctx_obj(ctx)
+        if is_live(settings) then pcall(function() build_mod_panel_on(settings) end) end
+    end)
+end)
+Log(TAG .. ": SelectStartingCategory hook: " .. (ok3 and "OK" or ("FAILED: " .. tostring(err3))))
 
 -- ── WBP_Button_Default_C CLICK ──────────────────────────────────────────────
--- ROOT CAUSE FIX: previous hook used "K2Node_ComponentBoundEvent_0" (wrong).
--- Correct name verified against WBP_Button_Default.cpp: "ComponentBoundEvent_0".
-pcall(function()
+-- PE trace confirmed: BndEvt functions DO go through ProcessEvent when the
+-- runtime name includes "K2Node_" — decompiled blueprints omit it.
+-- Correct runtime name: K2Node_ComponentBoundEvent_0 (not ComponentBoundEvent_0)
+local ok4, err4 = pcall(function()
     RegisterHook(
-        "WBP_Button_Default_C:BndEvt__WBP_Button_Default_WBP_Button_Base_ComponentBoundEvent_0_OnButtonClicked__DelegateSignature",
+        "WBP_Button_Default_C:BndEvt__WBP_Button_Default_WBP_Button_Base_K2Node_ComponentBoundEvent_0_OnButtonClicked__DelegateSignature",
         function(ctx)
             click_stats.hits = click_stats.hits + 1
+            local nm = ctx_name(ctx)
+            Log(TAG .. ": BTN_CLICK nm=[" .. nm .. "] hits=" .. click_stats.hits)
 
-            local btn = nil
-            pcall(function() if is_live(ctx) then btn = ctx end end)
-            if not is_live(btn) then
-                pcall(function()
-                    local c = ctx:get()
-                    if is_live(c) then btn = c end
-                end)
-            end
-            if not is_live(btn) then
-                click_stats.misses = click_stats.misses + 1
-                return
-            end
-
-            -- Skip nav buttons — OnSubmenuButtonClicked handles those
-            local nm = ""
-            pcall(function() nm = btn:GetName() end)
-            if nm == "WBP_Button_Legal" or nm == "WBP_Button_VR"
-            or nm == "WBP_Button_MR"   or nm == "WBP_Button_Tables"
-            or nm == "WBP_Button_PP"   then
-                return
-            end
-
-            local idx = btn_to_idx[btn]
+            local idx = name_to_idx[nm]
             if not idx then
                 click_stats.misses = click_stats.misses + 1
-                V("click miss: no action for btn=%s", nm)
+                Log(TAG .. ": BTN_CLICK miss: nm=[" .. nm .. "] (not a mod menu button)")
                 return
             end
 
-            dispatch_action(idx, "btn_default")
-            return "BLOCK"
+            dispatch_action(idx, "btn_click")
         end
     )
-    Log(TAG .. ": WBP_Button_Default_C click hook registered")
 end)
+Log(TAG .. ": WBP_Button_Default_C click hook: " .. (ok4 and "OK" or ("FAILED: " .. tostring(err4))))
 
--- ── WBP_OptionsEntry_C TOGGLE (carousel switcher, Type=1) ───────────────────
--- Fires when the user clicks left/right arrow on a Type=1 OptionsEntry.
--- ctx = self (the WBP_OptionsEntry_C instance).
--- We read SelectedIndex from the OptionSwitcher child widget to determine new state.
-pcall(function()
+-- ── WBP_OptionsEntry_C TOGGLE (carousel Type=1) ─────────────────────────────
+local ok5, err5 = pcall(function()
     RegisterHook("WBP_OptionsEntry_C:HandleSwitcherValueChanged", function(ctx)
-        local entry = nil
-        pcall(function() if is_live(ctx) then entry = ctx end end)
-        if not is_live(entry) then return end
+        local nm = ctx_name(ctx)
+        Log(TAG .. ": SWITCHER_CHANGE nm=[" .. nm .. "]")
 
-        -- Guard: ignore updates we trigger ourselves via sync_switcher_widget
-        if syncing_toggle_widgets[entry] then return end
+        if syncing_guard[nm] then
+            Log(TAG .. ": SWITCHER_CHANGE guarded, skip")
+            return
+        end
 
-        local idx = btn_to_idx[entry]
+        local idx = name_to_idx[nm]
         if not idx then return end
         local a = ACTIONS[idx]
         if not a or not a.toggle then return end
 
-        -- Read the new selected index from OptionSwitcher child (or entry property)
+        local entry = ctx_obj(ctx)
         local opt_idx = 0
         pcall(function()
-            local os_widget = entry:Get("OptionSwitcher")
-            if is_live(os_widget) then
-                opt_idx = tonumber(os_widget:Get("SelectedIndex")) or 0
+            local os = entry:Get("OptionSwitcher")
+            if is_live(os) then
+                opt_idx = tonumber(os:Get("SelectedIndex")) or 0
             else
                 opt_idx = tonumber(entry:Get("SelectedOptionIndex")) or 0
             end
         end)
 
-        local new_state = (opt_idx == 1)  -- 0=OFF, 1=ON
+        local new_state = (opt_idx == 1)
         local cur_state = action_toggle_state(idx)
 
         if new_state ~= cur_state then
@@ -761,38 +684,37 @@ pcall(function()
             click_stats.last_id  = a.id
             click_stats.last_src = "switcher"
             local result = "?"
-            local ok_fn = pcall(function() result = tostring(a.fn() or a.id) end)
-            if not ok_fn then result = "ERROR" end
+            pcall(function() result = tostring(a.fn() or a.id) end)
             Log(TAG .. ": [switcher] [" .. a.id .. "] " .. (new_state and "ON" or "OFF") .. " -> " .. result)
         end
 
-        -- Always sync widget back to actual state (handles failed toggles too)
         sync_switcher_widget(idx)
     end)
-    Log(TAG .. ": WBP_OptionsEntry_C:HandleSwitcherValueChanged hook registered")
 end)
+Log(TAG .. ": HandleSwitcherValueChanged hook: " .. (ok5 and "OK" or ("FAILED: " .. tostring(err5))))
 
 -- ── WBP_OptionsEntry_C SLIDER (Type=2) ──────────────────────────────────────
-pcall(function()
+local ok6, err6 = pcall(function()
     RegisterHook(
-        "WBP_OptionsEntry_C:BndEvt__WBP_OptionsEntry_Slider_ComponentBoundEvent_2_OnValueChanged__DelegateSignature",
+        "WBP_OptionsEntry_C:BndEvt__WBP_OptionsEntry_Slider_K2Node_ComponentBoundEvent_2_OnValueChanged__DelegateSignature",
         function(ctx)
-            local self_obj = nil
-            pcall(function() if is_live(ctx) then self_obj = ctx end end)
-            if not is_live(self_obj) then return end
-
-            local idx = btn_to_idx[self_obj]
+            local nm = ctx_name(ctx)
+            local idx = name_to_idx[nm]
             if not idx then return end
             local a = ACTIONS[idx]
             if not a or not a.slider then return end
 
+            local entry = ctx_obj(ctx)
             local val = 1.0
-            pcall(function() val = tonumber(self_obj:Get("SelectedSliderValue")) or 1.0 end)
+            if is_live(entry) then
+                pcall(function() val = tonumber(entry:Get("SelectedSliderValue")) or 1.0 end)
+            end
+            Log(TAG .. ": [slider] [" .. a.id .. "] val=" .. string.format("%.2f", val))
             pcall(a.fn, val)
         end
     )
-    Log(TAG .. ": WBP_OptionsEntry_C slider hook registered")
 end)
+Log(TAG .. ": slider hook: " .. (ok6 and "OK" or ("FAILED: " .. tostring(err6))))
 
 -- ============================================================================
 -- BRIDGE COMMANDS
@@ -800,22 +722,16 @@ end)
 pcall(function()
     RegisterCommand("modmenu_status", function()
         local lines = {
-            string.format("%s v8 | actions=%d panel=%s", TAG, #ACTIONS, tostring(panel_built)),
+            string.format("%s v10 | actions=%d", TAG, #ACTIONS),
             string.format("clicks: hits=%d actions=%d misses=%d last=[%s]@%s",
                 click_stats.hits, click_stats.actions, click_stats.misses,
                 click_stats.last_id, click_stats.last_src),
+            string.format("name_to_idx entries: %d", (function() local n=0; for _ in pairs(name_to_idx) do n=n+1 end; return n end)()),
         }
-        for i = 1, #ACTIONS do
-            local a = ACTIONS[i]
-            if a.header then
-                lines[#lines + 1] = "  " .. a.label
-            elseif not a.slider then
-                local state = a.toggle and ("[" .. (action_toggle_state(i) and "ON" or "OF") .. "] ") or "[btn] "
-                lines[#lines + 1] = "  " .. i .. ". " .. state .. get_action_label(i)
-            else
-                local cv = 0.0
-                pcall(function() cv = a.get_value() end)
-                lines[#lines + 1] = "  " .. i .. ". [sld=" .. string.format("%.1f", cv) .. "] " .. a.label
+        for nm, idx in pairs(name_to_idx) do
+            local a = ACTIONS[idx]
+            if a then
+                lines[#lines+1] = "  [" .. nm .. "] => " .. idx .. " (" .. a.id .. ")"
             end
         end
         return table.concat(lines, "\n")
@@ -829,11 +745,11 @@ pcall(function()
             dispatch_action(idx, "bridge_exec")
             return TAG .. ": exec done — " .. click_stats.last_id
         end
-        local lines = { "Usage: modmenu_exec <1-" .. #ACTIONS .. ">  (skip headers)" }
+        local lines = { "Usage: modmenu_exec <1-" .. #ACTIONS .. ">" }
         for i = 1, #ACTIONS do
             local a = ACTIONS[i]
             if not a.header then
-                lines[#lines + 1] = "  " .. i .. ". " .. get_action_label(i)
+                lines[#lines+1] = "  " .. i .. ". " .. get_action_label(i)
             end
         end
         return table.concat(lines, "\n")
@@ -842,11 +758,15 @@ end)
 
 pcall(function()
     RegisterCommand("modmenu_rebuild", function()
-        panel_built     = false
-        built_instances = {}
-        action_buttons  = {}
-        btn_to_idx      = {}
-        local n = build_mod_panel()
+        for k in pairs(name_to_idx)    do name_to_idx[k]    = nil end
+        for k in pairs(action_buttons) do action_buttons[k] = nil end
+        local all = nil; pcall(function() all = FindAllOf("WBP_WristMenuSettings_C") end)
+        local n = 0
+        if all then
+            for _, w in ipairs(all) do
+                if is_live(w) and build_mod_panel_on(w) then n = n + 1 end
+            end
+        end
         return n > 0 and (TAG .. ": rebuilt on " .. n .. " instance(s)")
             or TAG .. ": open Settings -> MODS tab first"
     end)
@@ -855,28 +775,18 @@ end)
 pcall(function()
     RegisterCommand("modmenu_rename", function()
         pcall(rename_legal_button_all)
-        return TAG .. ": rename attempted on all instances"
+        return TAG .. ": rename attempted"
     end)
 end)
 
 -- Hot-reload: rename any already-open Legal buttons immediately
 pcall(function()
     rename_legal_button_all()
-    Log(TAG .. ": initial rename_legal_button_all() called")
+    Log(TAG .. ": initial rename done")
 end)
 
 -- ============================================================================
-Log(TAG .. ": v8 ready — " .. #ACTIONS .. " items (" ..
-    (function()
-        local actions, headers, toggles, sliders = 0, 0, 0, 0
-        for _, x in ipairs(ACTIONS) do
-            if x.header then headers = headers + 1
-            elseif x.toggle then toggles = toggles + 1
-            elseif x.slider then sliders = sliders + 1
-            else actions = actions + 1 end
-        end
-        return actions .. " actions, " .. toggles .. " toggles, " .. sliders .. " sliders, " .. headers .. " headers"
-    end)() .. ")")
-Log(TAG .. ": Open wrist menu -> Settings (gear) -> tap MODS tab")
-Log(TAG .. ": Bridge: modmenu_status | modmenu_exec <N> | modmenu_rebuild | modmenu_rename")
-Log(TAG .. ": Toggles: native WBP_OptionsEntry_C Type=1 (OFF/ON carousel)")
+Log(TAG .. ": v10 ready — " .. #ACTIONS .. " items")
+Log(TAG .. ": OPEN wrist menu -> Settings (gear) -> tap MODS tab")
+Log(TAG .. ": BRIDGE: modmenu_status | modmenu_exec <N> | modmenu_rebuild")
+Log(TAG .. ": KEY FIX v10: ExecuteUbergraph ep=10 hook replaces broken BndEvt hook")

@@ -120,6 +120,42 @@ namespace lua_bindings
         return (slash != std::string::npos) ? raw.substr(slash + 1) : raw;
     }
 
+    static constexpr int32_t BULK_SCAN_UNSAFE_FLAGS =
+        ue::RF_ClassDefaultObject |
+        ue::RF_ArchetypeObject |
+        ue::RF_NeedInitialization |
+        ue::RF_NeedLoad |
+        ue::RF_NeedPostLoad |
+        ue::RF_NeedPostLoadSubobjects |
+        ue::RF_BeginDestroyed |
+        ue::RF_FinishDestroyed;
+
+    static bool is_safe_bulk_scan_object(ue::UObject *obj)
+    {
+        if (!obj || !ue::is_valid_ptr(obj))
+            return false;
+
+        if (ue::uobj_get_flags(obj) & BULK_SCAN_UNSAFE_FLAGS)
+            return false;
+
+        std::string name = reflection::get_short_name(obj);
+        if (name.empty() || ue::is_default_object(name.c_str()))
+            return false;
+
+        ue::UClass *cls = ue::uobj_get_class(obj);
+        return cls && ue::is_valid_ptr(cls);
+    }
+
+    static void warn_bridge_bulk_scan(const char *api_name, int32_t live_count)
+    {
+        if (!adb_bridge::is_game_thread_command_active())
+            return;
+
+        logger::log_warn("LUA",
+                         "%s running during live bridge command (%d live objects) — prefer targeted lookups when possible",
+                         api_name, live_count);
+    }
+
     // ═══ Pointer arithmetic helper ══════════════════════════════════════════
     static void *offset_ptr(void *base, int64_t offset)
     {
@@ -452,22 +488,82 @@ namespace lua_bindings
         if (!inst) return sol::nil;
         return lua_uobject::wrap_or_nil(lua, inst); });
 
-        // ── FindAllOf — returns ALL live instances of a class ────────────────
-        lua.set_function("FindAllOf", [](sol::this_state ts, const std::string &raw_class) -> sol::object
+        // ── FindObjectByType — robust first-instance search by class/type ───
+        // FindObjectByType("ClassName", include_subclasses=true)
+        // Returns the first live object whose class matches the requested type.
+        // This is tolerant to BP_Class vs BP_Class_C naming and supports IsA chain walk.
+        lua.set_function("FindObjectByType", [](sol::this_state ts, const std::string &raw_class, sol::optional<bool> include_subclasses_opt) -> sol::object
                          {
         sol::state_view lua(ts);
         std::string class_name = normalize_class_name(raw_class);
+        bool include_subclasses = include_subclasses_opt.value_or(true);
+
+        if (!include_subclasses) {
+            ue::UObject* inst = reflection::find_first_instance(class_name);
+            if (!inst) return sol::nil;
+            return lua_uobject::wrap_or_nil(lua, inst);
+        }
+
+        ue::UClass* target_cls = reflection::find_class_ptr(class_name);
+        if (!target_cls) target_cls = reflection::find_class_ptr(class_name + "_C");
+        if (!target_cls) return sol::nil;
+
+        int32_t count = reflection::get_live_object_count();
+        for (int32_t i = 0; i < count; i++) {
+            ue::UObject* obj = reflection::get_object_by_index(i);
+            if (!is_safe_bulk_scan_object(obj)) continue;
+
+            ue::UClass* cls = ue::uobj_get_class(obj);
+            while (cls) {
+                if (cls == target_cls) {
+                    return lua_uobject::wrap_or_nil(lua, obj);
+                }
+                cls = reinterpret_cast<ue::UClass*>(
+                    ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(cls)));
+            }
+        }
+
+        return sol::nil; });
+
+        // ── FindAllOf — returns ALL live instances of a class ────────────────
+        // When use_isa=true, also matches subclasses (IsA-style hierarchy walk).
+        lua.set_function("FindAllOf", [](sol::this_state ts, const std::string &raw_class, sol::optional<bool> use_isa_opt) -> sol::object
+                         {
+        sol::state_view lua(ts);
+        bool use_isa = use_isa_opt.value_or(false);
+        std::string class_name = normalize_class_name(raw_class);
         std::vector<ue::UObject*> instances;
-        // Try rebuilder cache first (fast path)
-        auto* rc = rebuilder::rebuild(class_name);
-        if (rc) {
-            instances = rc->get_all_instances();
+
+        if (use_isa) {
+            // Walk GUObjectArray and include any object whose class chain contains target
+            ue::UClass* target_cls = reflection::find_class_ptr(class_name);
+            if (!target_cls) target_cls = reflection::find_class_ptr(class_name + "_C");
+            if (!target_cls) return sol::nil;
+
+            int32_t count = reflection::get_live_object_count();
+            warn_bridge_bulk_scan("FindAllOf(..., true)", count);
+            for (int32_t i = 0; i < count; i++) {
+                ue::UObject* obj = reflection::get_object_by_index(i);
+                if (!is_safe_bulk_scan_object(obj)) continue;
+                ue::UClass* cls = ue::uobj_get_class(obj);
+                while (cls) {
+                    if (cls == target_cls) { instances.push_back(obj); break; }
+                    cls = reinterpret_cast<ue::UClass*>(
+                        ue::ustruct_get_super(reinterpret_cast<ue::UStruct*>(cls)));
+                }
+            }
+        } else {
+            // Exact match: try rebuilder cache first (fast path)
+            auto* rc = rebuilder::rebuild(class_name);
+            if (rc) {
+                instances = rc->get_all_instances();
+            }
+            // Always fall through to live GUObjectArray scan if empty
+            if (instances.empty()) {
+                instances = reflection::find_all_instances(class_name);
+            }
         }
-        // Always fall through to live GUObjectArray scan if empty
-        // This handles classes not in boot-time reflection cache
-        if (instances.empty()) {
-            instances = reflection::find_all_instances(class_name);
-        }
+
         if (instances.empty()) return sol::nil;
         sol::table t = lua.create_table();
         int i = 1;
@@ -2185,12 +2281,13 @@ namespace lua_bindings
         lua.set_function("ForEachUObject", [](sol::this_state ts, sol::function callback)
                          {
         sol::state_view lua(ts);
-        int32_t count = reflection::get_object_count();
+        int32_t count = reflection::get_live_object_count();
+        warn_bridge_bulk_scan("ForEachUObject", count);
         for (int32_t i = 0; i < count; i++) {
             ue::UObject* obj = reflection::get_object_by_index(i);
-            if (!obj || !ue::is_valid_ptr(obj)) continue;
+            if (!is_safe_bulk_scan_object(obj)) continue;
+
             std::string name = reflection::get_short_name(obj);
-            if (ue::is_default_object(name.c_str())) continue;
 
             lua_uobject::LuaUObject wrapped;
             wrapped.ptr = obj;

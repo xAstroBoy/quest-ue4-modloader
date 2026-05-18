@@ -300,10 +300,19 @@ function print(...) end
 ---@return UObject?
 function FindFirstOf(className) end
 
----Find all instances of a class by short name
+---Find all instances of a class by short name.
+---When use_isa=true, also returns subclass instances (walks the UClass hierarchy).
 ---@param className string Short class name
+---@param use_isa boolean? When true, matches subclasses too (slower, full GUObjectArray scan)
 ---@return UObject[]?
-function FindAllOf(className) end
+function FindAllOf(className, use_isa) end
+
+---Find first object by class/type name.
+---When include_subclasses=true (default), matches via IsA super-chain.
+---@param className string Short class/type name
+---@param include_subclasses boolean? default true
+---@return UObject?
+function FindObjectByType(className, include_subclasses) end
 
 ---Find a UClass by name. Returns UObject wrapping the UClass.
 ---@param className string
@@ -920,8 +929,8 @@ function DumpGNames(customPath) end
 ---@param customPath? string
 ---@return integer count
 function DumpGObjects(customPath) end
----Iterate all objects in GUObjectArray. Callback(obj) — return true to break.
----@param callback fun(obj: UObject): boolean?
+---Iterate all objects in GUObjectArray. Callback receives (obj, name) — return true to break.
+---@param callback fun(obj: UObject, name: string): boolean?
 function ForEachUObject(callback) end
 ---Get all rebuilt class names
 ---@return string[]

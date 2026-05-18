@@ -31,10 +31,10 @@ local stats = {
     flipper_applies     = 0,
 }
 
--- Ball scales uniformly. Flippers stretch only along their length axis (X)
--- so they cover the gap without tilting or distorting the shape.
+-- Ball scales uniformly. Flippers now scale on actor Y (table width axis)
+-- so collider + visible mesh widen together.
 local BIG_BALL_SCALE   = 2.50
-local FLIPPER_SCALE_X  = 3.50   -- current X stretch (runtime-mutable via slider)
+local FLIPPER_SCALE_X  = 10.00  -- current X stretch (runtime-mutable via slider)
 local FLIPPER_SCALE_Y  = 1.0    -- keep width unchanged
 local FLIPPER_SCALE_Z  = 1.0    -- keep height unchanged
 
@@ -45,103 +45,54 @@ local flipper_box_extents_cache = {}
 local flipper_mesh_scales_cache = {}
 local flipper_axis_cache = {}
 
--- FindAllOf in this environment is exact-class only (no subclass matching).
--- To support ALL tables, we dynamically discover flipper BP classes from
--- BlueprintGeneratedClass and then cache active classes with live instances.
-local FLIPPER_CLASS_DISCOVERY = {
-    all_candidates = nil,   -- all *Flippers* BP class names discovered from BPGC
-    active_classes = {},    -- subset that currently has live instances
-    last_discovery_t = 0,
+local TABLE_FOLDER_TO_FLIPPER_PREFIX = {
+    BALLY_Attack_from_Mars = "119_AttackFromMars",
+    BALLY_Black_Lagoon = "131_BlackLagoon",
+    BALLY_Black_Rose = "118_BlackRose",
+    BALLY_Champion_Pub = "121_ChampionPub",
+    BALLY_Elvira_and_the_Party_Monsters = "197_Elvira",
+    BALLY_Party_Zone = "120_PartyZone",
+    BALLY_Safe_Cracker = "122_SafeCracker",
+    BALLY_Scared_Stiff = "198_ScaredStiff",
+    BALLY_TheatreOfMagic = "117_TheatreOfMagic",
+    BALLY_Twilight_Zone = "162_TwilightZone",
+    BALLY_WHO_Dunnit = "195_WhoDunnit",
+    BALLY_World_Cup_Soccer = "157_WorldCup",
+    BETHESDA_Fallout = "90_Fallout",
+    Bally_Addams_Family = "156_AddamsFamily",
+    Bethesda_Doom = "92_Doom",
+    Bethesda_Skyrim = "91_Skyrim",
+    CD_Tomb_Raider_Chronicles = "182_TombRaider_Chronicles",
+    CD_Tomb_Raider_Croft_Manor = "192_TombRaider_Manor",
+    LEGENDARY_Godzilla = "158_Godzilla",
+    LEGENDARY_Godzilla_vs_Kong = "160_GvK",
+    LEGENDARY_Kong = "153_Kong",
+    PEANUTS_Charlie_Brown_CS = "181_CharlieBrown",
+    UNIVERSAL_BSG = "170_BattlestarGalactica",
+    UNIVERSAL_Knight_Rider = "177_KnightRider",
+    UNIVERSAL_Xena = "167_Xena",
+    WMS_Comet = "199_Comet",
+    WMS_Diner = "201_Diner",
+    WMS_Fire = "200_Fire",
+    WMS_Getaway = "111_Getaway",
+    WMS_Indiana_Jones = "133_IndianaJones",
+    WMS_Junkyard = "110_Junkyard",
+    WMS_Medieval_Madness = "109_MedievalMadness",
+    WMS_Monster_Bash = "130_MonsterBash",
+    WMS_Pinbot = "194_PinBot",
+    WMS_Start_Trek_TNG = "163_StarTrekTNG",
+    WMS_Taxi = "196_Taxi",
+    ZEN_Egypt = "112_CurseOfTheMummy",
+    ZEN_Noir = "123_PinballNoir",
+    ZEN_Pirates = "113_SkyPirates",
 }
 
-local function get_active_table_folder_from_ball_class()
-    local classes = { "ball_C", "Ball_C", "ball", "Ball" }
-    for _, cn in ipairs(classes) do
-        local arr = nil
-        pcall(function() arr = FindAllOf(cn) end)
-        if arr and #arr > 0 then
-            for _, b in ipairs(arr) do
-                local valid = false
-                pcall(function()
-                    valid = (b ~= nil) and (b:IsValid() == true)
-                end)
-                if valid then
-                    local cf = ""
-                    pcall(function() cf = tostring(b:GetClass():GetFullName() or "") end)
-                    local folder = cf:match("/Game/Tables/([^/]+)/")
-                    if folder and folder ~= "" then
-                        return folder
-                    end
-                end
-            end
-        end
-    end
-    return nil
-end
+-- Flipper actors are table-specific subclasses of BP_Collectible_FlipperArm_Base_C
+-- (e.g. BP_113_SkyPirates_Flippers0_C). They live in LVL_VR_Main.PersistentLevel.
+-- Avoid broad ForEachUObject bridge scans here; they are expensive on the live game thread.
+-- Prefer direct current-table class probes and exact/subclass lookups instead.
 
-local function is_table_rewards_path(path)
-    if not path or path == "" then return false end
-    return path:lower():find("/tablerewards/", 1, true) ~= nil
-end
 
-local function should_consider_flipper_class(class_name)
-    if not class_name or class_name == "" then return false end
-    local n = class_name:lower()
-    if not n:find("flipper", 1, true) then return false end
-    -- avoid unrelated UI/cabinet button classes
-    if n:find("button", 1, true) then return false end
-    -- reward classes typically follow BP_*_Flippers{0,1,2}_C
-    return n:find("_c", 1, true) ~= nil
-end
-
-local function discover_all_flipper_classes()
-    local now = os.clock()
-    if FLIPPER_CLASS_DISCOVERY.all_candidates and (now - FLIPPER_CLASS_DISCOVERY.last_discovery_t) < 30 then
-        return FLIPPER_CLASS_DISCOVERY.all_candidates
-    end
-
-    local table_folder = get_active_table_folder_from_ball_class()
-
-    local folder_need = nil
-    if table_folder and table_folder ~= "" then
-        folder_need = ("/game/tables/" .. table_folder:lower() .. "/")
-    end
-
-    local out = {}
-    local seen = {}
-
-    pcall(function()
-        local classes = FindAllOf("BlueprintGeneratedClass")
-        if not classes then return end
-        for _, cls in ipairs(classes) do
-            local cn = ""
-            local full = ""
-            pcall(function() cn = tostring(cls:GetName()) end)
-            if should_consider_flipper_class(cn) and not seen[cn] then
-                if folder_need then
-                    pcall(function() full = tostring(cls:GetFullName()) end)
-                    local lf = full:lower()
-                    if not lf:find(folder_need, 1, true) then
-                        goto continue_class
-                    end
-                end
-                if full == "" then
-                    pcall(function() full = tostring(cls:GetFullName()) end)
-                end
-                if is_table_rewards_path(full) then
-                    goto continue_class
-                end
-                seen[cn] = true
-                out[#out + 1] = cn
-            end
-            ::continue_class::
-        end
-    end)
-
-    FLIPPER_CLASS_DISCOVERY.all_candidates = out
-    FLIPPER_CLASS_DISCOVERY.last_discovery_t = now
-    return out
-end
 
 
 -- Known game state values (discovered via live logging — expand as needed)
@@ -388,6 +339,84 @@ local function find_active_ball()
     return fallback
 end
 
+local function get_active_table_folder_from_ball_class()
+    local ball = find_active_ball()
+    if ball == nil then return nil end
+    if not is_live(ball) then return nil end
+    local live_ball = ball
+    local class_full = ""
+    local ok_cls, cls = pcall(function() return live_ball:GetClass() end)
+    if ok_cls and cls then
+        local ok_name, full_name = pcall(function() return cls:GetFullName() end)
+        if ok_name and full_name then
+            class_full = tostring(full_name)
+        end
+    end
+    if class_full == "" then return nil end
+    return class_full:match("/Game/Tables/([^/]+)/")
+end
+
+local function get_active_table_level_name()
+    local folder = get_active_table_folder_from_ball_class()
+    if not folder then return nil, nil end
+    local level = folder:match("^[^_]+_(.+)$") or folder
+    if level == "" then return nil, nil end
+    return folder, level
+end
+
+local function get_active_table_folder_path()
+    local folder = get_active_table_folder_from_ball_class()
+    if not folder then return nil end
+    return "/Game/Tables/" .. folder .. "/"
+end
+
+local function get_active_table_level_prefix()
+    local ball = find_active_ball()
+    if not ball or not is_live(ball) then return nil end
+
+    local fn = ""
+    pcall(function() fn = tostring(ball:GetFullName() or "") end)
+    if fn == "" then return nil end
+
+    local prefix = fn:match("^(.-%.PersistentLevel%.)")
+    if prefix and prefix ~= "" then
+        return prefix
+    end
+    return nil
+end
+
+local function get_active_table_reference()
+    local pt = find_live("GFO_PlayTable_C", "PFXGameflowObject_PlayTable")
+    if not pt then return nil end
+
+    local tr = nil
+    pcall(function() tr = pt:Get("m_tableReference") end)
+    if tr and is_live(tr) then return tr end
+
+    pcall(function() tr = pt:Call("GetTableReference") end)
+    if tr and is_live(tr) then return tr end
+
+    tr = find_live("PFXTableReference", "YUPTableReference")
+    if tr and is_live(tr) then return tr end
+
+    return nil
+end
+
+local function collect_table_level_actors()
+    local tr = get_active_table_reference()
+    if not tr then return nil end
+
+    local actors = nil
+    pcall(function()
+        actors = tr:Call("GetTableLevelActors")
+    end)
+
+    if type(actors) == "table" and #actors > 0 then
+        return actors
+    end
+    return nil
+end
+
 local function collect_live_balls()
     local out = {}
     local seen = {}
@@ -418,121 +447,348 @@ local function collect_live_balls()
     return out
 end
 
+-- User-configurable flipper class (set via cheats_set_flipper_class bridge command).
+-- Empty = auto-detect via ForEachUObject class-name scan.
+local flipper_class_override = ""
+local flipper_class_pattern_cache = {
+    classes = nil,
+    last_t = 0,
+}
+local flipper_actor_cache = {
+    actors = nil,
+    last_t = 0,
+}
+
 local function collect_flipper_actors()
+    local now = os.clock()
+    if flipper_actor_cache.actors and (now - flipper_actor_cache.last_t) < 2.0 then
+        local cached = {}
+        for _, a in ipairs(flipper_actor_cache.actors) do
+            if is_live(a) then
+                cached[#cached + 1] = a
+            end
+        end
+        if #cached > 0 then
+            return cached
+        end
+    end
+
     local out = {}
     local seen = {}
-    local active_table_folder = get_active_table_folder_from_ball_class()
-    local active_table_need = nil
-    if active_table_folder and active_table_folder ~= "" then
-        active_table_need = ("/game/tables/" .. active_table_folder:lower() .. "/")
-    end
 
-    local function is_likely_non_gameplay_level(path)
-        if not path or path == "" then return false end
-        local p = path:lower()
-        if p:find("/game/hub/", 1, true) then return true end
-        if p:find("arcade", 1, true) then return true end
-        return false
-    end
-
-    local function add_actor(a, bypass_table_path_filter)
-        if not is_live(a) then return end
-        local cf = ""
-        local af = ""
-        local n = ""
-        pcall(function() cf = tostring(a:GetClass():GetFullName()) end)
-        pcall(function() af = tostring(a:GetFullName()) end)
-        pcall(function() n = tostring(a:GetName() or "") end)
-        if is_table_rewards_path(cf) then return end
-        if is_table_rewards_path(af) then return end
-        if n ~= "" and n:lower():find("button", 1, true) then return end
-        if active_table_need and not bypass_table_path_filter then
-            local cfl = cf:lower()
-            local afl = af:lower()
-            if not cfl:find(active_table_need, 1, true) and not afl:find(active_table_need, 1, true) then
-                return
-            end
-        else
-            if is_likely_non_gameplay_level(af) then return end
+    local function add_from_table_level_flippers()
+        local level_prefix = get_active_table_level_prefix()
+        if not level_prefix then
+            level_prefix = get_active_table_folder_path()
         end
-        if n == "" or seen[n] then return end
-        seen[n] = true
-        out[#out + 1] = a
-    end
+        if not level_prefix then return end
+        V("collect_flipper_actors(level_prefix=%s)", tostring(level_prefix))
 
-    -- Primary: base class for all table flipper collectible actors
-    pcall(function()
-        local all = FindAllOf("BP_Collectible_FlipperArm_Base_C")
-        if all then
-            for _, a in ipairs(all) do
-                add_actor(a)
-            end
-        end
-    end)
-
-    -- Fallback: generic collectible actors whose name includes Flipper
-    pcall(function()
-        local all = FindAllOf("PFXCollectibleActor")
-        if all then
-            for _, a in ipairs(all) do
-                if is_live(a) then
-                    local n = ""
-                    pcall(function() n = a:GetName() end)
-                    if n ~= "" and n:lower():find("flipper", 1, true) then
-                        add_actor(a)
-                    end
-                end
-            end
-        end
-    end)
-
-    -- Strict fallback: visible flipper meshes in active table only.
-    -- Excludes buttons/rewards/hub via add_actor filters above.
-    pcall(function()
-        local smas = FindAllOf("StaticMeshActor")
-        if not smas then return end
-        for _, sma in ipairs(smas) do
-            if is_live(sma) then
-                local n = ""
-                pcall(function() n = tostring(sma:GetName() or "") end)
-                local nn = n:lower()
-                if nn:find("flipper", 1, true) and not nn:find("button", 1, true) then
-                    add_actor(sma)
-                end
-            end
-        end
-    end)
-
-    -- Fast path: classes that had live actors recently (usually 3 per table)
-    for _, class_name in ipairs(FLIPPER_CLASS_DISCOVERY.active_classes) do
+        local actors = nil
         pcall(function()
-            local all = FindAllOf(class_name)
-            if all then
-                for _, a in ipairs(all) do
-                    add_actor(a)
+            actors = FindAllOf("StaticMeshActor", true)
+        end)
+        if not actors then return end
+
+        local function add_visible_flipper(a, n, fn)
+            local key = fn ~= "" and fn or n
+            if key == "" or seen[key] then return end
+            seen[key] = true
+            out[#out + 1] = a
+        end
+
+        -- Pass 1: prefer the plain flipper actors; on this table they carry the
+        -- collider path and their Y scale widens both the render and physics.
+        for _, a in ipairs(actors) do
+            if is_live(a) then
+                local n = ""
+                local fn = ""
+                pcall(function() n = tostring(a:GetName() or "") end)
+                pcall(function() fn = tostring(a:GetFullName() or "") end)
+                local nn = n:lower()
+                if fn:find(level_prefix, 1, true)
+                    and nn:find("flipper_", 1, true)
+                    and not nn:find("obj_", 1, true)
+                    and not nn:find("sensor_", 1, true)
+                then
+                    add_visible_flipper(a, n, fn)
                 end
             end
-        end)
+        end
+
+        if #out > 0 then return end
+
+        -- Pass 2: fallback to the obj_flipper proxies only if the plain flippers
+        -- are not exposed by the current table.
+        for _, a in ipairs(actors) do
+            if is_live(a) then
+                local n = ""
+                local fn = ""
+                pcall(function() n = tostring(a:GetName() or "") end)
+                pcall(function() fn = tostring(a:GetFullName() or "") end)
+
+                local nn = n:lower()
+                if fn:find(level_prefix, 1, true)
+                    and nn:find("obj_flipper_", 1, true)
+                then
+                    add_visible_flipper(a, n, fn)
+                end
+            end
+        end
     end
 
-    -- If nothing found yet, do broad discovery once and repopulate active cache.
-    if #out == 0 then
-        local discovered = discover_all_flipper_classes() or {}
-        local active = {}
-        for _, class_name in ipairs(discovered) do
+    local function is_actor_instance(obj)
+        local ok_isa, isa_actor = pcall(function() return IsA(obj, "Actor") end)
+        if not ok_isa or not isa_actor then return false end
+        local ofn = ""
+        pcall(function() ofn = tostring(obj:GetFullName() or "") end)
+        if ofn == "" then return false end
+        return ofn:find(".PersistentLevel.", 1, true) ~= nil
+    end
+
+    local function in_valid_table_path(a)
+        local af = ""
+        pcall(function() af = tostring(a:GetFullName() or "") end)
+        local afl = af:lower()
+
+        -- IMPORTANT: Do NOT reject by class path under /TableRewards/.
+        -- Many valid flipper classes are defined there but instantiated in
+        -- /Game/Hub/LVL_VR_Main.PersistentLevel during gameplay.
+        -- Keep only runtime level instances.
+        if not afl:find(".persistentlevel.", 1, true) then
+            return false
+        end
+        return true
+    end
+
+    local function has_flipper_components(a)
+        local has_box = false
+        pcall(function()
+            local bcls = FindClass("BoxComponent")
+            if not bcls then return end
+            local arr = a:Call("K2_GetComponentsByClass", bcls)
+            has_box = arr and #arr > 0
+        end)
+        if has_box then return true end
+
+        local has_mesh = false
+        pcall(function()
+            local mcls = FindClass("StaticMeshComponent")
+            if not mcls then return end
+            local arr = a:Call("K2_GetComponentsByClass", mcls)
+            has_mesh = arr and #arr > 0
+        end)
+        return has_mesh
+    end
+
+    local function add(a)
+        if not is_live(a) then return end
+        if not is_actor_instance(a) then return end
+        if not in_valid_table_path(a) then return end
+        if not has_flipper_components(a) then return end
+
+        local n = ""
+        local fn = ""
+        pcall(function() n = tostring(a:GetName() or "") end)
+        pcall(function() fn = tostring(a:GetFullName() or "") end)
+
+        local cn = ""
+        pcall(function() cn = tostring(a:GetClass():GetName() or "") end)
+        local is_flipper_base_subclass = false
+        pcall(function() is_flipper_base_subclass = IsA(a, "BP_Collectible_FlipperArm_Base_C") end)
+        if not is_flipper_base_subclass then
+            pcall(function() is_flipper_base_subclass = IsA(a, "ABP_Collectible_FlipperArm_Base_C") end)
+        end
+        local is_table_flipper_bp = (cn:match("^BP_.-_Flippers%d+_C$") ~= nil)
+        local key_text = (n .. " " .. cn):lower()
+        if not is_table_flipper_bp and not is_flipper_base_subclass then
+            if not key_text:find("flipper", 1, true) then return end
+            if key_text:find("button", 1, true) then return end
+            if key_text:find("widget", 1, true) then return end
+            if key_text:find("entry", 1, true) then return end
+            if key_text:find("light", 1, true) then return end
+            if key_text:find("manager", 1, true) then return end
+            if key_text:find("controller", 1, true) then return end
+        end
+
+        local key = fn ~= "" and fn or n
+        if key == "" or seen[key] then return end
+        seen[key] = true
+        out[#out + 1] = a
+        V("collect_flipper: %s cls=%s", n,
+            (function() local c="?"; pcall(function() c=a:GetClass():GetName() end); return c end)())
+    end
+
+    local function add_all(arr)
+        if not arr then return end
+        for _, a in ipairs(arr) do
+            add(a)
+        end
+    end
+
+    -- Primary runtime path: exact playfield flipper actors from the current
+    -- table level. These are the visible in-table flippers the player sees.
+    pcall(add_from_table_level_flippers)
+    if #out > 0 then
+        V("collect_flipper_actors(table-playfield flippers): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- Primary runtime path: use the current table reference's actor list.
+    -- This is the actual gameplay table actor set and is far smaller than a full
+    -- GUObjectArray walk, so it avoids bridge lag/timeouts.
+    pcall(function()
+        add_all(collect_table_level_actors())
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(table-level actors): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- Deterministic current-table path: derive the exact flipper class prefix from
+    -- the active ball's table folder, then probe Flippers0/1/2 directly.
+    pcall(function()
+        local folder = get_active_table_folder_from_ball_class()
+        local prefix = folder and TABLE_FOLDER_TO_FLIPPER_PREFIX[folder] or nil
+        if not prefix then return end
+        for i = 0, 2 do
+            local cn = string.format("BP_%s_Flippers%d_C", prefix, i)
+            add(FindObjectByType(cn, true))
+        end
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(table-prefix-direct): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- Fast fallback after exact table-prefix probing: grab live subclasses of the
+    -- flipper base class directly. This can include other loaded tables, so it is
+    -- only used when the current-table path fails to produce any results.
+    pcall(function()
+        add_all(FindAllOf("BP_Collectible_FlipperArm_Base_C", true))
+    end)
+    pcall(function()
+        add_all(FindAllOf("ABP_Collectible_FlipperArm_Base_C", true))
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(base-subclass-scan): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    local function get_cached_table_flipper_classes()
+        local now = os.clock()
+        if flipper_class_pattern_cache.classes and (now - flipper_class_pattern_cache.last_t) < 30 then
+            return flipper_class_pattern_cache.classes
+        end
+
+        local classes = {}
+        flipper_class_pattern_cache.classes = classes
+        flipper_class_pattern_cache.last_t = now
+        return classes
+    end
+
+    -- Explicit override: user identified the class via dump_actor_classes.
+    if flipper_class_override ~= "" then
+        pcall(function()
+            add_all(FindAllOf(flipper_class_override, true))
+        end)
+        if #out == 0 then
             pcall(function()
-                local all = FindAllOf(class_name)
-                if all and #all > 0 then
-                    active[#active + 1] = class_name
-                    for _, a in ipairs(all) do
-                        add_actor(a)
-                    end
-                end
+                add(FindObjectByType(flipper_class_override, true))
             end)
         end
-        FLIPPER_CLASS_DISCOVERY.active_classes = active
+        if #out == 0 then
+            pcall(function()
+                ForEachUObject(function(obj, _)
+                    if IsA(obj, flipper_class_override) then add(obj) end
+                end)
+            end)
+        end
+        V("collect_flipper_actors(override=%s): found=%d", flipper_class_override, #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
     end
 
+    -- Preferred auto path: class names discovered from BlueprintGeneratedClass
+    -- objects, then resolved exactly like the manual override path.
+    pcall(function()
+        local classes = get_cached_table_flipper_classes()
+        if not classes then return end
+        for _, cn in ipairs(classes) do
+            pcall(function() add_all(FindAllOf(cn, true)) end)
+            if #out == 0 then
+                pcall(function() add(FindObjectByType(cn, true)) end)
+            end
+        end
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(class-override-auto): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- Fast table-agnostic path: scan live Actor instances only.
+    -- This avoids heavy BlueprintGeneratedClass + FindAllOf-per-class scans.
+    pcall(function()
+        local actors = FindAllOf("Actor", true)
+        if not actors then return end
+        for _, a in ipairs(actors) do
+            if is_live(a) then
+                local cn = ""
+                local an = ""
+                pcall(function() cn = tostring(a:GetClass():GetName() or "") end)
+                pcall(function() an = tostring(a:GetName() or "") end)
+                local t = (cn .. " " .. an):lower()
+                local is_table_flipper_bp = (cn:match("^BP_.-_Flippers%d+_C$") ~= nil)
+                if is_table_flipper_bp
+                    or (t:find("flipper", 1, true)
+                        and not t:find("button", 1, true)
+                        and not t:find("widget", 1, true)
+                        and not t:find("entry", 1, true)
+                        and not t:find("manager", 1, true)
+                        and not t:find("controller", 1, true))
+                then
+                    add(a)
+                end
+            end
+        end
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(actor-scan): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- Subclass path: FindAllOf("Actor") is exact-class only on this runtime,
+    -- so walk UObject instances and keep only Actor subclasses with flipper-like class names.
+    pcall(function()
+        for _, obj in ipairs(collect_table_level_actors() or {}) do
+            add(obj)
+        end
+    end)
+    if #out > 0 then
+        V("collect_flipper_actors(table-level subclass-scan): found=%d", #out)
+        flipper_actor_cache.actors = out
+        flipper_actor_cache.last_t = os.clock()
+        return out
+    end
+
+    -- NOTE: Deliberately no full ForEachUObject fallback here.
+    -- It's too expensive for bridge-driven interactive calls.
+    V("collect_flipper_actors: found=%d", #out)
+    flipper_actor_cache.actors = out
+    flipper_actor_cache.last_t = os.clock()
     return out
 end
 
@@ -560,6 +816,8 @@ local function probe_scale_targets()
             local n = "?"
             local c = "?"
             local s = "?"
+            local box_count = 0
+            local mesh_count = 0
             pcall(function() n = tostring(f:GetName()) end)
             pcall(function() c = tostring(f:GetClass():GetFullName()) end)
             pcall(function()
@@ -569,7 +827,17 @@ local function probe_scale_targets()
                     s = string.format("(%.2f,%.2f,%.2f)", rs.X, rs.Y, rs.Z)
                 end
             end)
-            lines[#lines + 1] = string.format("f%d=%s|%s|scale=%s", i, n, c, s)
+            pcall(function()
+                local bcls = FindClass("BoxComponent")
+                local arr = bcls and f:Call("K2_GetComponentsByClass", bcls) or nil
+                box_count = arr and #arr or 0
+            end)
+            pcall(function()
+                local mcls = FindClass("StaticMeshComponent")
+                local arr = mcls and f:Call("K2_GetComponentsByClass", mcls) or nil
+                mesh_count = arr and #arr or 0
+            end)
+            lines[#lines + 1] = string.format("f%d=%s|%s|scale=%s|box=%d|mesh=%d", i, n, c, s, box_count, mesh_count)
         end
     end
 
@@ -615,64 +883,34 @@ local function apply_large_flippers()
     local ok_count = 0
     for _, f in ipairs(flippers) do
         if is_live(f) then
+            local applied_actor = false
             local actor_name = ""
             pcall(function() actor_name = tostring(f:GetName() or "") end)
 
-            -- Keep actor transform neutral to avoid hierarchy-induced visual tilt.
-            pcall(function() f:Call("SetActorScale3D", { X = 1.0, Y = 1.0, Z = 1.0 }) end)
+            local actor_scale = { X = 1.0, Y = sx, Z = 1.0 }
+
+            -- Scale the actor itself on Y so the collider follows the same width
+            -- change as the visible mesh.
+            pcall(function() f:Call("SetActorScale3D", actor_scale) end)
             pcall(function() f:Call("SetActorEnableCollision", true) end)
 
-            local length_axis = flipper_axis_cache[actor_name] or "X"
-
-            -- 1) Update collision extents directly on BoxComponents (actual physics shape).
+            -- Keep the root/world transform in sync with the actor scale.
             pcall(function()
-                local cls = FindClass("BoxComponent")
-                if not cls then return end
-                local comps = f:Call("K2_GetComponentsByClass", cls)
-                if not comps then return end
-                for i = 1, #comps do
-                    local bc = comps[i]
-                    if is_live(bc) then
-                        local n = ""
-                        pcall(function() n = tostring(bc:GetName() or "") end)
-                        if n == "" then n = tostring(i) end
-                        local key = actor_name .. "::" .. n
-                        -- Snapshot original extent once (before first scale)
-                        if not flipper_box_extents_cache[key] then
-                            pcall(function()
-                                local e = bc:Get("BoxExtent")
-                                if e then
-                                    flipper_box_extents_cache[key] = { X = e.X, Y = e.Y, Z = e.Z }
-                                end
-                            end)
-                        end
-                        local orig = flipper_box_extents_cache[key]
-                        if orig then
-                            -- Detect best length axis from original collision shape once.
-                            if not flipper_axis_cache[actor_name] then
-                                local ax = "X"
-                                if orig.Y >= orig.X and orig.Y >= orig.Z then ax = "Y" end
-                                if orig.Z >= orig.X and orig.Z >= orig.Y then ax = "Z" end
-                                flipper_axis_cache[actor_name] = ax
-                                length_axis = ax
-                            end
-
-                            local ex, ey, ez = orig.X, orig.Y, orig.Z
-                            if length_axis == "X" then ex = orig.X * sx end
-                            if length_axis == "Y" then ey = orig.Y * sx end
-                            if length_axis == "Z" then ez = orig.Z * sx end
-
-                            pcall(function()
-                                bc:Call("SetBoxExtent", { X = ex, Y = ey, Z = ez }, true)
-                            end)
-                            pcall(function() bc:Call("SetCollisionEnabled", 3) end)
-                            pcall(function() bc:Call("SetGenerateOverlapEvents", true) end)
-                        end
-                    end
+                local root = f:Call("K2_GetRootComponent")
+                if root then
+                    root:Call("SetRelativeScale3D", actor_scale)
+                    root:Call("SetWorldScale3D", actor_scale)
+                    root:Call("UpdateComponentToWorld")
+                    root:Call("UpdateBounds")
+                    root:Call("MarkRenderTransformDirty")
+                    root:Call("MarkRenderStateDirty")
                 end
             end)
 
-            -- 2) Stretch visible mesh on the same local axis as collision.
+            -- Keep mesh components at their cached LOCAL base scale.
+            -- Actor Y scale already applies the intended width and keeps
+            -- collider + visuals in sync. Multiplying mesh Y here would
+            -- compound world scale (e.g. actor 10 * mesh 10 => 100).
             pcall(function()
                 local mcls = FindClass("StaticMeshComponent")
                 if not mcls then return end
@@ -696,21 +934,37 @@ local function apply_large_flippers()
                         local base = flipper_mesh_scales_cache[key]
                         if base then
                             local mx, my, mz = base.X, base.Y, base.Z
-                            if length_axis == "X" then mx = base.X * sx end
-                            if length_axis == "Y" then my = base.Y * sx end
-                            if length_axis == "Z" then mz = base.Z * sx end
-                            pcall(function() mc:Call("SetRelativeScale3D", { X = mx, Y = my, Z = mz }) end)
+                            pcall(function() mc:Set("RelativeScale3D", { X = mx, Y = my, Z = mz }) end)
+                            pcall(function() mc:Call("UpdateComponentToWorld") end)
+                            pcall(function() mc:Call("UpdateBounds") end)
+                            pcall(function() mc:Call("MarkRenderTransformDirty") end)
+                            pcall(function() mc:Call("MarkRenderStateDirty") end)
+                            applied_actor = true
                         end
                     end
                 end
             end)
 
-            ok_count = ok_count + 1
+            if applied_actor then
+                ok_count = ok_count + 1
+            end
         end
     end
 
     stats.flipper_applies = stats.flipper_applies + ok_count
-    return ok_count > 0, string.format("flippers scaled=%d @(%.2f,1.00,1.00)", ok_count, sx)
+    return ok_count > 0, string.format("flippers scaled=%d @(1.00,%.2f,1.00)", ok_count, sx)
+end
+
+local function schedule_large_flipper_reapply_burst()
+    if not cheats.large_flippers then return end
+    local delays = { 100, 250, 500, 900, 1500 }
+    for _, delay_ms in ipairs(delays) do
+        ExecuteWithDelay(delay_ms, function()
+            if cheats.large_flippers then
+                pcall(apply_large_flippers)
+            end
+        end)
+    end
 end
 
 local function cheats_set_big_ball(enable)
@@ -726,6 +980,9 @@ end
 local function cheats_set_large_flippers(enable)
     cheats.large_flippers = not not enable
     local ok, msg = apply_large_flippers()
+    if cheats.large_flippers then
+        schedule_large_flipper_reapply_burst()
+    end
     return cheats.large_flippers, (ok and msg) or ("pending: " .. tostring(msg))
 end
 
@@ -740,7 +997,7 @@ end
 -- Set flipper length (X scale, 1.0 = none/default, up to 5.0).
 -- Immediately re-applies flipper scale if flippers are currently active.
 local function set_flipper_length_x(val)
-    val = math.max(1.0, math.min(5.0, tonumber(val) or 1.0))
+    val = math.max(1.0, math.min(10.0, tonumber(val) or 10.0))
     FLIPPER_SCALE_X = val
     if val > 1.0 then
         cheats.large_flippers = true
@@ -1029,6 +1286,49 @@ pcall(function()
     end)
 end)
 
+-- Dump all unique actor class names present in GUObjectArray (run while in a table).
+-- Use this to identify the real flipper actor class, then call cheats_set_flipper_class.
+pcall(function()
+    RegisterCommand("dump_actor_classes", function()
+        local counts = {}
+        local lines = {}
+        local actors = collect_flipper_actors()
+        if not actors or #actors == 0 then
+            return "actor_classes(0): no flipper actors found"
+        end
+
+        for _, obj in ipairs(actors) do
+            local cn = "?"
+            local fn = "?"
+            pcall(function() cn = tostring(obj:GetClass():GetName() or "?") end)
+            pcall(function() fn = tostring(obj:GetFullName() or "?") end)
+            counts[cn] = (counts[cn] or 0) + 1
+            lines[#lines + 1] = string.format("%s :: %s", cn, fn)
+        end
+
+        local sorted = {}
+        for cn, c in pairs(counts) do sorted[#sorted+1] = {cn, c} end
+        table.sort(sorted, function(a, b) return a[1] < b[1] end)
+        local summary = {}
+        for _, v in ipairs(sorted) do
+            summary[#summary+1] = string.format("%s x%d", v[1], v[2])
+        end
+        return "actor_classes(" .. #sorted .. "):\n"
+            .. table.concat(summary, "\n")
+            .. "\n---\n"
+            .. table.concat(lines, "\n")
+    end)
+end)
+
+-- Override the flipper class used by collect_flipper_actors().
+-- Run dump_actor_classes first to find the right class name.
+pcall(function()
+    RegisterCommand("cheats_set_flipper_class", function(args)
+        flipper_class_override = tostring(args or "")
+        return TAG .. ": flipper_class_override=" .. tostring(flipper_class_override)
+    end)
+end)
+
 -- Status dump
 pcall(function()
     RegisterCommand("cheats_status", function()
@@ -1069,6 +1369,7 @@ _G.PFX_Cheats = {
     reset_scale = cheats_reset_scale,
     apply_big_ball = apply_big_ball,
     apply_large_flippers = apply_large_flippers,
+    probe_scale_targets = probe_scale_targets,
     save_ball = cheats_saveball,
     restart_ball = cheats_restartball,
     pause_resume = cheats_pause_resume,

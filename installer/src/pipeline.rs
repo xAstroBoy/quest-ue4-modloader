@@ -156,10 +156,13 @@ pub fn patch_local_apk(
 /// Full install pipeline (device-connected mode)
 pub fn install(
     serial: &str,
-    game: &game_db::GameProfile,
+    package: &str,
+    app_name: &str,
     so_path: &Path,
     progress: Option<ProgressFn>,
 ) -> Result<()> {
+    let game_profile = game_db::find_by_package(package);
+
     let total = 10u32;
     let report = |step: u32, msg: &str| {
         log::info!("[{}/{}] {}", step, total, msg);
@@ -169,20 +172,20 @@ pub fn install(
     };
 
     // 1. Stop the game
-    report(1, &format!("Stopping {}...", game.package));
-    adb::force_stop(serial, game.package)?;
+    report(1, &format!("Stopping {}...", package));
+    adb::force_stop(serial, package)?;
 
     // 2. Check if already installed
-    let already = adb::is_modloader_installed(serial, game.package)?;
+    let already = adb::is_modloader_installed(serial, package)?;
     if already {
-        log::warn!("Modloader already installed for {}. Re-patching anyway.", game.name);
+        log::warn!("Modloader already installed for {}. Re-patching anyway.", app_name);
     }
 
     // 3. Pull APK
     report(2, "Pulling APK from device...");
     let work_dir = tempfile::tempdir()?;
-    let app = adb::get_installed_app(serial, game.package)?
-        .ok_or_else(|| anyhow::anyhow!("{} is not installed on device", game.name))?;
+    let app = adb::get_installed_app(serial, package)?
+        .ok_or_else(|| anyhow::anyhow!("{} is not installed on device", app_name))?;
     let apk = adb::pull_apk(serial, &app, work_dir.path())?;
 
     // 4. Decompile
@@ -192,7 +195,7 @@ pub fn install(
 
     // 5. Smart injection — tries profile targets, manifest auto-detect, common UE activities
     report(4, "Injecting modloader...");
-    let target = smali::find_injection_target(&decompiled, Some(game))?;
+    let target = smali::find_injection_target(&decompiled, game_profile)?;
     log::info!("Injection target: {}", target);
     smali::inject_loadlibrary(&decompiled, &target)?;
     smali::add_native_lib(&decompiled, so_path)?;
@@ -213,11 +216,11 @@ pub fn install(
 
     // 8. Temporarily rename OBB/data, uninstall old, install new, restore dirs
     report(8, "Temporarily renaming OBB/data...");
-    let backups = adb::backup_game_dirs(serial, game.package)?;
+    let backups = adb::backup_game_dirs(serial, package)?;
 
     report(9, "Installing patched APK...");
     let install_result = (|| -> Result<()> {
-        adb::uninstall(serial, game.package)?;
+        adb::uninstall(serial, package)?;
         adb::install_apk(serial, &signed_apk)?;
         Ok(())
     })();
@@ -232,9 +235,9 @@ pub fn install(
     install_result?;
 
     report(10, "Finalizing — setting up directories & permissions...");
-    setup_game_dirs(serial, game)?;
+    setup_game_dirs(serial, package)?;
 
-    log::info!("✅ {} modloader installed successfully!", game.name);
+    log::info!("✅ {} modloader installed successfully!", app_name);
     Ok(())
 }
 
@@ -248,8 +251,7 @@ pub fn install(
 ///
 /// The modloader (running as the app) creates mods/ and paks/ directories
 /// at startup via paths::ensure_dir(). Let it do its job.
-fn setup_game_dirs(serial: &str, game: &game_db::GameProfile) -> Result<()> {
-    let pkg = game.package;
+fn setup_game_dirs(serial: &str, pkg: &str) -> Result<()> {
 
     // Grant runtime storage permissions via Android's permission manager
     let perms = [

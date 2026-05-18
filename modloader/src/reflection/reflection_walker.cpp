@@ -11,9 +11,88 @@
 #include <algorithm>
 #include <mutex>
 #include <cstdio>
+#include <cctype>
 
 namespace reflection
 {
+    static bool is_all_digits(const std::string &s)
+    {
+        if (s.empty())
+            return false;
+        for (unsigned char ch : s)
+        {
+            if (!std::isdigit(ch))
+                return false;
+        }
+        return true;
+    }
+
+    static std::string normalize_type_name_token(std::string n)
+    {
+        if (n.empty())
+            return n;
+
+        // Path-form to short token: /Script/Game.BP_X_C -> BP_X_C
+        if (n[0] == '/')
+        {
+            size_t dot = n.rfind('.');
+            if (dot != std::string::npos)
+                n = n.substr(dot + 1);
+            else
+            {
+                size_t slash = n.rfind('/');
+                if (slash != std::string::npos)
+                    n = n.substr(slash + 1);
+            }
+        }
+
+        // Common blueprint/compiler prefixes that can appear transiently.
+        if (n.rfind("REINST_", 0) == 0)
+            n = n.substr(7);
+        if (n.rfind("SKEL_", 0) == 0)
+            n = n.substr(5);
+
+        // Runtime class token variants can include numeric suffixes
+        // e.g. BP_X_C_123 -> normalize to BP_X_C
+        size_t us = n.rfind('_');
+        if (us != std::string::npos && us + 1 < n.size())
+        {
+            std::string tail = n.substr(us + 1);
+            if (is_all_digits(tail))
+            {
+                std::string base = n.substr(0, us);
+                // Keep canonical _C marker if present before numeric suffix.
+                n = base;
+            }
+        }
+
+        return n;
+    }
+
+    static bool type_name_matches(const std::string &requested_raw, const std::string &candidate_raw)
+    {
+        std::string r = normalize_type_name_token(requested_raw);
+        std::string c = normalize_type_name_token(candidate_raw);
+
+        if (r.empty() || c.empty())
+            return false;
+        if (r == c)
+            return true;
+
+        // Accept BP_Class and BP_Class_C interchangeably.
+        if (r.size() > 2 && r.substr(r.size() - 2) == "_C")
+        {
+            if (r.substr(0, r.size() - 2) == c)
+                return true;
+        }
+        if (c.size() > 2 && c.substr(c.size() - 2) == "_C")
+        {
+            if (c.substr(0, c.size() - 2) == r)
+                return true;
+        }
+
+        return false;
+    }
 
     // ═══ Internal state ═════════════════════════════════════════════════════
     static std::vector<ClassInfo> s_classes;
@@ -1010,6 +1089,64 @@ namespace reflection
         else
         {
             logger::log_error("REFLECT", "GNames is null — cannot resolve FNames");
+
+            // UE4 stripped fallback: some builds export GNameBlocksDebug but not GNames.
+            // GNameBlocksDebug typically points to FNamePool::Entries.Blocks (pool + 0x10).
+            // Try both interpretations:
+            //   1) symbol is a pointer variable -> dereference to Blocks base
+            //   2) symbol address itself is Blocks base
+            logger::log_info("REFLECT", "Attempting GNameBlocksDebug fallback...");
+            void *gname_blocks_sym = symbols::resolve("GNameBlocksDebug");
+            if (!gname_blocks_sym)
+                gname_blocks_sym = symbols::resolve("_ZL16GNameBlocksDebug");
+            if (!gname_blocks_sym)
+                gname_blocks_sym = symbols::resolve("_ZN12GNameBlocksDebugE");
+            if (gname_blocks_sym)
+            {
+                uintptr_t sym_addr = reinterpret_cast<uintptr_t>(gname_blocks_sym);
+                uintptr_t blocks_candidates[2] = {0, sym_addr};
+
+                if (ue::is_valid_ptr(reinterpret_cast<const void *>(sym_addr)))
+                {
+                    blocks_candidates[0] = ue::read_field<uintptr_t>(
+                        reinterpret_cast<const void *>(sym_addr), 0);
+                }
+
+                bool recovered = false;
+                for (uintptr_t blocks_base : blocks_candidates)
+                {
+                    if (!blocks_base || !ue::is_valid_ptr(reinterpret_cast<const void *>(blocks_base)))
+                        continue;
+
+                    uintptr_t block0_ptr = ue::read_field<uintptr_t>(
+                        reinterpret_cast<const void *>(blocks_base), 0);
+                    if (!block0_ptr || !ue::is_valid_ptr(reinterpret_cast<const void *>(block0_ptr)))
+                        continue;
+
+                    uintptr_t candidate_pool = blocks_base - ue::FNAMEPOOL_TO_BLOCKS;
+                    s_fname_pool = candidate_pool;
+
+                    std::string probe = fname_to_string(0);
+                    if (probe == "None" || probe == "none")
+                    {
+                        logger::log_info("REFLECT", "Recovered FNamePool via GNameBlocksDebug: pool=0x%lX blocks=0x%lX",
+                                         (unsigned long)s_fname_pool,
+                                         (unsigned long)blocks_base);
+                        recovered = true;
+                        break;
+                    }
+                }
+
+                if (!recovered)
+                {
+                    s_fname_pool = 0;
+                    logger::log_error("REFLECT", "GNameBlocksDebug fallback failed — name resolution still unavailable");
+                }
+            }
+            else
+            {
+                logger::log_error("REFLECT", "GNameBlocksDebug symbol not resolved — no FName fallback available");
+            }
         }
     }
 
@@ -1328,10 +1465,36 @@ namespace reflection
         auto *ci = find_class(name);
         if (ci)
             return ci->raw;
+
+        // Accept caller passing BP_Class without/with _C.
+        if (name.size() > 2 && name.substr(name.size() - 2) == "_C")
+        {
+            auto *ci2 = find_class(name.substr(0, name.size() - 2));
+            if (ci2)
+                return ci2->raw;
+        }
+        else
+        {
+            auto *ci2 = find_class(name + "_C");
+            if (ci2)
+                return ci2->raw;
+        }
+
         // Fallback: scan GUObjectArray
-        ue::UObject *obj = find_object_by_name(name);
-        if (obj && is_uclass(obj))
-            return reinterpret_cast<ue::UClass *>(obj);
+        int32_t count = get_num_elements();
+        for (int32_t i = 0; i < count; i++)
+        {
+            ue::UObject *obj = get_object_at_index(i);
+            if (!obj || !ue::is_valid_ptr(obj))
+                continue;
+            if (!is_uclass(obj))
+                continue;
+
+            std::string obj_name = get_short_name(obj);
+            if (type_name_matches(name, obj_name))
+                return reinterpret_cast<ue::UClass *>(obj);
+        }
+
         return nullptr;
     }
 
@@ -1352,7 +1515,7 @@ namespace reflection
             if (!cls || !ue::is_valid_ptr(cls))
                 continue;
             std::string cls_name = get_short_name(reinterpret_cast<const ue::UObject *>(cls));
-            if (cls_name == class_name)
+            if (type_name_matches(class_name, cls_name))
                 return obj;
         }
         return nullptr;
@@ -1390,7 +1553,7 @@ namespace reflection
             if (!cls || !ue::is_valid_ptr(cls))
                 continue;
             std::string cls_name = get_short_name(reinterpret_cast<const ue::UObject *>(cls));
-            if (cls_name == class_name)
+            if (type_name_matches(class_name, cls_name))
                 result.push_back(obj);
         }
         return result;

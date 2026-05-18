@@ -79,6 +79,43 @@ pub struct InstalledApp {
     pub version: String,
 }
 
+/// List all installed APK packages (user + system) that have a resolvable APK path.
+///
+/// Uses `pm list packages -f` to get package + base APK path in one call.
+/// Version is left as "?" for speed; call `get_installed_app` for a specific
+/// package if exact version is needed.
+pub fn list_installed_apps(serial: &str) -> Result<Vec<InstalledApp>> {
+    let out = shell(serial, "pm list packages -f 2>/dev/null")?;
+    let mut apps = Vec::new();
+
+    for raw_line in out.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with("package:") {
+            continue;
+        }
+
+        // Expected format:
+        // package:/data/app/~~.../com.foo.bar/base.apk=com.foo.bar
+        let body = line.trim_start_matches("package:");
+        let mut parts = body.rsplitn(2, '=');
+        let package = parts.next().unwrap_or("").trim();
+        let apk_path = parts.next().unwrap_or("").trim();
+
+        if package.is_empty() || apk_path.is_empty() {
+            continue;
+        }
+
+        apps.push(InstalledApp {
+            package: package.to_string(),
+            apk_path: apk_path.to_string(),
+            version: "?".to_string(),
+        });
+    }
+
+    apps.sort_by(|a, b| a.package.cmp(&b.package));
+    Ok(apps)
+}
+
 pub fn get_installed_app(serial: &str, package: &str) -> Result<Option<InstalledApp>> {
     let out = shell(serial, &format!("pm path {} 2>/dev/null", package))?;
     if !out.starts_with("package:") { return Ok(None); }

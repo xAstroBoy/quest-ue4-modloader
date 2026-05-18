@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/ue_tool.py all --game pfxvr)",
+      "Bash(python tools/ue_tool.py launch --game pfxvr)",
+      "Bash(python tools/ue_tool.py monitor --game pfxvr --once)",
+      "Bash(Get-Content \"c:\\\\Users\\\\xAstroBoy\\\\Desktop\\\\UE4-5 Quest Modloader\\\\logs\\\\sessions\\\\2026-05-09_20-06-02_PFXVRQuest_16291\\\\UEModLoader.log\")",
+      "Bash(Select-Object -Last 80)",
+      "mcp__ida-pro-mcp__check_connection"
+    ]
+  }
+}

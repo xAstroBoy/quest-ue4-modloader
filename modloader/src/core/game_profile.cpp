@@ -581,6 +581,47 @@ namespace game_profile
         return p;
     }
 
+    // ═══ Hand Boi profile ═══════════════════════════════════════════════════
+    static GameProfile build_handboi_profile()
+    {
+        using namespace engine_versions;
+
+        GameProfile p;
+        // Keep UNKNOWN id behavior (alternate engine-lib probes in some boot paths),
+        // but provide package-specific, fixed offsets for stable globals/functions.
+        p.id = GameID::UNKNOWN;
+        p.package_name = "com.Capricia.HandBoi";
+        p.display_name = "Hand Boi";
+        p.engine_lib_name = "libUE4.so";
+        p.engine_version = "UE4.27";
+        p.detected_engine_version = EngineVersion::UE4_27;
+
+        p.offsets = build_offsets_for_version(EngineVersion::UE4_27);
+
+        // Verified from HandBoi symbol dump (.dynsym):
+        // Current Modloader SDK/Hand Boi/com.Capricia.HandBoi/symbol_dump.txt
+        p.stable_global_offsets = {
+            {"GUObjectArray", 0x0C57DF58},
+            {"GEngine", 0x0C6F0D88},
+            {"GWorld", 0x0C6F4C78},
+            {"GNameBlocksDebug", 0x0C491398},
+
+            // Core functions (kept as stable fallbacks when dynamic resolution fails)
+            {"ProcessEvent", 0x08208F98},
+            {"StaticFindObject", 0x0822324C},
+            {"StaticLoadObject", 0x082139C8},
+            {"StaticConstructObject_Internal", 0x0822807C},
+            {"_Z19GetTransientPackagev", 0x0816C654},
+            {"GetTransientPackage", 0x0816C654},
+            {"FName::Init", 0x07FE01A0},
+            {"FName::FName", 0x07FE01A0},
+        };
+
+        // Leave pattern/fallback tables empty for HandBoi for now; this profile
+        // intentionally uses direct symbols + known stable offsets.
+        return p;
+    }
+
     // ═══ Unknown/fallback profile ═══════════════════════════════════════════
     // For games we haven't seen before. Tries to auto-detect UE4 vs UE5
     // based on which engine library is loaded, then uses engine_versions.h
@@ -686,6 +727,10 @@ namespace game_profile
         else if (pkg == "com.zenstudios.PFXVRQuest")
         {
             s_profile = build_pinball_fx_vr_profile();
+        }
+        else if (pkg == "com.Capricia.HandBoi")
+        {
+            s_profile = build_handboi_profile();
         }
         else
         {

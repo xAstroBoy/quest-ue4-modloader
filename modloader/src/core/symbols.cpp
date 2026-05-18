@@ -1543,15 +1543,40 @@ namespace symbols
             logger::log_error("SYMBOL", "GUObjectArray NOT FOUND — reflection walker will fail");
         }
 
-        // GNames — try multiple names, it's often a static local
-        GNames = resolve("GNames");
-        if (!GNames)
-            GNames = resolve("_ZL6GNames");
-        if (!GNames)
-            GNames = resolve("GNamePool");
-        if (!GNames)
-            GNames = resolve("NamePoolData");
-        if (!GNames && GUObjectArray)
+        const bool is_handboi = (game_profile::package_name() == "com.Capricia.HandBoi");
+
+        // GNames / NamePool globals
+        // HandBoi: deterministic IDA-derived path via GNameBlocksDebug; don't spam
+        // unresolved alias probes that are known absent in this title.
+        if (!is_handboi)
+        {
+            GNames = resolve("GNames");
+            if (!GNames)
+                GNames = resolve("_ZL6GNames");
+            if (!GNames)
+                GNames = resolve("GNamePool");
+            if (!GNames)
+                GNames = resolve("NamePoolData");
+        }
+        else
+        {
+            GNames = nullptr;
+        }
+        void *gname_blocks_debug = nullptr;
+        if (!GNames && is_handboi)
+        {
+            // HandBoi uses GNameBlocksDebug (IDA-confirmed) rather than exported GNames.
+            // Reflection layer derives FNamePool from this global directly.
+            gname_blocks_debug = resolve("GNameBlocksDebug");
+            if (!gname_blocks_debug)
+                gname_blocks_debug = resolve("_ZL16GNameBlocksDebug");
+            if (gname_blocks_debug)
+            {
+                logger::log_warn("SYMBOL", "GNames unresolved; HandBoi will use GNameBlocksDebug fallback @ 0x%lX",
+                                 reinterpret_cast<uintptr_t>(gname_blocks_debug));
+            }
+        }
+        if (!GNames && GUObjectArray && game_profile::is_pinball_fx())
         {
             // Pinball FX VR fallback: GNames is at GUObjectArray - 0x47638
             // Verified on both old and new PFX VR binaries.
@@ -1568,6 +1593,10 @@ namespace symbols
         if (GNames)
         {
             logger::log_info("SYMBOL", "GNames resolved: 0x%lX", reinterpret_cast<uintptr_t>(GNames));
+        }
+        else if (gname_blocks_debug)
+        {
+            logger::log_warn("SYMBOL", "GNames not exported (expected on HandBoi) — deferred fallback active via GNameBlocksDebug");
         }
         else
         {
@@ -1659,7 +1688,7 @@ namespace symbols
             resolved++;
         if (GUObjectArray)
             resolved++;
-        if (GNames)
+        if (GNames || (is_handboi && gname_blocks_debug))
             resolved++;
         if (GEngine)
             resolved++;

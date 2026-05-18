@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tools/ue_tool.py --help)",
+      "Bash(python tools/ue_tool.py --game pfxvr mods)",
+      "Bash(python tools/ue_tool.py --game pfxvr monitor --once)",
+      "Bash(python tools/ue_tool.py --game pfxvr launch)",
+      "Bash(python tools/ue_tool.py --game pfxvr --once monitor)",
+      "Bash(xargs grep -l -i \"MatchProgress\\\\|ChampionshipProgress\\\\|LeagueProgress\")",
+      "Bash(python3 \"c:\\\\Users\\\\xAstroBoy\\\\Desktop\\\\UE4-5 Quest Modloader\\\\tools\\\\ue_tool.py\" --help)"
+    ]
+  }
+}

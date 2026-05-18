@@ -23,6 +23,10 @@ void stop();
 // Check if the server is running
 bool is_running();
 
+// True while a bridge command is actively executing on the game thread.
+// Used by Lua bindings to reject crash-prone bulk scans from live bridge calls.
+bool is_game_thread_command_active();
+
 // Register a custom command handler (from Lua mods via RegisterCommand)
 void register_command(const std::string& name, CommandHandler handler);
 

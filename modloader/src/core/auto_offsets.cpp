@@ -953,13 +953,24 @@ namespace auto_offsets
             }
         }
 
-        // UE5 without +UE5+ marker: check for UE5-specific strings
-        if (pattern::find_string("FNamePool") || pattern::find_string("PreAllocatedObjects"))
+        // UE5 without +UE5+ marker: check for UE5-specific strings.
+        // IMPORTANT: don't promote libUE4.so titles to UE5 from this weak heuristic.
+        // Some UE4 builds contain these tokens in diagnostics/dead strings.
+        if (game_profile::engine_lib_name() != "libUE4.so" &&
+            (pattern::find_string("FNamePool") || pattern::find_string("PreAllocatedObjects")))
         {
             logger::log_warn("AUTOOFF", "UE5-specific strings found — assuming UE5");
             if (out_version_string)
                 *out_version_string = "UE5-inferred";
             return EngineVersion::UE5_0;
+        }
+
+        if (game_profile::engine_lib_name() == "libUE4.so")
+        {
+            logger::log_warn("AUTOOFF", "No explicit version markers found in libUE4.so — defaulting to UE4.27");
+            if (out_version_string)
+                *out_version_string = "UE4-libUE4-default";
+            return EngineVersion::UE4_27;
         }
 
         logger::log_error("AUTOOFF", "Could not detect engine version from binary strings");

@@ -59,43 +59,49 @@ pub fn run(
         device.model, device.serial,
         if device.is_quest { " [Quest]" } else { "" });
 
-    // ── Find installed games ────────────────────────────────────────
-    let packages: Vec<&str> = game_db::GAMES.iter().map(|g| g.package).collect();
-    let installed = adb::find_installed_games(&device.serial, &packages)?;
+    // ── Find installed APKs ─────────────────────────────────────────
+    let installed = adb::list_installed_apps(&device.serial)?;
 
     if installed.is_empty() {
-        bail!("No supported games found on device.\nSupported: {}",
-            game_db::GAMES.iter().map(|g| format!("{} ({})", g.name, g.package)).collect::<Vec<_>>().join(", "));
+        bail!("No installed APK packages found on device.");
     }
 
-    // ── Select game ─────────────────────────────────────────────────
-    let game = if let Some(ref pkg) = package_override {
-        let g = game_db::find_by_package(pkg)
-            .ok_or_else(|| anyhow::anyhow!("Unknown package: {}", pkg))?;
+    // ── Select package ──────────────────────────────────────────────
+    let selected_package = if let Some(ref pkg) = package_override {
         if !installed.iter().any(|a| a.package == pkg.as_str()) {
-            bail!("{} is not installed on device", g.name);
+            bail!("Package is not installed on device: {}", pkg);
         }
-        g
+        pkg.clone()
     } else if installed.len() == 1 {
-        game_db::find_by_package(&installed[0].package).unwrap()
+        installed[0].package.clone()
     } else {
         let labels: Vec<String> = installed.iter().map(|a| {
-            let g = game_db::find_by_package(&a.package).unwrap();
-            format!("{} (v{})", g.name, a.version)
+            if let Some(g) = game_db::find_by_package(&a.package) {
+                format!("{} ({})", g.name, a.package)
+            } else {
+                a.package.clone()
+            }
         }).collect();
         let sel = Select::new()
-            .with_prompt("Select game to mod")
+            .with_prompt("Select package to mod")
             .items(&labels)
             .default(0)
             .interact()?;
-        game_db::find_by_package(&installed[sel].package).unwrap()
+        installed[sel].package.clone()
     };
 
-    let app = installed.iter().find(|a| a.package == game.package).unwrap();
-    println!("{} Game: {} (v{})", style("✓").green(), game.name, app.version);
+    // Refresh details for chosen package (version/apk path)
+    let app = adb::get_installed_app(&device.serial, &selected_package)?
+        .ok_or_else(|| anyhow::anyhow!("{} is not installed on device", selected_package))?;
+
+    let app_name = game_db::find_by_package(&selected_package)
+        .map(|g| g.name.to_string())
+        .unwrap_or_else(|| selected_package.clone());
+
+    println!("{} Target: {} (v{})", style("✓").green(), app_name, app.version);
 
     // ── Check if already modded ─────────────────────────────────────
-    let already = adb::is_modloader_installed(&device.serial, game.package)?;
+    let already = adb::is_modloader_installed(&device.serial, &selected_package)?;
     if already {
         println!("{} Modloader is already installed!", style("⚠").yellow());
         if !auto_yes {
@@ -138,12 +144,12 @@ pub fn run(
         pb2.set_message(msg.to_string());
     });
 
-    pipeline::install(&device.serial, game, &so_path, Some(progress))?;
+    pipeline::install(&device.serial, &selected_package, &app_name, &so_path, Some(progress))?;
     pb.finish_with_message("Done!");
 
     println!();
     println!("{}", style("════════════════════════════════════════════").green());
-    println!("{} {} modloader installed!", style("✅").green(), game.name);
+    println!("{} {} modloader installed!", style("✅").green(), app_name);
     println!("{}", style("════════════════════════════════════════════").green());
     println!();
     println!("Next steps:");
@@ -154,9 +160,9 @@ pub fn run(
 
     // Offer to launch
     if auto_yes {
-        println!("Use: adb shell monkey -p {} -c android.intent.category.LAUNCHER 1", game.package);
+        println!("Use: adb shell monkey -p {} -c android.intent.category.LAUNCHER 1", selected_package);
     } else if Confirm::new().with_prompt("Launch game now?").default(false).interact()? {
-        adb::launch(&device.serial, game.package)?;
+        adb::launch(&device.serial, &selected_package)?;
         println!("{} Launched!", style("✓").green());
     }
 

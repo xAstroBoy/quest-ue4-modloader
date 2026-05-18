@@ -51,9 +51,11 @@ struct App {
     selected_device: usize,
     device_error: Option<String>,
 
-    // Games
-    installed_games: Vec<(game_db::GameProfile, adb::InstalledApp)>,
-    selected_game: usize,
+    // Apps
+    installed_apps: Vec<adb::InstalledApp>,
+    selected_app: usize,
+    package_search: String,
+    user_apps_only: bool,
     already_modded: bool,
 
     // Install progress
@@ -82,8 +84,10 @@ impl App {
             devices: Vec::new(),
             selected_device: 0,
             device_error: None,
-            installed_games: Vec::new(),
-            selected_game: 0,
+            installed_apps: Vec::new(),
+            selected_app: 0,
+            package_search: String::new(),
+            user_apps_only: true,
             already_modded: false,
             progress: Arc::new(Mutex::new(ProgressState {
                 step: 0, total: 9, message: String::new(), done: false, error: None,
@@ -134,27 +138,24 @@ impl App {
                     self.device_error = None;
                     self.devices = devs;
                     self.selected_device = 0;
-                    self.scan_games();
+                    self.scan_apps();
                 }
             }
             Err(e) => { self.device_error = Some(e.to_string()); }
         }
 
-        if self.so_error.is_none() && self.device_error.is_none() && !self.installed_games.is_empty() {
+        if self.so_error.is_none() && self.device_error.is_none() && !self.installed_apps.is_empty() {
             self.phase = Phase::Ready;
         }
     }
 
-    fn scan_games(&mut self) {
+    fn scan_apps(&mut self) {
         if self.devices.is_empty() { return; }
         let serial = &self.devices[self.selected_device].serial;
-        let pkgs: Vec<&str> = game_db::GAMES.iter().map(|g| g.package).collect();
-        match adb::find_installed_games(serial, &pkgs) {
+        match adb::list_installed_apps(serial) {
             Ok(apps) => {
-                self.installed_games = apps.iter().filter_map(|a| {
-                    game_db::find_by_package(&a.package).map(|g| (g.clone(), a.clone()))
-                }).collect();
-                self.selected_game = 0;
+                self.installed_apps = apps;
+                self.selected_app = 0;
                 self.check_modded();
             }
             Err(e) => { self.device_error = Some(format!("Scan error: {}", e)); }
@@ -162,16 +163,49 @@ impl App {
     }
 
     fn check_modded(&mut self) {
-        if self.installed_games.is_empty() || self.devices.is_empty() { return; }
+        if self.installed_apps.is_empty() || self.devices.is_empty() { return; }
         let serial = &self.devices[self.selected_device].serial;
-        let pkg = &self.installed_games[self.selected_game].0.package;
+        let pkg = &self.installed_apps[self.selected_app].package;
         self.already_modded = adb::is_modloader_installed(serial, pkg).unwrap_or(false);
+    }
+
+    fn is_user_app(app: &adb::InstalledApp) -> bool {
+        let p = app.apk_path.to_lowercase();
+
+        // Typical user-installed locations on Android/Quest
+        if p.starts_with("/data/app/") || p.starts_with("/mnt/expand/") {
+            return true;
+        }
+
+        // Common system/app partitions
+        if p.starts_with("/system/")
+            || p.starts_with("/product/")
+            || p.starts_with("/vendor/")
+            || p.starts_with("/apex/")
+            || p.starts_with("/system_ext/")
+        {
+            return false;
+        }
+
+        // Unknown path: treat as non-user by default for safety when filter is enabled
+        false
+    }
+
+    fn app_label(app: &adb::InstalledApp) -> String {
+        if let Some(g) = game_db::find_by_package(&app.package) {
+            format!("{} ({})", g.name, app.package)
+        } else {
+            app.package.clone()
+        }
     }
 
     fn start_install(&mut self) {
         self.phase = Phase::Installing;
         let serial = self.devices[self.selected_device].serial.clone();
-        let game = self.installed_games[self.selected_game].0.clone();
+        let package = self.installed_apps[self.selected_app].package.clone();
+        let app_name = game_db::find_by_package(&package)
+            .map(|g| g.name.to_string())
+            .unwrap_or_else(|| package.clone());
         let so = self.so_path.clone().unwrap();
         let progress = self.progress.clone();
 
@@ -194,11 +228,11 @@ impl App {
                 p.message = msg.to_string();
             });
 
-            match pipeline::install(&serial, &game, &so, Some(cb)) {
+            match pipeline::install(&serial, &package, &app_name, &so, Some(cb)) {
                 Ok(()) => {
                     let mut p = progress.lock().unwrap();
                     p.done = true;
-                    p.message = format!("{} installed successfully!", game.name);
+                    p.message = format!("{} installed successfully!", app_name);
                 }
                 Err(e) => {
                     let mut p = progress.lock().unwrap();
@@ -344,8 +378,8 @@ impl App {
             ui.colored_label(egui::Color32::RED, format!("❌ {}", e));
             ui.add_space(8.0);
         }
-        if self.installed_games.is_empty() && self.device_error.is_none() && !self.devices.is_empty() {
-            ui.colored_label(egui::Color32::YELLOW, "⚠ No supported games found on device.");
+        if self.installed_apps.is_empty() && self.device_error.is_none() && !self.devices.is_empty() {
+            ui.colored_label(egui::Color32::YELLOW, "⚠ No installed APK packages found on device.");
             ui.add_space(8.0);
         }
 
@@ -384,32 +418,88 @@ impl App {
                 });
         });
         if self.selected_device != old_dev {
-            self.scan_games();
+            self.scan_apps();
         }
 
         ui.add_space(4.0);
 
-        // Game selector
-        if self.installed_games.is_empty() {
-            ui.colored_label(egui::Color32::YELLOW, "No supported games on this device.");
+        // Package selector
+        if self.installed_apps.is_empty() {
+            ui.colored_label(egui::Color32::YELLOW, "No installed APK packages on this device.");
         } else {
-            let game_labels: Vec<String> = self.installed_games.iter()
-                .map(|(g, a)| format!("{} (v{})", g.name, a.version))
-                .collect();
-            let old_game = self.selected_game;
             ui.horizontal(|ui| {
-                ui.label("🎮 Game:");
-                egui::ComboBox::from_id_salt("game")
-                    .selected_text(&game_labels[self.selected_game])
+                ui.label("🔎 Search:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.package_search)
+                        .hint_text("package name...")
+                        .desired_width(220.0)
+                );
+                ui.checkbox(&mut self.user_apps_only, "User apps only");
+            });
+
+            ui.add_space(6.0);
+
+            let needle = self.package_search.trim().to_lowercase();
+            let visible_indices: Vec<usize> = self.installed_apps.iter()
+                .enumerate()
+                .filter(|(_i, app)| {
+                    let allowed_by_type = !self.user_apps_only || Self::is_user_app(app);
+                    if !allowed_by_type {
+                        return false;
+                    }
+
+                    if needle.is_empty() {
+                        return true;
+                    }
+
+                    let pkg = app.package.to_lowercase();
+                    let label = Self::app_label(app).to_lowercase();
+                    pkg.contains(&needle) || label.contains(&needle)
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            if visible_indices.is_empty() {
+                ui.colored_label(egui::Color32::YELLOW, "No packages match current filters.");
+                ui.add_space(8.0);
+                ui.label(format!("Total packages on device: {}", self.installed_apps.len()));
+                ui.add_space(8.0);
+                return;
+            }
+
+            if !visible_indices.iter().any(|&i| i == self.selected_app) {
+                self.selected_app = visible_indices[0];
+                self.check_modded();
+            }
+
+            let mut selected_visible = visible_indices
+                .iter()
+                .position(|&i| i == self.selected_app)
+                .unwrap_or(0);
+            let old_visible = selected_visible;
+
+            ui.horizontal(|ui| {
+                ui.label("📦 Package:");
+                egui::ComboBox::from_id_salt("package")
+                    .selected_text(Self::app_label(&self.installed_apps[visible_indices[selected_visible]]))
                     .show_ui(ui, |ui| {
-                        for (i, label) in game_labels.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_game, i, label);
+                        for (pos, app_idx) in visible_indices.iter().enumerate() {
+                            let label = Self::app_label(&self.installed_apps[*app_idx]);
+                            ui.selectable_value(&mut selected_visible, pos, label);
                         }
                     });
             });
-            if self.selected_game != old_game {
+
+            if selected_visible != old_visible {
+                self.selected_app = visible_indices[selected_visible];
                 self.check_modded();
             }
+
+            ui.label(format!(
+                "Showing {}/{} packages",
+                visible_indices.len(),
+                self.installed_apps.len()
+            ));
 
             ui.add_space(8.0);
 
@@ -479,7 +569,7 @@ impl App {
             ui.horizontal(|ui| {
                 if ui.button("🚀 Launch Game").clicked() {
                     let serial = &self.devices[self.selected_device].serial;
-                    let pkg = &self.installed_games[self.selected_game].0.package;
+                    let pkg = &self.installed_apps[self.selected_app].package;
                     let _ = adb::launch(serial, pkg);
                 }
                 if ui.button("↩ Back").clicked() {

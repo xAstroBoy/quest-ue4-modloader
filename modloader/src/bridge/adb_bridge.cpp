@@ -38,8 +38,22 @@ namespace adb_bridge
 
     static int s_server_fd = -1;
     static std::atomic<bool> s_running{false};
+    static std::atomic<int> s_game_thread_command_depth{0};
     static pthread_t s_server_thread;
     static std::chrono::steady_clock::time_point s_start_time;
+
+    struct GameThreadCommandScope
+    {
+        GameThreadCommandScope()
+        {
+            s_game_thread_command_depth.fetch_add(1, std::memory_order_acq_rel);
+        }
+
+        ~GameThreadCommandScope()
+        {
+            s_game_thread_command_depth.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    };
 
     // ═══ Custom command registry ════════════════════════════════════════════
     static std::unordered_map<std::string, CommandHandler> s_custom_commands;
@@ -61,6 +75,11 @@ namespace adb_bridge
             names.push_back(pair.first);
         }
         return names;
+    }
+
+    bool is_game_thread_command_active()
+    {
+        return s_game_thread_command_depth.load(std::memory_order_acquire) > 0;
     }
 
     // ═══ JSON response helpers ══════════════════════════════════════════════
@@ -145,6 +164,8 @@ namespace adb_bridge
             logger::log_warn("ADB", "exec_lua: skipping cancelled/timed-out command");
             return;
         }
+
+        GameThreadCommandScope scope;
 
         // Use instruction limit for bridge exec_lua to prevent infinite loops/recursion
         // from freezing the game thread. 10M instructions is plenty for any reasonable
@@ -685,6 +706,7 @@ namespace adb_bridge
                     logger::log_warn("ADB", "Custom command: skipping cancelled/timed-out");
                     return;
                 }
+                GameThreadCommandScope scope;
                 ctx->result = handler(args);
                 {
                     std::lock_guard<std::mutex> lk(ctx->mtx);
